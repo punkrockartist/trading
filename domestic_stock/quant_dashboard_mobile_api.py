@@ -13,6 +13,7 @@ import asyncio
 import threading
 import uuid
 import time
+import os
 
 import kis_auth as ka
 from domestic_stock_functions_ws import ccnl_krx
@@ -31,6 +32,38 @@ DEFAULT_STOCK_INFO = [
     {"code": "005930", "name": "삼성전자"},
     {"code": "000660", "name": "SK하이닉스"},
 ]
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    v = str(raw).strip().lower()
+    if v in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if v in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _env_float(key: str, default: float) -> float:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    try:
+        return float(str(raw).strip())
+    except Exception:
+        return default
+
+
+def _ensure_initialized() -> bool:
+    """Start 버튼에서 lazy-init."""
+    if state.strategy and state.trenv and state.risk_manager:
+        return True
+
+    account_balance = _env_float("ACCOUNT_BALANCE", 100000.0)
+    is_paper = _env_bool("IS_PAPER_TRADING", getattr(state, "is_paper_trading", True))
+    return bool(initialize_trading_system(account_balance=account_balance, is_paper_trading=is_paper))
 
 
 def _run_async_broadcast(message: dict):
@@ -318,7 +351,13 @@ async def start_system(current_user: str = Depends(get_current_user)):
             return JSONResponse({"success": False, "message": "이미 실행 중입니다."})
 
         if not state.strategy or not state.trenv or not state.risk_manager:
-            return JSONResponse({"success": False, "message": "시스템이 초기화되지 않았습니다."})
+            ok = _ensure_initialized()
+            if not ok or not state.strategy or not state.trenv or not state.risk_manager:
+                detail = getattr(state, "last_init_error", None)
+                msg = "시스템 초기화 실패: KIS 설정(.env/kis_devlp.yaml), 네트워크, 계정 설정을 확인하세요."
+                if detail:
+                    msg = f"{msg} (detail: {detail})"
+                return JSONResponse({"success": False, "message": msg})
 
         if not state.selected_stocks:
             state.selected_stocks = ["005930", "000660"]
@@ -439,8 +478,14 @@ async def get_pending_signals(current_user: str = Depends(get_current_user)):
 @app.post("/api/signals/{signal_id}/approve")
 async def approve_signal(signal_id: str, current_user: str = Depends(get_current_user)):
     """신호 승인 후 주문 실행"""
-    if not state.strategy or not state.trenv:
-        return JSONResponse({"success": False, "message": "시스템이 초기화되지 않았습니다."})
+    if not state.strategy or not state.trenv or not state.risk_manager:
+        ok = _ensure_initialized()
+        if not ok or not state.strategy or not state.trenv or not state.risk_manager:
+            detail = getattr(state, "last_init_error", None)
+            msg = "시스템 초기화 실패: KIS 설정(.env/kis_devlp.yaml), 네트워크, 계정 설정을 확인하세요."
+            if detail:
+                msg = f"{msg} (detail: {detail})"
+            return JSONResponse({"success": False, "message": msg})
 
     with pending_signals_lock:
         signal_data = state.pending_signals.get(signal_id)
@@ -505,13 +550,17 @@ async def reject_signal(signal_id: str, current_user: str = Depends(get_current_
 async def update_risk_config(config: RiskConfig, current_user: str = Depends(get_current_user)):
     """리스크 설정 업데이트"""
     try:
-        if state.risk_manager:
-            state.risk_manager.max_single_trade_amount = config.max_single_trade_amount
-            state.risk_manager.stop_loss_ratio = config.stop_loss_ratio
-            state.risk_manager.take_profit_ratio = config.take_profit_ratio
-            state.risk_manager.daily_loss_limit = config.daily_loss_limit
-            state.risk_manager.max_trades_per_day = config.max_trades_per_day
-            state.risk_manager.max_position_size_ratio = config.max_position_size_ratio
+        if not state.risk_manager:
+            ok = _ensure_initialized()
+            if not ok or not state.risk_manager:
+                return JSONResponse({"success": False, "message": "리스크 관리자가 초기화되지 않았습니다."})
+
+        state.risk_manager.max_single_trade_amount = config.max_single_trade_amount
+        state.risk_manager.stop_loss_ratio = config.stop_loss_ratio
+        state.risk_manager.take_profit_ratio = config.take_profit_ratio
+        state.risk_manager.daily_loss_limit = config.daily_loss_limit
+        state.risk_manager.max_trades_per_day = config.max_trades_per_day
+        state.risk_manager.max_position_size_ratio = config.max_position_size_ratio
         
         await state.broadcast({"type": "log", "message": "리스크 설정이 업데이트되었습니다.", "level": "info"})
         return JSONResponse({"success": True})
@@ -524,8 +573,10 @@ async def update_risk_config(config: RiskConfig, current_user: str = Depends(get
 async def update_strategy_config(config: StrategyConfig, current_user: str = Depends(get_current_user)):
     """전략 설정(이동평균 기간) 업데이트"""
     try:
-        if not state.strategy:
-            return JSONResponse({"success": False, "message": "전략이 초기화되지 않았습니다."})
+        if not state.strategy or not state.trenv or not state.risk_manager:
+            ok = _ensure_initialized()
+            if not ok or not state.strategy:
+                return JSONResponse({"success": False, "message": "전략이 초기화되지 않았습니다."})
 
         short_period = int(config.short_ma_period)
         long_period = int(config.long_ma_period)
@@ -595,7 +646,9 @@ async def select_stocks(current_user: str = Depends(get_current_user)):
     """종목 재선정"""
     try:
         if not state.stock_selector:
-            return JSONResponse({"success": False, "message": "종목 선정기가 초기화되지 않았습니다."})
+            ok = _ensure_initialized()
+            if not ok or not state.stock_selector:
+                return JSONResponse({"success": False, "message": "종목 선정기가 초기화되지 않았습니다."})
         
         selected = state.stock_selector.select_stocks_by_fluctuation()
         if not selected:
@@ -627,8 +680,14 @@ async def select_stocks(current_user: str = Depends(get_current_user)):
 async def execute_manual_order(order: ManualOrder, current_user: str = Depends(get_current_user)):
     """수동 주문 실행"""
     try:
-        if not state.strategy or not state.trenv:
-            return JSONResponse({"success": False, "message": "시스템이 초기화되지 않았습니다."})
+        if not state.strategy or not state.trenv or not state.risk_manager:
+            ok = _ensure_initialized()
+            if not ok or not state.strategy or not state.trenv or not state.risk_manager:
+                detail = getattr(state, "last_init_error", None)
+                msg = "시스템 초기화 실패: KIS 설정(.env/kis_devlp.yaml), 네트워크, 계정 설정을 확인하세요."
+                if detail:
+                    msg = f"{msg} (detail: {detail})"
+                return JSONResponse({"success": False, "message": msg})
         
         result = safe_execute_order(
             signal=order.order_type,
@@ -669,6 +728,7 @@ def initialize_trading_system(
 ):
     """거래 시스템 초기화"""
     try:
+        state.last_init_error = None
         svr = "vps" if is_paper_trading else "prod"
         ka.changeTREnv(None, svr=svr, product="01")
         ka.auth(svr=svr, product="01")
@@ -704,6 +764,7 @@ def initialize_trading_system(
         logger.info("거래 시스템 초기화 완료")
         return True
     except Exception as e:
+        state.last_init_error = str(e)
         logger.error(f"시스템 초기화 오류: {e}")
         return False
 
