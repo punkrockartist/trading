@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 로그 파일
+*.log
+quant_trading_*.log
+logs/
+
+# 설정 파일 (민감 정보 포함)
+config/kis_devlp.yaml
+.env
+.env.local
+
+# 문서 (일부만 제외)
+*.md
+!README.md
+!DEVELOPMENT_WORKFLOW.md
+!DOCKER_HUB_DEPLOY.md
+!DOCKER_LOGIN_FIX.md
+!DOCKER_PUSH_FIX.md
+!README_DOCKERHUB.md
+
+# 테스트
+test/
+tests/
+*.test.py
+
+# Docker
+.docker/
+
+# 기타
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
+
+# AWS 자격 증명 (로컬)
+.aws/
+aws-credentials.json
+
+# 임시 파일
+fix_domestic_stock.py
+*.pyc

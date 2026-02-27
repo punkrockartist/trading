@@ -1,0 +1,29 @@
+# FastAPI 및 웹 서버
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+python-multipart>=0.0.6
+
+# 인증 및 보안
+PyJWT>=2.8.0
+pycryptodome>=3.19.0
+
+# AWS DynamoDB
+boto3>=1.28.0
+botocore>=1.31.0
+
+# 데이터 처리
+pandas>=2.0.0
+numpy>=1.24.0
+
+# HTTP 클라이언트
+requests>=2.31.0
+
+# WebSocket
+websockets>=12.0
+
+# 설정 파일
+PyYAML>=6.0
+
+# 로깅 (내장이지만 명시)
+# logging - 내장 모듈

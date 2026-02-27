@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  quant-trading:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: quant-trading-dashboard
+    ports:
+      - "8000:8000"
+    environment:
+      # DynamoDB 설정 (환경변수로 오버라이드 가능)
+      - USE_DYNAMODB=${USE_DYNAMODB:-true}
+      - DYNAMODB_TABLE_NAME=${DYNAMODB_TABLE_NAME:-quant_trading_users}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
+      
+      # KIS API 설정 (필요시)
+      # - KIS_APP_KEY=${KIS_APP_KEY}
+      # - KIS_APP_SECRET=${KIS_APP_SECRET}
+      
+      # Python 설정
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app:/app/domestic_stock
+    volumes:
+      # 설정 파일 마운트 (선택)
+      - ./config:/app/config:ro
+      # 로그 파일 마운트 (선택)
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - quant-trading-network
+
+networks:
+  quant-trading-network:
+    driver: bridge

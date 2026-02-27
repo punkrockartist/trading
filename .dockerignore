@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 로그 파일
+*.log
+quant_trading_*.log
+
+# 설정 파일 (민감 정보 포함 가능)
+# config/kis_devlp.yaml  # 주의: 필요하면 복사하거나 볼륨 마운트
+
+# 문서
+*.md
+!README.md
+
+# 테스트
+test/
+tests/
+*.test.py
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# 기타
+.DS_Store
+Thumbs.db
