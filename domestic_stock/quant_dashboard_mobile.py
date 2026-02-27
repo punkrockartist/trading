@@ -57,6 +57,9 @@ class TradingState:
         self.current_positions: Dict[str, Dict] = {}
         self.selected_stocks: List[str] = []
         self.stock_selector: Optional[StockSelector] = None
+        self.pending_signals: Dict[str, Dict] = {}
+        self.engine_thread = None
+        self.engine_running = False
         
     async def broadcast(self, message: dict):
         """모든 WebSocket 클라이언트에 메시지 전송"""
@@ -107,6 +110,10 @@ class StockSelectionConfig(BaseModel):
     min_trade_amount: int = 0
     max_stocks: int
     exclude_risk_stocks: bool
+
+class StrategyConfig(BaseModel):
+    short_ma_period: int
+    long_ma_period: int
 
 class ManualOrder(BaseModel):
     stock_code: str

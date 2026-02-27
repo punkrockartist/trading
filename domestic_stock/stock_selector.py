@@ -6,7 +6,7 @@
 
 import sys
 import logging
-from typing import List
+from typing import Dict, List
 
 sys.path.extend(['..', '.'])
 from domestic_stock_functions import fluctuation
@@ -51,6 +51,7 @@ class StockSelector:
         self.min_trade_amount = min_trade_amount
         self.max_stocks = max_stocks
         self.exclude_risk_stocks = exclude_risk_stocks
+        self.last_selected_stock_info: List[Dict[str, str]] = []
     
     def select_stocks_by_fluctuation(self) -> List[str]:
         """
@@ -122,14 +123,35 @@ class StockSelector:
             # 종목코드 추출
             if "ISCD" in df_filtered.columns:  # 종목코드 컬럼
                 selected_codes = df_filtered["ISCD"].astype(str).str.strip().str.zfill(6).tolist()
+                code_col = "ISCD"
             elif "MKSC_SHRN_ISCD" in df_filtered.columns:
                 selected_codes = df_filtered["MKSC_SHRN_ISCD"].astype(str).str.strip().str.zfill(6).tolist()
+                code_col = "MKSC_SHRN_ISCD"
             else:
                 logging.error("종목 선정: 종목코드 컬럼을 찾을 수 없습니다.")
                 return []
             
             # 최대 종목 수로 제한
             selected_codes = selected_codes[:self.max_stocks]
+
+            # 종목명 정보 보관 (대시보드 표시용)
+            name_candidates = ["HTS_KOR_ISNM", "PRDT_NAME", "ISNM", "STCK_SHRN_ISCD_NM"]
+            name_col = next((c for c in name_candidates if c in df_filtered.columns), None)
+            selected_info: List[Dict[str, str]] = []
+            if name_col:
+                selected_df = df_filtered[[code_col, name_col]].copy()
+                selected_df[code_col] = selected_df[code_col].astype(str).str.strip().str.zfill(6)
+                selected_df = selected_df.drop_duplicates(subset=[code_col])
+                for code in selected_codes:
+                    matched = selected_df[selected_df[code_col] == code]
+                    if not matched.empty:
+                        stock_name = str(matched.iloc[0][name_col]).strip()
+                        selected_info.append({"code": code, "name": stock_name or code})
+                    else:
+                        selected_info.append({"code": code, "name": code})
+            else:
+                selected_info = [{"code": code, "name": code} for code in selected_codes]
+            self.last_selected_stock_info = selected_info
             
             logging.info(f"종목 선정 완료: {len(selected_codes)}개 종목 ({', '.join(selected_codes)})")
             return selected_codes

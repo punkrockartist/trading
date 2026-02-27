@@ -148,8 +148,12 @@ def changeTREnv(token_key, svr="prod", product=_cfg["my_prod"]):
         _isPaper = False
         _smartSleep = 0.05
     elif svr == "vps":  # 모의투자
-        ak1 = "paper_app"  # 모의투자용 앱키
-        ak2 = "paper_sec"  # 모의투자용 앱시크리트
+        # 모의 키가 없거나 placeholder면 실전 키로 fallback (계정/도메인은 vps 유지)
+        paper_app = str(_cfg.get("paper_app", "")).strip()
+        paper_sec = str(_cfg.get("paper_sec", "")).strip()
+        use_paper_keys = bool(paper_app and paper_sec and not paper_app.startswith("your_") and not paper_sec.startswith("your_"))
+        ak1 = "paper_app" if use_paper_keys else "my_app"
+        ak2 = "paper_sec" if use_paper_keys else "my_sec"
         _isPaper = True
         _smartSleep = 0.5
 
@@ -167,9 +171,9 @@ def changeTREnv(token_key, svr="prod", product=_cfg["my_prod"]):
     elif svr == "prod" and product == "29":  # 실전투자 퇴직연금계좌
         cfg["my_acct"] = _cfg["my_acct_stock"]
     elif svr == "vps" and product == "01":  # 모의투자 주식투자, 위탁계좌, 투자계좌
-        cfg["my_acct"] = _cfg["my_paper_stock"]
+        cfg["my_acct"] = _cfg.get("my_paper_stock") or _cfg.get("my_acct_stock", "")
     elif svr == "vps" and product == "03":  # 모의투자 선물옵션(파생)
-        cfg["my_acct"] = _cfg["my_paper_future"]
+        cfg["my_acct"] = _cfg.get("my_paper_future") or _cfg.get("my_acct_future", "")
 
     cfg["my_prod"] = product
     cfg["my_htsid"] = _cfg["my_htsid"]
@@ -669,7 +673,7 @@ class KISWebSocket:
     # private
     async def __subscriber(self, ws: websockets.ClientConnection):
         async for raw in ws:
-            logging.info("received message >> %s" % raw)
+            logging.debug("received message >> %s" % raw)
             show_result = False
 
             df = pd.DataFrame()
