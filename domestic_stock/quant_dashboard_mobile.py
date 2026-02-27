@@ -335,7 +335,9 @@ def get_login_html() -> str:
             <button type="submit" class="btn">로그인</button>
         </form>
         <div class="link">
+            <!--
             <a href="/register">계정이 없으신가요? 회원가입</a>
+            -->
         </div>
     </div>
     <script>
