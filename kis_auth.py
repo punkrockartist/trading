@@ -32,17 +32,19 @@ from Crypto.Util.Padding import unpad
 clearConsole = lambda: os.system("cls" if os.name in ("nt", "dos") else "clear")
 
 key_bytes = 32
-config_root = os.path.join(os.path.expanduser("~"), "kis-api", "config")
-# config_root = "$HOME/KIS/config/"  # 토큰 파일이 저장될 폴더, 제3자가 찾기 어렵도록 경로 설정하시기 바랍니다.
-# token_tmp = config_root + 'KIS000000'  # 토큰 로컬저장시 파일 이름 지정, 파일이름을 토큰값이 유추가능한 파일명은 삼가바랍니다.
-# token_tmp = config_root + 'KIS' + datetime.today().strftime("%Y%m%d%H%M%S")  # 토큰 로컬저장시 파일명 년월일시분초
-token_tmp = os.path.join(
-    config_root, f"KIS{datetime.today().strftime("%Y%m%d")}"
-)  # 토큰 로컬저장시 파일명 년월일
+config_root = os.getenv(
+    "KIS_CONFIG_ROOT", os.path.join(os.path.expanduser("~"), "kis-api", "config")
+)
+# 토큰 파일은 config와 분리된 쓰기 가능 경로에 저장 (컨테이너에서 config를 :ro로 마운트하는 경우 대비)
+token_root = os.getenv(
+    "KIS_TOKEN_ROOT", os.path.join(os.path.expanduser("~"), "kis-api", "token")
+)
+token_tmp = os.path.join(token_root, f"KIS{datetime.today().strftime('%Y%m%d')}")
 
 # 접근토큰 관리하는 파일 존재여부 체크, 없으면 생성
 # 디렉토리가 없으면 생성
 os.makedirs(config_root, exist_ok=True)
+os.makedirs(token_root, exist_ok=True)
 if os.path.exists(token_tmp) == False:
     f = open(token_tmp, "w+")
     f.close()
