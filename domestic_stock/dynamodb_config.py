@@ -44,9 +44,10 @@ from typing import Optional
 
 # DynamoDB 설정
 DYNAMODB_CONFIG = {
-    "use_dynamodb": True,  # False면 인메모리 저장소 사용
-    "table_name": "quant_trading_users",
-    "region": "us-east-1",  # 리전 설정 (us-east-1, ap-northeast-2 등)
+    # 환경변수가 있으면 환경변수를 우선 적용 (컨테이너/배포 환경에서 제어 가능하게)
+    "use_dynamodb": os.getenv("USE_DYNAMODB", "true").lower() == "true",
+    "table_name": os.getenv("DYNAMODB_TABLE_NAME", "quant_trading_users"),
+    "region": os.getenv("AWS_DEFAULT_REGION", os.getenv("AWS_REGION", "us-east-1")),
     
     # 방법 3을 사용하는 경우에만 아래 값 설정
     # 환경변수가 있으면 환경변수가 우선 적용됨

@@ -11,6 +11,7 @@ import jwt
 from datetime import datetime, timedelta
 from typing import Optional, Dict
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,50 @@ logger = logging.getLogger(__name__)
 SECRET_KEY = secrets.token_urlsafe(32)  # 실제 운영에서는 환경변수로 관리
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24시간
+
+
+def _load_dotenv_file(dotenv_path: str) -> bool:
+    """Load KEY=VALUE pairs into os.environ (does not override existing)."""
+    try:
+        with open(dotenv_path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export ") :].strip()
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception as e:
+        logger.warning(f".env 로드 실패: {e}")
+        return False
+
+
+def _maybe_load_dotenv():
+    """Best-effort: load .env from common config locations."""
+    candidates = []
+    explicit = os.getenv("ENV_FILE") or os.getenv("DOTENV_PATH")
+    if explicit:
+        candidates.append(explicit)
+    config_root = os.getenv("KIS_CONFIG_ROOT", "/root/kis-api/config")
+    candidates.append(os.path.join(config_root, ".env"))
+    candidates.append("/app/config/.env")
+
+    for p in candidates:
+        if _load_dotenv_file(p):
+            logger.info(f".env 로드: {p}")
+            break
+
+
+_maybe_load_dotenv()
 
 # ============================================================================
 # 간단한 인메모리 사용자 저장소 (개발용)
@@ -75,8 +120,7 @@ class SimpleUserStore:
 
 try:
     import boto3
-    from botocore.exceptions import ClientError
-    import os
+    from botocore.exceptions import ClientError, NoCredentialsError
     
     class DynamoDBUserStore:
         """DynamoDB 사용자 저장소"""
@@ -249,14 +293,25 @@ class AuthManager:
             aws_session_token: AWS Session Token (임시 자격 증명용, 선택)
         """
         if use_dynamodb and DYNAMODB_AVAILABLE:
-            self.user_store = DynamoDBUserStore(
-                table_name=table_name,
-                region=region,
-                aws_access_key_id=aws_access_key_id,
-                aws_secret_access_key=aws_secret_access_key,
-                aws_session_token=aws_session_token
-            )
-            logger.info("DynamoDB 사용자 저장소 사용")
+            try:
+                self.user_store = DynamoDBUserStore(
+                    table_name=table_name,
+                    region=region,
+                    aws_access_key_id=aws_access_key_id,
+                    aws_secret_access_key=aws_secret_access_key,
+                    aws_session_token=aws_session_token
+                )
+                logger.info("DynamoDB 사용자 저장소 사용")
+            except NoCredentialsError:
+                self.user_store = SimpleUserStore()
+                logger.warning(
+                    "DynamoDB를 요청했지만 AWS 자격 증명을 찾지 못해 인메모리 저장소로 전환합니다. "
+                    "해결: USE_DYNAMODB=false 또는 AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY 설정, "
+                    "혹은 EC2 IAM Role(Instance Profile) 부여"
+                )
+            except ClientError as e:
+                self.user_store = SimpleUserStore()
+                logger.warning(f"DynamoDB 초기화 실패로 인메모리 저장소로 전환합니다: {e}")
         else:
             self.user_store = SimpleUserStore()
             if use_dynamodb:
