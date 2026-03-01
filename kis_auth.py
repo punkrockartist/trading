@@ -32,12 +32,14 @@ from Crypto.Util.Padding import unpad
 clearConsole = lambda: os.system("cls" if os.name in ("nt", "dos") else "clear")
 
 key_bytes = 32
+# 기본 경로: 이 프로젝트(레포) 루트의 config 폴더 (clone 폴더명이 trading이든 kis-api든 상관없음)
+_project_root = os.path.dirname(os.path.abspath(__file__))
 config_root = os.getenv(
-    "KIS_CONFIG_ROOT", os.path.join(os.path.expanduser("~"), "kis-api", "config")
+    "KIS_CONFIG_ROOT", os.path.join(_project_root, "config")
 )
 # 토큰 파일은 config와 분리된 쓰기 가능 경로에 저장 (컨테이너에서 config를 :ro로 마운트하는 경우 대비)
 token_root = os.getenv(
-    "KIS_TOKEN_ROOT", os.path.join(os.path.expanduser("~"), "kis-api", "token")
+    "KIS_TOKEN_ROOT", os.path.join(_project_root, "config", "token")
 )
 token_tmp = os.path.join(token_root, f"KIS{datetime.today().strftime('%Y%m%d')}")
 

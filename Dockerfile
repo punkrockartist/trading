@@ -18,12 +18,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 애플리케이션 코드 복사
 COPY . .
 
-# kis_auth.py가 사용하는 디렉토리 생성 및 config 파일 복사
-RUN mkdir -p /root/kis-api/config && \
-    mkdir -p /app/config
-
-# config 디렉토리 복사 (kis_devlp.yaml 포함)
-COPY config/ /root/kis-api/config/
+# config 디렉토리 (kis_auth는 프로젝트 루트/config 사용)
+RUN mkdir -p /app/config
+COPY config/ /app/config/
 
 # 환경 변수 설정
 ENV PYTHONUNBUFFERED=1

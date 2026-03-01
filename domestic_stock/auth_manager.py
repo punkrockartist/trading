@@ -52,7 +52,8 @@ def _maybe_load_dotenv():
     explicit = os.getenv("ENV_FILE") or os.getenv("DOTENV_PATH")
     if explicit:
         candidates.append(explicit)
-    config_root = os.getenv("KIS_CONFIG_ROOT", "/root/kis-api/config")
+    _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    config_root = os.getenv("KIS_CONFIG_ROOT", os.path.join(_project_root, "config"))
     candidates.append(os.path.join(config_root, ".env"))
     candidates.append("/app/config/.env")
 

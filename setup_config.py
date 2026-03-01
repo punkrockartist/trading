@@ -7,8 +7,9 @@ import os
 import yaml
 from pathlib import Path
 
-# 설정 파일 경로
-config_root = os.path.join(os.path.expanduser("~"), "kis-api", "config")
+# 설정 파일 경로: 이 프로젝트 루트의 config 폴더
+_project_root = os.path.dirname(os.path.abspath(__file__))
+config_root = os.path.join(_project_root, "config")
 config_file = os.path.join(config_root, "kis_devlp.yaml")
 
 def create_config():
