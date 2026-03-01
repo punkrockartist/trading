@@ -4,7 +4,7 @@ API 엔드포인트 모듈 (모바일 대시보드용)
 기존 quant_dashboard.py의 API를 인증 의존성과 함께 제공
 """
 
-from fastapi import Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi import Depends, HTTPException, WebSocket, WebSocketDisconnect, Query, Body
 from fastapi.responses import JSONResponse
 from typing import Dict, List, Optional
 from datetime import datetime
@@ -185,6 +185,60 @@ def _create_or_replace_pending_signal(signal_data: dict) -> Optional[dict]:
         return signal_data
 
 
+def _build_positions_message():
+    """리스크 매니저 포지션을 브로드캐스트용 dict로 변환"""
+    if not state.risk_manager:
+        return {}
+    positions = {}
+    for code, pos in state.risk_manager.positions.items():
+        positions[code] = {
+            "quantity": pos["quantity"],
+            "buy_price": pos["buy_price"],
+            "current_price": pos.get("current_price", pos["buy_price"]),
+            "buy_time": pos["buy_time"].isoformat() if isinstance(pos.get("buy_time"), datetime) else str(pos.get("buy_time", ""))
+        }
+    return positions
+
+
+def _handle_signal(stock_code: str, signal: str, price: float, reason: str):
+    """신호 처리: 수동 모드면 승인대기 등록, 자동 모드면 즉시 주문 실행"""
+    manual = getattr(state, "manual_approval", True)
+    if manual:
+        sig = _build_pending_signal(stock_code=stock_code, signal=signal, price=price, reason=reason)
+        created = _create_or_replace_pending_signal(sig)
+        if created:
+            _run_async_broadcast({"type": "signal_pending", "data": created})
+        return
+
+    result = safe_execute_order(
+        signal=signal,
+        stock_code=stock_code,
+        price=price,
+        strategy=state.strategy,
+        trenv=state.trenv,
+        is_paper_trading=state.is_paper_trading,
+        manual_approval=False
+    )
+    if not result:
+        return
+    suggested_qty = 0
+    if signal == "buy" and state.risk_manager:
+        suggested_qty = state.risk_manager.calculate_quantity(price)
+    elif signal == "sell" and state.risk_manager and stock_code in state.risk_manager.positions:
+        suggested_qty = state.risk_manager.positions[stock_code]["quantity"]
+    trade_info = {
+        "stock_code": stock_code,
+        "order_type": signal,
+        "quantity": suggested_qty,
+        "price": price,
+        "pnl": None
+    }
+    state.add_trade(trade_info)
+    _run_async_broadcast({"type": "trade", "data": trade_info})
+    _run_async_broadcast({"type": "position", "data": _build_positions_message()})
+    _run_async_broadcast({"type": "log", "message": f"자동 체결: {stock_code} {signal.upper()} {price:,.0f}원", "level": "info"})
+
+
 def _start_trading_engine_thread():
     """실시간 체결 수신 -> 신호 생성 -> 승인 대기 등록."""
     if state.engine_running:
@@ -217,15 +271,7 @@ def _start_trading_engine_thread():
 
                         sell_signal = state.risk_manager.check_stop_loss_take_profit(stock_code, current_price)
                         if sell_signal:
-                            signal = _build_pending_signal(
-                                stock_code=stock_code,
-                                signal="sell",
-                                price=current_price,
-                                reason="손절/익절 조건 충족",
-                            )
-                            created = _create_or_replace_pending_signal(signal)
-                            if created:
-                                _run_async_broadcast({"type": "signal_pending", "data": created})
+                            _handle_signal(stock_code, "sell", current_price, "손절/익절 조건 충족")
                             continue
 
                         short_ma = state.strategy.calculate_ma(stock_code, state.strategy.short_ma_period)
@@ -242,15 +288,7 @@ def _start_trading_engine_thread():
                             elif short_ma < long_ma and stock_code in state.risk_manager.positions:
                                 signal_type = "sell"
                         if signal_type:
-                            signal = _build_pending_signal(
-                                stock_code=stock_code,
-                                signal=signal_type,
-                                price=current_price,
-                                reason="이동평균 크로스 조건 충족",
-                            )
-                            created = _create_or_replace_pending_signal(signal)
-                            if created:
-                                _run_async_broadcast({"type": "signal_pending", "data": created})
+                            _handle_signal(stock_code, signal_type, current_price, "이동평균 크로스 조건 충족")
                     except Exception:
                         continue
 
@@ -292,6 +330,8 @@ async def send_status_update():
             "type": "status",
             "data": {
                 "is_running": state.is_running,
+                "is_paper_trading": state.is_paper_trading,
+                "manual_approval": getattr(state, "manual_approval", True),
                 "env_name": "모의투자" if state.is_paper_trading else "실전투자",
                 "account_balance": state.risk_manager.account_balance,
                 "daily_pnl": state.risk_manager.daily_pnl,
@@ -323,6 +363,8 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
     if not state.risk_manager:
         return JSONResponse({
             "is_running": False,
+            "is_paper_trading": getattr(state, "is_paper_trading", True),
+            "manual_approval": getattr(state, "manual_approval", True),
             "env_name": "-",
             "account_balance": 0,
             "daily_pnl": 0,
@@ -333,6 +375,8 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
     
     return JSONResponse({
         "is_running": state.is_running,
+        "is_paper_trading": state.is_paper_trading,
+        "manual_approval": getattr(state, "manual_approval", True),
         "env_name": "모의투자" if state.is_paper_trading else "실전투자",
         "account_balance": state.risk_manager.account_balance,
         "daily_pnl": state.risk_manager.daily_pnl,
@@ -372,6 +416,56 @@ async def start_system(current_user: str = Depends(get_current_user)):
     except Exception as e:
         logger.error(f"시스템 시작 오류: {e}")
         return JSONResponse({"success": False, "message": str(e)})
+
+@app.post("/api/system/set-env")
+async def set_trading_env(
+    body: dict = Body(...),
+    current_user: str = Depends(get_current_user)
+):
+    """모의투자/실전투자 환경 전환 (시스템 중지 상태에서만 가능)"""
+    is_paper_trading = body.get("is_paper_trading", True)
+    if not isinstance(is_paper_trading, bool):
+        is_paper_trading = str(is_paper_trading).lower() in ("true", "1", "yes")
+    try:
+        if state.is_running:
+            return JSONResponse({
+                "success": False,
+                "message": "시스템을 중지한 후 투자 환경을 변경할 수 있습니다."
+            })
+        balance = float(getattr(state.risk_manager, "account_balance", 100000) if state.risk_manager else 100000)
+        ok = initialize_trading_system(account_balance=balance, is_paper_trading=is_paper_trading)
+        if not ok:
+            detail = getattr(state, "last_init_error", None)
+            msg = "환경 전환 실패: KIS 설정·네트워크·계정을 확인하세요."
+            if detail:
+                msg = f"{msg} ({detail})"
+            return JSONResponse({"success": False, "message": msg})
+        await send_status_update()
+        env_label = "모의투자" if is_paper_trading else "실전투자"
+        return JSONResponse({"success": True, "message": f"환경이 {env_label}(으)로 변경되었습니다.", "is_paper_trading": is_paper_trading})
+    except Exception as e:
+        logger.error(f"환경 전환 오류: {e}")
+        return JSONResponse({"success": False, "message": str(e)})
+
+
+@app.post("/api/system/set-trade-mode")
+async def set_trade_mode(
+    body: dict = Body(...),
+    current_user: str = Depends(get_current_user)
+):
+    """매매 모드 전환: 수동(승인대기) / 자동(즉시 체결)"""
+    try:
+        manual_approval = body.get("manual_approval", True)
+        if not isinstance(manual_approval, bool):
+            manual_approval = str(manual_approval).lower() in ("true", "1", "yes")
+        state.manual_approval = manual_approval
+        await send_status_update()
+        label = "수동(승인대기)" if manual_approval else "자동(즉시 체결)"
+        return JSONResponse({"success": True, "message": f"매매 모드가 {label}(으)로 변경되었습니다.", "manual_approval": manual_approval})
+    except Exception as e:
+        logger.error(f"매매 모드 전환 오류: {e}")
+        return JSONResponse({"success": False, "message": str(e)})
+
 
 @app.post("/api/system/stop")
 async def stop_system(

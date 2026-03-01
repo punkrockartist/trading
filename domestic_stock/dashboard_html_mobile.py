@@ -17,20 +17,21 @@ def get_dashboard_html_mobile(username: str) -> str:
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background: #f5f5f5;
-            color: #333;
+            background: #161b22;
+            color: #e6edf3;
             padding: 0;
             -webkit-font-smoothing: antialiased;
             -moz-osx-font-smoothing: grayscale;
         }}
         .header {{
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            background: linear-gradient(135deg, #21262d 0%, #30363d 50%, #161b22 100%);
+            color: #e6edf3;
             padding: 15px 20px;
             position: sticky;
             top: 0;
             z-index: 100;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            box-shadow: 0 2px 12px rgba(0,0,0,0.35);
+            border-bottom: 1px solid #30363d;
         }}
         .header-top {{
             display: flex;
@@ -44,7 +45,7 @@ def get_dashboard_html_mobile(username: str) -> str:
         }}
         .header-user {{
             font-size: 12px;
-            opacity: 0.9;
+            color: #8b949e;
         }}
         .status {{
             display: inline-block;
@@ -54,47 +55,48 @@ def get_dashboard_html_mobile(username: str) -> str:
             font-weight: 600;
             margin-left: 8px;
         }}
-        .status.running {{ background: rgba(76, 175, 80, 0.3); border: 1px solid #4caf50; }}
-        .status.stopped {{ background: rgba(244, 67, 54, 0.3); border: 1px solid #f44336; }}
+        .status.running {{ background: rgba(63, 185, 80, 0.25); border: 1px solid #3fb950; color: #3fb950; }}
+        .status.stopped {{ background: rgba(248, 81, 73, 0.25); border: 1px solid #f85149; color: #f85149; }}
         .container {{
             padding: 15px;
             max-width: 100%;
         }}
         .card {{
-            background: white;
+            background: #21262d;
             border-radius: 12px;
             padding: 15px;
             margin-bottom: 15px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            box-shadow: 0 2px 12px rgba(0,0,0,0.25);
+            border: 1px solid #30363d;
         }}
         .card h2 {{
-            color: #667eea;
+            color: #7ee787;
             font-size: 16px;
             margin-bottom: 12px;
             padding-bottom: 8px;
-            border-bottom: 2px solid #f0f0f0;
+            border-bottom: 1px solid #30363d;
         }}
         .metric {{
             display: flex;
             justify-content: space-between;
             padding: 10px 0;
-            border-bottom: 1px solid #f0f0f0;
+            border-bottom: 1px solid #30363d;
         }}
         .metric:last-child {{ border-bottom: none; }}
         .metric-label {{
-            color: #666;
+            color: #8b949e;
             font-size: 14px;
         }}
         .metric-value {{
             font-weight: 600;
             font-size: 14px;
-            color: #333;
+            color: #e6edf3;
         }}
-        .metric-value.positive {{ color: #4caf50; }}
-        .metric-value.negative {{ color: #f44336; }}
+        .metric-value.positive {{ color: #3fb950; }}
+        .metric-value.negative {{ color: #f85149; }}
         .btn {{
-            background: #667eea;
-            color: white;
+            background: #388bfd;
+            color: #fff;
             border: none;
             padding: 12px 20px;
             border-radius: 8px;
@@ -108,18 +110,55 @@ def get_dashboard_html_mobile(username: str) -> str:
         }}
         .btn:active {{
             transform: scale(0.98);
-            background: #5568d3;
+            background: #2563eb;
         }}
         .btn-danger {{
-            background: #f44336;
+            background: #da3633;
         }}
         .btn-danger:active {{
-            background: #d32f2f;
+            background: #b62324;
+        }}
+        .env-selector {{
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+        }}
+        .env-selector .metric-label {{
+            flex: 0 0 auto;
+            margin-right: 4px;
+        }}
+        .env-btn {{
+            flex: 1;
+            min-width: 90px;
+            padding: 8px 14px;
+            border-radius: 8px;
+            border: 1px solid #30363d;
+            background: #21262d;
+            color: #8b949e;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }}
+        .env-btn.active {{
+            background: #388bfd;
+            border-color: #388bfd;
+            color: #fff;
+        }}
+        .env-btn:not(.active):hover {{
+            background: #30363d;
+            border-color: #8b949e;
+            color: #e6edf3;
+        }}
+        .env-btn:disabled {{
+            opacity: 0.5;
+            cursor: not-allowed;
         }}
         .modal-overlay {{
             position: fixed;
             top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(0,0,0,0.45);
+            background: rgba(0,0,0,0.7);
             display: none;
             align-items: center;
             justify-content: center;
@@ -127,28 +166,29 @@ def get_dashboard_html_mobile(username: str) -> str:
             padding: 20px;
         }}
         .modal {{
-            background: white;
+            background: #21262d;
             border-radius: 14px;
             width: 100%;
             max-width: 420px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.25);
+            box-shadow: 0 10px 40px rgba(0,0,0,0.5);
             overflow: hidden;
+            border: 1px solid #30363d;
         }}
         .modal-header {{
             padding: 14px 16px;
-            border-bottom: 1px solid #f0f0f0;
+            border-bottom: 1px solid #30363d;
             font-weight: 700;
-            color: #111827;
+            color: #e6edf3;
         }}
         .modal-body {{
             padding: 16px;
-            color: #374151;
+            color: #c9d1d9;
             font-size: 14px;
             line-height: 1.5;
         }}
         .modal-footer {{
             padding: 12px 16px;
-            border-top: 1px solid #f0f0f0;
+            border-top: 1px solid #30363d;
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 10px;
@@ -158,14 +198,17 @@ def get_dashboard_html_mobile(username: str) -> str:
             gap: 10px;
             align-items: center;
             padding: 10px 12px;
-            border: 1px solid #e5e7eb;
+            border: 1px solid #30363d;
             border-radius: 10px;
-            background: #fafafa;
+            background: #161b22;
             margin-top: 12px;
         }}
         .checkbox-row input {{
             width: auto;
             margin: 0;
+        }}
+        .checkbox-row label {{
+            color: #c9d1d9;
         }}
         .btn-group {{
             display: grid;
@@ -177,15 +220,17 @@ def get_dashboard_html_mobile(username: str) -> str:
             width: 100%;
             padding: 12px;
             margin: 8px 0;
-            border: 2px solid #e0e0e0;
+            border: 1px solid #30363d;
             border-radius: 8px;
             font-size: 14px;
+            background: #161b22;
+            color: #e6edf3;
             -webkit-appearance: none;
             appearance: none;
         }}
         input:focus, select:focus {{
             outline: none;
-            border-color: #667eea;
+            border-color: #388bfd;
         }}
         .form-group {{
             margin: 12px 0;
@@ -193,7 +238,7 @@ def get_dashboard_html_mobile(username: str) -> str:
         .form-group label {{
             display: block;
             margin-bottom: 6px;
-            color: #666;
+            color: #8b949e;
             font-weight: 600;
             font-size: 13px;
         }}
@@ -205,18 +250,19 @@ def get_dashboard_html_mobile(username: str) -> str:
         th, td {{
             padding: 8px;
             text-align: left;
-            border-bottom: 1px solid #f0f0f0;
+            border-bottom: 1px solid #30363d;
+            color: #c9d1d9;
         }}
         th {{
-            background: #f8f8f8;
-            color: #667eea;
+            background: #161b22;
+            color: #7ee787;
             font-weight: 600;
             font-size: 11px;
             text-transform: uppercase;
         }}
         .log {{
-            background: #1e1e1e;
-            color: #d4d4d4;
+            background: #0d1117;
+            color: #c9d1d9;
             padding: 12px;
             border-radius: 8px;
             max-height: 200px;
@@ -224,23 +270,27 @@ def get_dashboard_html_mobile(username: str) -> str:
             font-family: 'Courier New', monospace;
             font-size: 11px;
             -webkit-overflow-scrolling: touch;
+            border: 1px solid #30363d;
         }}
         .log-entry {{
             margin: 4px 0;
             padding: 4px;
             word-break: break-word;
         }}
-        .log-entry.info {{ color: #4ec9b0; }}
-        .log-entry.warning {{ color: #dcdcaa; }}
-        .log-entry.error {{ color: #f48771; }}
+        .log-entry.info {{ color: #7ee787; }}
+        .log-entry.warning {{ color: #d29922; }}
+        .log-entry.error {{ color: #f85149; }}
         .logout-btn {{
             background: transparent;
-            border: 1px solid rgba(255,255,255,0.3);
-            color: white;
+            border: 1px solid #8b949e;
+            color: #e6edf3;
             padding: 6px 12px;
             border-radius: 6px;
             font-size: 12px;
             cursor: pointer;
+        }}
+        .logout-btn:hover {{
+            background: rgba(255,255,255,0.08);
         }}
         .tabs {{
             display: flex;
@@ -251,18 +301,23 @@ def get_dashboard_html_mobile(username: str) -> str:
         }}
         .tab {{
             padding: 8px 16px;
-            background: white;
-            border: none;
+            background: #21262d;
+            border: 1px solid #30363d;
             border-radius: 8px;
             font-size: 13px;
             font-weight: 600;
-            color: #666;
+            color: #8b949e;
             cursor: pointer;
             white-space: nowrap;
         }}
+        .tab:hover {{
+            color: #e6edf3;
+            border-color: #8b949e;
+        }}
         .tab.active {{
-            background: #667eea;
-            color: white;
+            background: #388bfd;
+            border-color: #388bfd;
+            color: #fff;
         }}
         .tab-content {{
             display: none;
@@ -313,8 +368,20 @@ def get_dashboard_html_mobile(username: str) -> str:
             <div class="card">
                 <h2>시스템 상태</h2>
                 <div class="metric">
-                    <span class="metric-label">환경:</span>
-                    <span class="metric-value" id="env">-</span>
+                    <div class="env-selector">
+                        <span class="metric-label">투자 환경:</span>
+                        <button type="button" id="env-btn-paper" class="env-btn active" onclick="setTradingEnv(true)" title="시스템 중지 시에만 변경 가능">모의 투자</button>
+                        <button type="button" id="env-btn-real" class="env-btn" onclick="setTradingEnv(false)" title="시스템 중지 시에만 변경 가능">실전 투자</button>
+                    </div>
+                    <span class="metric-value" id="env" style="display:block; margin-top:6px; font-size:12px; color:#8b949e;">-</span>
+                </div>
+                <div class="metric">
+                    <div class="env-selector">
+                        <span class="metric-label">매매 방식:</span>
+                        <button type="button" id="trade-mode-manual" class="env-btn active" onclick="setTradeMode(true)" title="신호 발생 시 승인대기 후 수동 승인">수동</button>
+                        <button type="button" id="trade-mode-auto" class="env-btn" onclick="setTradeMode(false)" title="신호 발생 시 즉시 자동 매수/매도">자동</button>
+                    </div>
+                    <span class="metric-value" id="trade_mode_label" style="display:block; margin-top:6px; font-size:12px; color:#8b949e;">승인대기 후 수동</span>
                 </div>
                 <div class="metric">
                     <span class="metric-label">계좌 잔고:</span>
@@ -337,7 +404,7 @@ def get_dashboard_html_mobile(username: str) -> str:
             <div class="card">
                 <h2>선정 종목 리스트</h2>
                 <div id="selected_stocks">
-                    <p style="color: #999; text-align: center; padding: 20px;">선정된 종목이 없습니다.</p>
+                    <p style="color: #8b949e; text-align: center; padding: 20px;">선정된 종목이 없습니다.</p>
                 </div>
             </div>
         </div>
@@ -347,7 +414,7 @@ def get_dashboard_html_mobile(username: str) -> str:
             <div class="card">
                 <h2>현재 포지션</h2>
                 <div id="positions">
-                    <p style="color: #999; text-align: center; padding: 20px;">보유 종목이 없습니다.</p>
+                    <p style="color: #8b949e; text-align: center; padding: 20px;">보유 종목이 없습니다.</p>
                 </div>
             </div>
         </div>
@@ -446,7 +513,7 @@ def get_dashboard_html_mobile(username: str) -> str:
             <div class="card">
                 <h2>승인 대기 신호</h2>
                 <div id="pending_signals">
-                    <p style="color: #999; text-align: center; padding: 20px;">대기 중인 신호가 없습니다.</p>
+                    <p style="color: #8b949e; text-align: center; padding: 20px;">대기 중인 신호가 없습니다.</p>
                 </div>
             </div>
         </div>
@@ -494,7 +561,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                         보유 포지션 전량 시장가 청산 후 중지
                     </label>
                 </div>
-                <div style="margin-top:10px; font-size:12px; color:#6b7280;">
+                <div style="margin-top:10px; font-size:12px; color:#8b949e;">
                     청산을 선택하면 보유 종목을 시장가로 매도 주문합니다.
                 </div>
             </div>
@@ -589,7 +656,7 @@ def get_dashboard_html_mobile(username: str) -> str:
             const container = document.getElementById('pending_signals');
             const list = Object.values(pendingSignals);
             if (!list.length) {{
-                container.innerHTML = '<p style="color: #999; text-align: center; padding: 20px;">대기 중인 신호가 없습니다.</p>';
+                container.innerHTML = '<p style="color: #8b949e; text-align: center; padding: 20px;">대기 중인 신호가 없습니다.</p>';
                 return;
             }}
 
@@ -604,8 +671,8 @@ def get_dashboard_html_mobile(username: str) -> str:
                                 ${{signal.signal === 'buy' ? '매수' : '매도'}}
                             </span>
                         </div>
-                        <div style="font-size:13px; color:#666; margin-bottom:4px;">가격: ${{formatNumber(signal.price)}}원</div>
-                        <div style="font-size:13px; color:#666; margin-bottom:4px;">수량(제안): ${{signal.suggested_qty}}주</div>
+                        <div style="font-size:13px; color:#8b949e; margin-bottom:4px;">가격: ${{formatNumber(signal.price)}}원</div>
+                        <div style="font-size:13px; color:#8b949e; margin-bottom:4px;">수량(제안): ${{signal.suggested_qty}}주</div>
                         <div style="font-size:12px; color:#888; margin-bottom:10px;">사유: ${{signal.reason}}</div>
                         <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
                             <button class="btn" onclick="approveSignal('${{signal.signal_id}}')" style="margin:0;">승인</button>
@@ -669,6 +736,30 @@ def get_dashboard_html_mobile(username: str) -> str:
             document.getElementById('status').textContent = data.is_running ? '실행 중' : '중지됨';
             document.getElementById('status').className = 'status ' + (data.is_running ? 'running' : 'stopped');
             document.getElementById('env').textContent = data.env_name || '-';
+            const isPaper = data.is_paper_trading !== false;
+            const paperBtn = document.getElementById('env-btn-paper');
+            const realBtn = document.getElementById('env-btn-real');
+            if (paperBtn) {{
+                paperBtn.classList.toggle('active', isPaper);
+                paperBtn.disabled = !!data.is_running;
+            }}
+            if (realBtn) {{
+                realBtn.classList.toggle('active', !isPaper);
+                realBtn.disabled = !!data.is_running;
+            }}
+            const manualApproval = data.manual_approval !== false;
+            const manualBtn = document.getElementById('trade-mode-manual');
+            const autoBtn = document.getElementById('trade-mode-auto');
+            const tradeModeLabel = document.getElementById('trade_mode_label');
+            if (manualBtn) {{
+                manualBtn.classList.toggle('active', manualApproval);
+            }}
+            if (autoBtn) {{
+                autoBtn.classList.toggle('active', !manualApproval);
+            }}
+            if (tradeModeLabel) {{
+                tradeModeLabel.textContent = manualApproval ? '승인대기 후 수동' : '즉시 자동 체결';
+            }}
             document.getElementById('balance').textContent = formatNumber(data.account_balance) + '원';
             document.getElementById('daily_pnl').textContent = formatNumber(data.daily_pnl) + '원';
             document.getElementById('daily_pnl').className = 'metric-value ' + (data.daily_pnl >= 0 ? 'positive' : 'negative');
@@ -685,7 +776,7 @@ def get_dashboard_html_mobile(username: str) -> str:
         function renderSelectedStocks(stocks) {{
             const container = document.getElementById('selected_stocks');
             if (!stocks || stocks.length === 0) {{
-                container.innerHTML = '<p style="color: #999; text-align: center; padding: 20px;">선정된 종목이 없습니다.</p>';
+                container.innerHTML = '<p style="color: #8b949e; text-align: center; padding: 20px;">선정된 종목이 없습니다.</p>';
                 return;
             }}
 
@@ -693,7 +784,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                 const code = (typeof item === 'string') ? item : (item.code || '-');
                 const name = (typeof item === 'string') ? '' : (item.name || '');
                 const label = name ? `${{code}} · ${{name}}` : code;
-                return `<span style="display:inline-block; padding:6px 10px; margin:4px; border-radius:999px; background:#eef2ff; color:#374151; font-weight:600; font-size:13px;">${{label}}</span>`;
+                return `<span style="display:inline-block; padding:6px 10px; margin:4px; border-radius:999px; background:#30363d; color:#e6edf3; font-weight:600; font-size:13px; border:1px solid #484f58;">${{label}}</span>`;
             }}).join('');
             container.innerHTML = `<div>${{chips}}</div>`;
         }}
@@ -701,7 +792,7 @@ def get_dashboard_html_mobile(username: str) -> str:
         function updatePositions(positions) {{
             const container = document.getElementById('positions');
             if (!positions || Object.keys(positions).length === 0) {{
-                container.innerHTML = '<p style="color: #999; text-align: center; padding: 20px;">보유 종목이 없습니다.</p>';
+                container.innerHTML = '<p style="color: #8b949e; text-align: center; padding: 20px;">보유 종목이 없습니다.</p>';
                 return;
             }}
             
@@ -744,6 +835,44 @@ def get_dashboard_html_mobile(username: str) -> str:
 
         function formatNumber(num) {{
             return new Intl.NumberFormat('ko-KR').format(num);
+        }}
+
+        async function setTradingEnv(isPaper) {{
+            try {{
+                const response = await fetch('/api/system/set-env', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ is_paper_trading: isPaper }})
+                }});
+                const data = await response.json();
+                if (data.success) {{
+                    addLog(data.message || (isPaper ? '모의 투자로 변경됨' : '실전 투자로 변경됨'), 'info');
+                    refreshData();
+                }} else {{
+                    addLog('환경 변경 실패: ' + (data.message || '알 수 없는 오류'), 'error');
+                }}
+            }} catch (error) {{
+                addLog('오류: ' + error, 'error');
+            }}
+        }}
+
+        async function setTradeMode(manualApproval) {{
+            try {{
+                const response = await fetch('/api/system/set-trade-mode', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ manual_approval: manualApproval }})
+                }});
+                const data = await response.json();
+                if (data.success) {{
+                    addLog(data.message || (manualApproval ? '수동(승인대기) 모드' : '자동 체결 모드'), 'info');
+                    refreshData();
+                }} else {{
+                    addLog('매매 모드 변경 실패: ' + (data.message || '알 수 없는 오류'), 'error');
+                }}
+            }} catch (error) {{
+                addLog('오류: ' + error, 'error');
+            }}
         }}
 
         async function startSystem() {{

@@ -51,6 +51,7 @@ class TradingState:
         self.strategy: Optional[QuantStrategy] = None
         self.trenv = None
         self.is_paper_trading = True
+        self.manual_approval = True  # True: 승인대기 후 수동 처리, False: 신호 발생 시 자동 매수/매도
         self.is_running = False
         self.websocket_clients: List[WebSocket] = []
         self.trade_history: List[Dict] = []
