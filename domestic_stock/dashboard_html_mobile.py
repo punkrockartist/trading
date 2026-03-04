@@ -555,6 +555,27 @@ def get_dashboard_html_mobile(username: str) -> str:
             line-height: 1.5;
             margin-top: 6px;
         }}
+        .help-grid {{
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 10px;
+            margin-top: 10px;
+        }}
+        .help-item {{
+            padding: 10px 12px;
+            border: 1px solid var(--border);
+            background: var(--surface-2);
+            border-radius: var(--radius);
+        }}
+        .help-item strong {{
+            display: block;
+            margin-bottom: 6px;
+            color: var(--text);
+        }}
+        .help-item code {{
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-size: 12px;
+        }}
         @media (min-width: 768px) {{
             :root {{
                 --container-pad: 20px;
@@ -605,6 +626,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                     <button type="button" class="subtab" id="subtab-risk" onclick="showSettingsSection('risk')">리스크</button>
                     <button type="button" class="subtab" id="subtab-strategy" onclick="showSettingsSection('strategy')">전략</button>
                     <button type="button" class="subtab" id="subtab-stocks" onclick="showSettingsSection('stocks')">종목선정</button>
+                    <button type="button" class="subtab" id="subtab-help" onclick="showSettingsSection('help')">도움말</button>
                 </div>
             </div>
         </div>
@@ -713,12 +735,85 @@ def get_dashboard_html_mobile(username: str) -> str:
                         <input type="number" id="daily_loss_limit" value="500000">
                     </div>
                     <div class="form-group">
+                        <label>일일 손실 한도 기준:</label>
+                        <select id="daily_loss_limit_basis">
+                            <option value="realized">실현(체결 손익)</option>
+                            <option value="total">실현+미실현(가정)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
                         <label>일일 이익 한도(원) (전량매도 트리거):</label>
                         <input type="number" id="daily_profit_limit" value="0" min="0" step="10000">
                     </div>
+                    <div class="form-group">
+                        <label>일일 이익 한도 기준:</label>
+                        <select id="daily_profit_limit_basis">
+                            <option value="total">실현+미실현(가정)</option>
+                            <option value="realized">실현(체결 손익)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label style="color:var(--muted);">팁: “실현+미실현” 기반 손실 제한은 위의 ‘일일 손실 한도 기준’을 <strong>total</strong>로 바꾸면 됩니다.</label>
+                    </div>
 
                     <details>
-                        <summary>고급(트레일링/부분익절)</summary>
+                        <summary>고급(주문/재시도/사이징/트레일링)</summary>
+                        <div class="form-group">
+                            <label>매수 주문 방식:</label>
+                            <select id="buy_order_style">
+                                <option value="market">시장가</option>
+                                <option value="best_limit">최우선 지정가</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>매도 주문 방식:</label>
+                            <select id="sell_order_style">
+                                <option value="market">시장가</option>
+                                <option value="best_limit">최우선 지정가</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>주문 재시도 횟수:</label>
+                            <input type="number" id="order_retry_count" value="0" min="0" max="10">
+                        </div>
+                        <div class="form-group">
+                            <label>재시도 지연(ms):</label>
+                            <input type="number" id="order_retry_delay_ms" value="300" min="0" max="10000" step="50">
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="order_fallback_to_market" checked>
+                                최우선 지정가 실패 시 시장가로 폴백
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="enable_volatility_sizing">
+                                변동성 기반 포지션 사이징 사용
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>변동성 lookback(N틱):</label>
+                            <input type="number" id="volatility_lookback_ticks" value="20" min="2" max="300">
+                        </div>
+                        <div class="form-group">
+                            <label>변동성 stop 배수:</label>
+                            <input type="number" id="volatility_stop_mult" value="1.0" step="0.1" min="0.1" max="10">
+                        </div>
+                        <div class="form-group">
+                            <label>종목당 최대 손실액(원):</label>
+                            <input type="number" id="max_loss_per_stock_krw" value="0" min="0" step="10000">
+                        </div>
+                        <details>
+                            <summary>레거시(합산 손실 한도)</summary>
+                            <div class="form-group">
+                                <label>일일 손실 한도(원) (레거시: 실현+미실현, 전량매도):</label>
+                                <input type="number" id="daily_total_loss_limit" value="0" min="0" step="10000">
+                            </div>
+                            <div class="hint" style="margin-top:-6px;">
+                                신규 방식은 <code>daily_loss_limit</code> + <code>daily_loss_limit_basis=total</code> 사용을 권장합니다.
+                            </div>
+                        </details>
                         <div class="form-group">
                             <label>부분 익절 트리거(%):</label>
                             <input type="number" id="partial_tp_pct" value="0" step="0.1" min="0" max="50">
@@ -746,12 +841,23 @@ def get_dashboard_html_mobile(username: str) -> str:
                     <h2>전략 설정 (이동평균)</h2>
                     <div class="hint" id="strategy_summary"></div>
                     <div class="form-group">
-                        <label>MA 프리셋:</label>
-                        <div class="btn-group">
-                            <button type="button" class="btn" onclick="applyMaPreset(3, 10)">빠름 3/10</button>
-                            <button type="button" class="btn" onclick="applyMaPreset(5, 20)">보수 5/20</button>
+                        <label>프리셋:</label>
+                        <select id="strategy_preset_select" onchange="onStrategyPresetChange()">
+                            <option value="">직접 설정</option>
+                            <optgroup label="MA-only (고급 유지)">
+                                <option value="ma_fast_3_10">MA 빠름 3/10</option>
+                                <option value="ma_safe_5_20">MA 보수 5/20</option>
+                                <option value="ma_mid_8_21">MA 중기 8/21</option>
+                            </optgroup>
+                            <optgroup label="단타 프리셋 (고급 포함)">
+                                <option value="scalp_morning_balanced">오전 단타(밸런스)</option>
+                                <option value="scalp_morning_strict">오전 단타(엄격)</option>
+                                <option value="scalp_light">단타(가벼움)</option>
+                            </optgroup>
+                        </select>
+                        <div class="hint" style="margin-top:8px;">
+                            MA-only는 이동평균만 변경(다른 고급값 유지). 단타 프리셋은 고급(보강/레짐/진입직전/청산)까지 함께 설정합니다.
                         </div>
-                        <button type="button" class="btn" onclick="applyMaPreset(8, 21)" style="margin-top: 8px;">중기 8/21</button>
                     </div>
                     <div class="form-group">
                         <label>단기 이동평균 (틱):</label>
@@ -771,10 +877,167 @@ def get_dashboard_html_mobile(username: str) -> str:
                     </div>
 
                     <details>
-                        <summary>고급(필터/쿨다운/청산)</summary>
+                        <summary>고급(필터/쿨다운/보강/레짐/청산)</summary>
                         <div class="form-group">
                             <label>단기MA 기울기 최소(%/틱):</label>
                             <input type="number" id="min_short_ma_slope_pct" value="0" step="0.001" min="0" max="5">
+                        </div>
+                        <div class="form-group">
+                            <label>모멘텀 확인: 최근 N틱</label>
+                            <input type="number" id="momentum_lookback_ticks" value="0" min="0" max="200">
+                        </div>
+                        <div class="form-group">
+                            <label>모멘텀 최소 상승률(%)</label>
+                            <input type="number" id="min_momentum_pct" value="0" step="0.01" min="0" max="20">
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="avoid_chase_near_high_enabled">
+                                진입 직전: 고점 근접 추격 회피
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>고점 lookback(분) / “고점 대비 하락폭” 최소(%)</label>
+                            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+                                <input type="number" id="near_high_lookback_minutes" value="2" min="1" max="30">
+                                <input type="number" id="avoid_near_high_pct" value="0.30" step="0.05" min="0" max="5">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="avoid_near_high_dynamic">
+                                고점근접 회피 임계값을 변동성 기반으로 자동 상향
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>고점근접 정규화 배수(0=사용안함)</label>
+                            <input type="number" id="avoid_near_high_vs_vol_mult" value="0" step="0.1" min="0" max="20">
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="minute_trend_enabled">
+                                진입 직전: 1~2분봉 추세 유지(양봉 유지)
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>분봉 추세 모드:</label>
+                            <select id="minute_trend_mode">
+                                <option value="green">양봉 유지(개수)</option>
+                                <option value="higher_close">종가 상승 유지</option>
+                                <option value="higher_low">저가 상승 유지</option>
+                                <option value="hh_hl">고가/저가 상승 유지</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="minute_trend_early_only">
+                                분봉 추세 필터를 초반 레짐(09:00~종료)에서만 적용
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>분봉 lookback(개) / 최소 양봉 개수</label>
+                            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+                                <input type="number" id="minute_trend_lookback_bars" value="2" min="1" max="5">
+                                <input type="number" id="minute_trend_min_green_bars" value="2" min="0" max="5">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="entry_confirm_enabled">
+                                진입 보강(2단) 사용: 추세 조건 + 아래 조건 중 N개 이상
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>보강 조건 최소 충족 개수(N):</label>
+                            <input type="number" id="entry_confirm_min_count" value="1" min="1" max="3">
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="confirm_breakout_enabled">
+                                (보강) 최근 N틱 신고가 돌파
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>돌파 lookback(N틱) / 버퍼(%)</label>
+                            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+                                <input type="number" id="breakout_lookback_ticks" value="20" min="2" max="300">
+                                <input type="number" id="breakout_buffer_pct" value="0" step="0.01" min="0" max="5">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="confirm_volume_surge_enabled">
+                                (보강) 거래량 급증(틱 체결량)
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>거래량 급증: lookback(N틱) / 배수</label>
+                            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+                                <input type="number" id="volume_surge_lookback_ticks" value="20" min="2" max="200">
+                                <input type="number" id="volume_surge_ratio" value="2.0" step="0.1" min="1.0" max="20">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="confirm_trade_value_surge_enabled">
+                                (보강) 거래대금 급증(틱 체결량×가격)
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>거래대금 급증: lookback(N틱) / 배수</label>
+                            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+                                <input type="number" id="trade_value_surge_lookback_ticks" value="20" min="2" max="200">
+                                <input type="number" id="trade_value_surge_ratio" value="2.0" step="0.1" min="1.0" max="50">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>변동성 정규화 lookback(N틱)</label>
+                            <input type="number" id="vol_norm_lookback_ticks" value="20" min="2" max="300">
+                        </div>
+                        <div class="form-group">
+                            <label>slope 정규화 배수(0=사용안함)</label>
+                            <input type="number" id="slope_vs_vol_mult" value="0" step="0.1" min="0" max="20">
+                        </div>
+                        <div class="form-group">
+                            <label>range 정규화 배수(0=사용안함)</label>
+                            <input type="number" id="range_vs_vol_mult" value="0" step="0.1" min="0" max="20">
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="enable_morning_regime_split">
+                                오전장 레짐 분기(초반/메인) 사용
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>초반 레짐 종료(HH:MM, KST)</label>
+                            <input type="text" id="morning_regime_early_end_hhmm" value="09:10" placeholder="09:10">
+                        </div>
+                        <div class="form-group">
+                            <label>초반 레짐: slope 최소(%/틱)</label>
+                            <input type="number" id="early_min_short_ma_slope_pct" value="0" step="0.001" min="0" max="5">
+                        </div>
+                        <div class="form-group">
+                            <label>초반 레짐: 모멘텀 N틱 / 최소 상승률(%)</label>
+                            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+                                <input type="number" id="early_momentum_lookback_ticks" value="0" min="0" max="200">
+                                <input type="number" id="early_min_momentum_pct" value="0" step="0.01" min="0" max="20">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>초반 레짐: 진입 확인(연속 틱 수)</label>
+                            <input type="number" id="early_buy_confirm_ticks" value="1" min="1" max="10">
+                        </div>
+                        <div class="form-group">
+                            <label>초반 레짐: 최대 스프레드(%)</label>
+                            <input type="number" id="early_max_spread_pct" value="0" step="0.01" min="0" max="5">
+                        </div>
+                        <div class="form-group">
+                            <label>초반 레짐: 횡보장 제외(N틱/레인지%)</label>
+                            <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:10px;">
+                                <input type="number" id="early_range_lookback_ticks" value="0" min="0" max="300">
+                                <input type="number" id="early_min_range_pct" value="0" step="0.01" min="0" max="20">
+                                <div class="hint" style="margin:0; align-self:center;">(N/%)</div>
+                            </div>
                         </div>
                         <div class="form-group">
                             <label>재진입 쿨다운(초):</label>
@@ -836,8 +1099,8 @@ def get_dashboard_html_mobile(username: str) -> str:
                         <input type="number" id="max_change" value="15" step="0.1">
                     </div>
                     <div class="form-group">
-                        <label>최대 선정 종목 수:</label>
-                        <input type="number" id="max_stocks" value="5">
+                        <label>선정 후보군 수(최대 20):</label>
+                        <input type="number" id="max_stocks" value="10" min="1" max="20">
                     </div>
                     <div class="form-group">
                         <label>최소 가격 (원):</label>
@@ -858,6 +1121,18 @@ def get_dashboard_html_mobile(username: str) -> str:
 
                     <details>
                         <summary>고급(장초/드로우다운)</summary>
+                        <div class="form-group">
+                            <label>선정 정렬 기준:</label>
+                            <select id="stock_sort_by">
+                                <option value="change">등락률(기본)</option>
+                                <option value="trade_amount">당일 거래대금(가능시)</option>
+                                <option value="prev_day_trade_value">전일 거래대금(추정, 느림)</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>전일 거래대금 정렬 후보 pool 크기:</label>
+                            <input type="number" id="prev_day_rank_pool_size" value="80" min="10" max="200" step="10">
+                        </div>
                         <div class="form-group">
                             <label>장 시작 시각 (HH:MM):</label>
                             <input type="text" id="market_open_hhmm" value="09:00" placeholder="09:00">
@@ -904,6 +1179,168 @@ def get_dashboard_html_mobile(username: str) -> str:
                         <button class="btn" onclick="updateStockSelection()">저장</button>
                         <button class="btn" onclick="selectStocks()">종목 재선정</button>
                     </div>
+                </div>
+            </div>
+
+            <div id="settings-section-help" class="settings-section">
+                <div class="card">
+                    <h2>설정 도움말</h2>
+                    <div class="hint">
+                        아래 설명은 “현재 시스템 구현 기준”으로, 값이 커질수록 보수적/공격적이 되는 방향이 어디인지 함께 정리했습니다.
+                        (단위가 %인 항목은 입력은 “퍼센트(예: 2.0)”이고, 내부에서는 비율(0.02)로 저장됩니다.)
+                    </div>
+
+                    <details open>
+                        <summary>리스크 관리</summary>
+                        <div class="help-grid">
+                            <div class="help-item">
+                                <strong>최대 거래 금액 (원) (<code>max_single_trade_amount</code>)</strong>
+                                한 번의 매수에서 사용할 수 있는 최대 금액 상한입니다. 너무 크게 잡으면 급등락 시 손익 변동이 커집니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>최소 매수 수량(주) (<code>min_order_quantity</code>)</strong>
+                                매수 시 최소 수량을 강제합니다. 너무 크게 잡으면 “조건은 좋은데 주문이 거절(수량 부족)”될 수 있습니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>손절매 비율(%) (<code>stop_loss_ratio</code>)</strong>
+                                종목별 손실률이 이 값 이상이면 매도 신호를 냅니다. 값이 작을수록 더 빨리 손절(보수적)합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>익절매 비율(%) (<code>take_profit_ratio</code>)</strong>
+                                종목별 수익률이 이 값 이상이면 매도 신호를 냅니다. 값이 작을수록 빠르게 이익 실현합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>일일 손실 한도 (원) (<code>daily_loss_limit</code>)</strong>
+                                누적 실현 손익(<code>daily_pnl</code>)이 손실 한도 이하로 내려가면 신규 매수가 차단됩니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>일일 이익 한도(원) (<code>daily_profit_limit</code>)</strong>
+                                현재 보유 전량을 시장가로 청산한다고 가정한 “실현+미실현 합산 손익”이 이 값 이상이면, 그날 1회 전량 매도 신호를 생성합니다. 0이면 사용 안 함.
+                            </div>
+                            <div class="help-item">
+                                <strong>일일 손실 한도 기준 (<code>daily_loss_limit_basis</code>)</strong>
+                                기본은 <code>realized</code>(실현 손익)이며, <code>total</code>로 바꾸면 “실현+미실현 합산” 기준으로 손실 한도를 적용합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>일일 손실 한도(원) (레거시) (<code>daily_total_loss_limit</code>)</strong>
+                                과거 호환용입니다. 신규 방식은 <code>daily_loss_limit</code> + <code>daily_loss_limit_basis=total</code> 사용을 권장합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>부분 익절 트리거/비율</strong>
+                                트리거 수익률에 도달하면 보유 수량의 일부를 매도합니다. (수량이 1주면 부분익절은 사실상 전량 매도처럼 동작할 수 있습니다.)
+                            </div>
+                            <div class="help-item">
+                                <strong>트레일링 스탑/활성화</strong>
+                                일정 수익(활성화) 이후에는 고점 대비 하락폭이 트레일링 스탑을 넘으면 매도합니다. 변동성 큰 종목에서 유효합니다.
+                            </div>
+                        </div>
+                    </details>
+
+                    <details>
+                        <summary>전략 설정</summary>
+                        <div class="help-grid">
+                            <div class="help-item">
+                                <strong>단기/장기 이동평균 (틱) (<code>short_ma_period</code>/<code>long_ma_period</code>)</strong>
+                                단기가 짧을수록 민감(신호 잦음), 장기가 길수록 느림(신호 적음)입니다. 일반적으로 <code>short &lt; long</code>이어야 합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>신규 매수 허용 시간 (KST) (<code>buy_window_start_hhmm</code>~<code>buy_window_end_hhmm</code>)</strong>
+                                매수만 시간 제한을 걸어 장중 노이즈 구간 진입을 줄입니다. 매도/청산은 항상 허용됩니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>단기MA 기울기 최소(%/틱) (<code>min_short_ma_slope_ratio</code>)</strong>
+                                단기 추세 강도가 약하면 매수 스킵합니다. 값이 커질수록 “강한 추세”만 진입합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>모멘텀 필터(N틱/%) (<code>momentum_lookback_ticks</code>/<code>min_momentum_ratio</code>)</strong>
+                                최근 N틱 전 대비 상승률이 최소 % 이상일 때만 매수합니다. (0이면 사용 안 함)
+                            </div>
+                            <div class="help-item">
+                                <strong>진입 보강(2단) (<code>entry_confirm_enabled</code>)</strong>
+                                MA/모멘텀 같은 “추세 조건”을 만족하더라도, 돌파/급증 같은 추가 조건을 통과해야만 매수합니다. (과매수/노이즈 구간 진입 감소)
+                            </div>
+                            <div class="help-item">
+                                <strong>돌파/급증 보강 조건</strong>
+                                - <code>confirm_breakout_enabled</code>: 최근 N틱 신고가 돌파<br>
+                                - <code>confirm_volume_surge_enabled</code>: 틱 체결량 급증<br>
+                                - <code>confirm_trade_value_surge_enabled</code>: 틱 거래대금(체결량×가격) 급증<br>
+                                위 중 최소 <code>entry_confirm_min_count</code>개 이상 만족해야 매수합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>변동성 정규화(보조) (<code>slope_vs_vol_mult</code>/<code>range_vs_vol_mult</code>)</strong>
+                                평균 변동폭 대비 slope/range 임계값을 보정합니다. 변동성 큰 종목/작은 종목에서 기준이 한쪽으로 치우치는 것을 완화합니다. (0이면 사용 안 함)
+                            </div>
+                            <div class="help-item">
+                                <strong>오전장 레짐 분기 (<code>enable_morning_regime_split</code>)</strong>
+                                09:00~초반 종료 시각(<code>morning_regime_early_end_hhmm</code>)과 그 이후를 다른 임계값으로 운영합니다. 초반에는 더 엄격하게(노이즈 방지) 설정하는 것을 권장합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>진입 직전 추가 필터</strong>
+                                - <code>avoid_chase_near_high_enabled</code>: 최근 N분 고점에 너무 근접(고점 대비 하락폭이 너무 작음)하면 “피크 추격”으로 보고 매수 스킵<br>
+                                - <code>minute_trend_enabled</code>: 최근 1~2분봉이 양봉 유지 등 “초단기 추세 유지” 조건을 만족할 때만 매수
+                            </div>
+                            <div class="help-item">
+                                <strong>고점근접/분봉 고도화</strong>
+                                - <code>avoid_near_high_dynamic</code>: 변동성(평균 변동폭) 기반으로 고점근접 회피 임계값을 자동 상향<br>
+                                - <code>minute_trend_mode</code>: 분봉 추세를 “양봉 유지” 외에 “종가/저가/고가+저가 상승 유지”로도 선택 가능<br>
+                                - <code>minute_trend_early_only</code>: 분봉 추세 필터를 장 초반 레짐에만 적용
+                            </div>
+                            <div class="help-item">
+                                <strong>재진입 쿨다운(초) (<code>reentry_cooldown_seconds</code>)</strong>
+                                매도 직후 같은 종목 재매수를 일정 시간 금지합니다. 횡보장에서 ‘사고팔고 반복’을 줄입니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>진입 확인(연속 틱 수) (<code>buy_confirm_ticks</code>)</strong>
+                                매수 조건이 연속으로 유지될 때만 매수합니다. 값이 커질수록 엄격해져 매수가 줄 수 있습니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>최대 스프레드(%) (<code>max_spread_ratio</code>)</strong>
+                                호가 스프레드가 크면 매수 스킵합니다. 너무 타이트하면 매수가 거의 안 될 수 있습니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>횡보장 제외(N틱/레인지%) (<code>range_lookback_ticks</code>/<code>min_range_ratio</code>)</strong>
+                                최근 N틱의 고저 폭이 너무 작으면(레인지가 작으면) 매수 스킵합니다. “움직임 없는 구간” 진입을 피합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>시간기반 청산</strong>
+                                지정 시각 이후 보유 포지션을 전량 매도 신호로 청산합니다(하루 1회). 오전 단타 운영에서 정리용으로 씁니다.
+                            </div>
+                        </div>
+                    </details>
+
+                    <details>
+                        <summary>종목 선정 기준</summary>
+                        <div class="help-grid">
+                            <div class="help-item">
+                                <strong>최소/최대 상승률(%) (<code>min_price_change_ratio</code>/<code>max_price_change_ratio</code>)</strong>
+                                KIS 등락률 랭킹에서 이 범위에 해당하는 종목만 후보로 가져옵니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>가격/거래량/거래대금 조건</strong>
+                                너무 빡세면 “API OK but output empty/결과 없음”이 자주 나옵니다. 특히 거래대금(원)은 크게 잡으면 후보가 급감합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>선정 정렬 기준 (<code>sort_by</code>)</strong>
+                                최종 후보 중 어떤 종목을 우선 선택할지 결정합니다. 기본은 등락률(랭킹 그대로)이며, 전일 거래대금은 “전일에 거래가 많이 된 종목”을 우선으로 하는 대신 선정이 느릴 수 있습니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>전일 거래대금 후보 pool 크기 (<code>prev_day_rank_pool_size</code>)</strong>
+                                전일 거래대금 기반 정렬 시, 상위 몇 개 후보에 대해 전일 거래대금 조회를 수행할지 제한합니다. 값이 클수록 정확하지만 느려집니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>장초 워밍업(분) (<code>warmup_minutes</code>)</strong>
+                                장 시작 직후 변동 노이즈가 큰 구간을 지나고 나서 종목 선정/재선정을 하도록 유도합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>장초 강화 필터 (<code>early_strict</code>)</strong>
+                                장 시작 후 일정 시간 동안 거래량/거래대금 최소치를 더 높여, “초기 체결 몇 건”에 의한 왜곡을 줄입니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>고점 대비 하락추세 제외 (<code>exclude_drawdown</code>)</strong>
+                                특히 오후 시작 시점에 고점 찍고 밀린 종목을 제외합니다. <code>max_drawdown_pct</code>를 너무 작게 잡으면 대부분 제외될 수 있습니다.
+                            </div>
+                        </div>
+                    </details>
                 </div>
             </div>
         </div>
@@ -1025,7 +1462,7 @@ def get_dashboard_html_mobile(username: str) -> str:
         }});
 
         function showSettingsSection(name) {{
-            const sections = ['preset', 'risk', 'strategy', 'stocks'];
+            const sections = ['preset', 'risk', 'strategy', 'stocks', 'help'];
             sections.forEach(s => {{
                 const sec = document.getElementById(`settings-section-${{s}}`);
                 const btn = document.getElementById(`subtab-${{s}}`);
@@ -1242,8 +1679,12 @@ def get_dashboard_html_mobile(username: str) -> str:
                 spread: '스프레드 과대',
                 range: '횡보장 제외',
                 slope: '단기MA 기울기 부족',
+                momentum: '모멘텀 부족',
+                near_high: '고점 근접(추격) 회피',
+                minute_trend: '분봉 추세 유지 실패',
                 cooldown: '재진입 쿨다운',
                 confirm: '진입 확인 대기',
+                confirm2: '진입 보강 조건 미충족',
                 time_window: '신규매수 시간외',
                 unknown: '기타',
             }};
@@ -1297,14 +1738,19 @@ def get_dashboard_html_mobile(username: str) -> str:
                     const tp = document.getElementById('take_profit')?.value || '-';
                     const dly = document.getElementById('daily_loss_limit')?.value || '-';
                     const dpr = document.getElementById('daily_profit_limit')?.value || '0';
+                    const dtl = document.getElementById('daily_total_loss_limit')?.value || '0';
+                    const dlb = document.getElementById('daily_loss_limit_basis')?.value || 'realized';
+                    const dpb = document.getElementById('daily_profit_limit_basis')?.value || 'total';
                     const pt = document.getElementById('partial_tp_pct')?.value || '0';
                     const tr = document.getElementById('trailing_stop_pct')?.value || '0';
+                    const legacyLoss = (parseInt(dtl || '0') > 0) ? (' · legacyTotalLoss=' + dtl + '원') : '';
                     risk.textContent =
                         'max=' + maxAmt + '원 · ' +
                         'minQty=' + minQty + '주 · ' +
                         'SL=' + sl + '%/TP=' + tp + '% · ' +
-                        'dailyLoss=' + dly + '원 · ' +
-                        'dailyProfit=' + dpr + '원 · ' +
+                        'dailyLoss=' + dly + '원(' + dlb + ') · ' +
+                        'dailyProfit=' + dpr + '원(' + dpb + ')' +
+                        legacyLoss + ' · ' +
                         '부분익절=' + pt + '% · ' +
                         'trailing=' + tr + '%';
                 }}
@@ -1316,6 +1762,9 @@ def get_dashboard_html_mobile(username: str) -> str:
                     const bwS = document.getElementById('buy_window_start_hhmm')?.value || '-';
                     const bwE = document.getElementById('buy_window_end_hhmm')?.value || '-';
                     const slope = document.getElementById('min_short_ma_slope_pct')?.value || '0';
+                    const momN = document.getElementById('momentum_lookback_ticks')?.value || '0';
+                    const momP = document.getElementById('min_momentum_pct')?.value || '0';
+                    const ec = !!document.getElementById('entry_confirm_enabled')?.checked;
                     const cd = document.getElementById('reentry_cooldown_seconds')?.value || '0';
                     const conf = document.getElementById('buy_confirm_ticks')?.value || '1';
                     const spr = document.getElementById('max_spread_pct')?.value || '0';
@@ -1327,6 +1776,8 @@ def get_dashboard_html_mobile(username: str) -> str:
                         'MA=' + sma + '/' + lma + ' · ' +
                         'buy=' + bwS + '-' + bwE + ' · ' +
                         'slope≥' + slope + '%/t · ' +
+                        'mom≥' + momP + '%/N' + momN + ' · ' +
+                        'confirm2=' + (ec ? 'on' : 'off') + ' · ' +
                         'cd=' + cd + 's · ' +
                         'confirm=' + conf + ' · ' +
                         'spr≤' + spr + '% · ' +
@@ -1343,6 +1794,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                     const mv = document.getElementById('min_volume')?.value || '-';
                     const ta = document.getElementById('min_trade_amount')?.value || '-';
                     const mx = document.getElementById('max_stocks')?.value || '-';
+                    const sb = document.getElementById('stock_sort_by')?.value || 'change';
                     const warm = document.getElementById('warmup_minutes')?.value || '0';
                     const es = !!document.getElementById('early_strict')?.checked;
                     const dd = !!document.getElementById('exclude_drawdown')?.checked;
@@ -1353,6 +1805,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                         'vol≥' + mv + ' · ' +
                         'amt≥' + ta + ' · ' +
                         'max=' + mx + ' · ' +
+                        'sort=' + sb + ' · ' +
                         'warmup=' + warm + 'm · ' +
                         'earlyStrict=' + (es ? 'on' : 'off') + ' · ' +
                         'drawdown=' + (dd ? 'on' : 'off') + '(' + ddPct + '%)';
@@ -1540,6 +1993,18 @@ def get_dashboard_html_mobile(username: str) -> str:
                     if (risk.take_profit_ratio != null) document.getElementById('take_profit').value = (risk.take_profit_ratio * 100).toFixed(1);
                     if (risk.daily_loss_limit != null) document.getElementById('daily_loss_limit').value = risk.daily_loss_limit;
                     if (risk.daily_profit_limit != null) document.getElementById('daily_profit_limit').value = risk.daily_profit_limit;
+                    if (risk.daily_total_loss_limit != null) document.getElementById('daily_total_loss_limit').value = risk.daily_total_loss_limit;
+                    if (risk.daily_loss_limit_basis != null) document.getElementById('daily_loss_limit_basis').value = risk.daily_loss_limit_basis;
+                    if (risk.daily_profit_limit_basis != null) document.getElementById('daily_profit_limit_basis').value = risk.daily_profit_limit_basis;
+                    if (risk.buy_order_style != null) document.getElementById('buy_order_style').value = risk.buy_order_style;
+                    if (risk.sell_order_style != null) document.getElementById('sell_order_style').value = risk.sell_order_style;
+                    if (risk.order_retry_count != null) document.getElementById('order_retry_count').value = risk.order_retry_count;
+                    if (risk.order_retry_delay_ms != null) document.getElementById('order_retry_delay_ms').value = risk.order_retry_delay_ms;
+                    if (risk.order_fallback_to_market != null) document.getElementById('order_fallback_to_market').checked = !!risk.order_fallback_to_market;
+                    if (risk.enable_volatility_sizing != null) document.getElementById('enable_volatility_sizing').checked = !!risk.enable_volatility_sizing;
+                    if (risk.volatility_lookback_ticks != null) document.getElementById('volatility_lookback_ticks').value = risk.volatility_lookback_ticks;
+                    if (risk.volatility_stop_mult != null) document.getElementById('volatility_stop_mult').value = risk.volatility_stop_mult;
+                    if (risk.max_loss_per_stock_krw != null) document.getElementById('max_loss_per_stock_krw').value = risk.max_loss_per_stock_krw;
                     if (risk.trailing_stop_ratio != null) document.getElementById('trailing_stop_pct').value = (risk.trailing_stop_ratio * 100).toFixed(1);
                     if (risk.trailing_activation_ratio != null) document.getElementById('trailing_activation_pct').value = (risk.trailing_activation_ratio * 100).toFixed(1);
                     if (risk.partial_take_profit_ratio != null) document.getElementById('partial_tp_pct').value = (risk.partial_take_profit_ratio * 100).toFixed(1);
@@ -1551,6 +2016,41 @@ def get_dashboard_html_mobile(username: str) -> str:
                     if (strat.buy_window_start_hhmm != null) document.getElementById('buy_window_start_hhmm').value = strat.buy_window_start_hhmm;
                     if (strat.buy_window_end_hhmm != null) document.getElementById('buy_window_end_hhmm').value = strat.buy_window_end_hhmm;
                     if (strat.min_short_ma_slope_ratio != null) document.getElementById('min_short_ma_slope_pct').value = (strat.min_short_ma_slope_ratio * 100).toFixed(3);
+                    if (strat.momentum_lookback_ticks != null) document.getElementById('momentum_lookback_ticks').value = strat.momentum_lookback_ticks;
+                    if (strat.min_momentum_ratio != null) document.getElementById('min_momentum_pct').value = (strat.min_momentum_ratio * 100).toFixed(2);
+                    if (strat.avoid_chase_near_high_enabled != null) document.getElementById('avoid_chase_near_high_enabled').checked = !!strat.avoid_chase_near_high_enabled;
+                    if (strat.near_high_lookback_minutes != null) document.getElementById('near_high_lookback_minutes').value = strat.near_high_lookback_minutes;
+                    if (strat.avoid_near_high_ratio != null) document.getElementById('avoid_near_high_pct').value = (strat.avoid_near_high_ratio * 100).toFixed(2);
+                    if (strat.avoid_near_high_dynamic != null) document.getElementById('avoid_near_high_dynamic').checked = !!strat.avoid_near_high_dynamic;
+                    if (strat.avoid_near_high_vs_vol_mult != null) document.getElementById('avoid_near_high_vs_vol_mult').value = strat.avoid_near_high_vs_vol_mult;
+                    if (strat.minute_trend_enabled != null) document.getElementById('minute_trend_enabled').checked = !!strat.minute_trend_enabled;
+                    if (strat.minute_trend_lookback_bars != null) document.getElementById('minute_trend_lookback_bars').value = strat.minute_trend_lookback_bars;
+                    if (strat.minute_trend_min_green_bars != null) document.getElementById('minute_trend_min_green_bars').value = strat.minute_trend_min_green_bars;
+                    if (strat.minute_trend_mode != null) document.getElementById('minute_trend_mode').value = strat.minute_trend_mode;
+                    if (strat.minute_trend_early_only != null) document.getElementById('minute_trend_early_only').checked = !!strat.minute_trend_early_only;
+                    if (strat.entry_confirm_enabled != null) document.getElementById('entry_confirm_enabled').checked = !!strat.entry_confirm_enabled;
+                    if (strat.entry_confirm_min_count != null) document.getElementById('entry_confirm_min_count').value = strat.entry_confirm_min_count;
+                    if (strat.confirm_breakout_enabled != null) document.getElementById('confirm_breakout_enabled').checked = !!strat.confirm_breakout_enabled;
+                    if (strat.breakout_lookback_ticks != null) document.getElementById('breakout_lookback_ticks').value = strat.breakout_lookback_ticks;
+                    if (strat.breakout_buffer_ratio != null) document.getElementById('breakout_buffer_pct').value = (strat.breakout_buffer_ratio * 100).toFixed(2);
+                    if (strat.confirm_volume_surge_enabled != null) document.getElementById('confirm_volume_surge_enabled').checked = !!strat.confirm_volume_surge_enabled;
+                    if (strat.volume_surge_lookback_ticks != null) document.getElementById('volume_surge_lookback_ticks').value = strat.volume_surge_lookback_ticks;
+                    if (strat.volume_surge_ratio != null) document.getElementById('volume_surge_ratio').value = strat.volume_surge_ratio;
+                    if (strat.confirm_trade_value_surge_enabled != null) document.getElementById('confirm_trade_value_surge_enabled').checked = !!strat.confirm_trade_value_surge_enabled;
+                    if (strat.trade_value_surge_lookback_ticks != null) document.getElementById('trade_value_surge_lookback_ticks').value = strat.trade_value_surge_lookback_ticks;
+                    if (strat.trade_value_surge_ratio != null) document.getElementById('trade_value_surge_ratio').value = strat.trade_value_surge_ratio;
+                    if (strat.vol_norm_lookback_ticks != null) document.getElementById('vol_norm_lookback_ticks').value = strat.vol_norm_lookback_ticks;
+                    if (strat.slope_vs_vol_mult != null) document.getElementById('slope_vs_vol_mult').value = strat.slope_vs_vol_mult;
+                    if (strat.range_vs_vol_mult != null) document.getElementById('range_vs_vol_mult').value = strat.range_vs_vol_mult;
+                    if (strat.enable_morning_regime_split != null) document.getElementById('enable_morning_regime_split').checked = !!strat.enable_morning_regime_split;
+                    if (strat.morning_regime_early_end_hhmm != null) document.getElementById('morning_regime_early_end_hhmm').value = strat.morning_regime_early_end_hhmm;
+                    if (strat.early_min_short_ma_slope_ratio != null) document.getElementById('early_min_short_ma_slope_pct').value = (strat.early_min_short_ma_slope_ratio * 100).toFixed(3);
+                    if (strat.early_momentum_lookback_ticks != null) document.getElementById('early_momentum_lookback_ticks').value = strat.early_momentum_lookback_ticks;
+                    if (strat.early_min_momentum_ratio != null) document.getElementById('early_min_momentum_pct').value = (strat.early_min_momentum_ratio * 100).toFixed(2);
+                    if (strat.early_buy_confirm_ticks != null) document.getElementById('early_buy_confirm_ticks').value = strat.early_buy_confirm_ticks;
+                    if (strat.early_max_spread_ratio != null) document.getElementById('early_max_spread_pct').value = (strat.early_max_spread_ratio * 100).toFixed(2);
+                    if (strat.early_range_lookback_ticks != null) document.getElementById('early_range_lookback_ticks').value = strat.early_range_lookback_ticks;
+                    if (strat.early_min_range_ratio != null) document.getElementById('early_min_range_pct').value = (strat.early_min_range_ratio * 100).toFixed(2);
                     if (strat.reentry_cooldown_seconds != null) document.getElementById('reentry_cooldown_seconds').value = strat.reentry_cooldown_seconds;
                     if (strat.buy_confirm_ticks != null) document.getElementById('buy_confirm_ticks').value = strat.buy_confirm_ticks;
                     if (strat.enable_time_liquidation != null) document.getElementById('enable_time_liquidation').checked = !!strat.enable_time_liquidation;
@@ -1569,6 +2069,8 @@ def get_dashboard_html_mobile(username: str) -> str:
                     if (stocksel.max_price != null) document.getElementById('max_price').value = stocksel.max_price;
                     if (stocksel.min_volume != null) document.getElementById('min_volume').value = stocksel.min_volume;
                     if (stocksel.min_trade_amount != null) document.getElementById('min_trade_amount').value = stocksel.min_trade_amount;
+                    if (stocksel.sort_by != null) document.getElementById('stock_sort_by').value = stocksel.sort_by;
+                    if (stocksel.prev_day_rank_pool_size != null) document.getElementById('prev_day_rank_pool_size').value = stocksel.prev_day_rank_pool_size;
 
                     if (stocksel.market_open_hhmm != null) document.getElementById('market_open_hhmm').value = stocksel.market_open_hhmm;
                     if (stocksel.warmup_minutes != null) document.getElementById('warmup_minutes').value = stocksel.warmup_minutes;
@@ -1595,6 +2097,18 @@ def get_dashboard_html_mobile(username: str) -> str:
                     take_profit_ratio: parseFloat(document.getElementById('take_profit').value) / 100,
                     daily_loss_limit: parseInt(document.getElementById('daily_loss_limit').value),
                     daily_profit_limit: parseInt(document.getElementById('daily_profit_limit').value) || 0,
+                    daily_total_loss_limit: parseInt(document.getElementById('daily_total_loss_limit').value) || 0,
+                    daily_loss_limit_basis: (document.getElementById('daily_loss_limit_basis')?.value || 'realized'),
+                    daily_profit_limit_basis: (document.getElementById('daily_profit_limit_basis')?.value || 'total'),
+                    buy_order_style: (document.getElementById('buy_order_style')?.value || 'market'),
+                    sell_order_style: (document.getElementById('sell_order_style')?.value || 'market'),
+                    order_retry_count: parseInt(document.getElementById('order_retry_count')?.value) || 0,
+                    order_retry_delay_ms: parseInt(document.getElementById('order_retry_delay_ms')?.value) || 300,
+                    order_fallback_to_market: !!document.getElementById('order_fallback_to_market')?.checked,
+                    enable_volatility_sizing: !!document.getElementById('enable_volatility_sizing')?.checked,
+                    volatility_lookback_ticks: parseInt(document.getElementById('volatility_lookback_ticks')?.value) || 20,
+                    volatility_stop_mult: parseFloat(document.getElementById('volatility_stop_mult')?.value) || 1.0,
+                    max_loss_per_stock_krw: parseInt(document.getElementById('max_loss_per_stock_krw')?.value) || 0,
                     max_trades_per_day: 5,
                     max_position_size_ratio: 0.1,
                     trailing_stop_ratio: (parseFloat(document.getElementById('trailing_stop_pct').value) || 0) / 100,
@@ -1625,6 +2139,41 @@ def get_dashboard_html_mobile(username: str) -> str:
                     buy_window_start_hhmm: (document.getElementById('buy_window_start_hhmm').value || '09:05').trim(),
                     buy_window_end_hhmm: (document.getElementById('buy_window_end_hhmm').value || '11:30').trim(),
                     min_short_ma_slope_ratio: (parseFloat(document.getElementById('min_short_ma_slope_pct').value) || 0) / 100,
+                    momentum_lookback_ticks: parseInt(document.getElementById('momentum_lookback_ticks').value) || 0,
+                    min_momentum_ratio: (parseFloat(document.getElementById('min_momentum_pct').value) || 0) / 100,
+                    avoid_chase_near_high_enabled: !!document.getElementById('avoid_chase_near_high_enabled').checked,
+                    near_high_lookback_minutes: parseInt(document.getElementById('near_high_lookback_minutes').value) || 2,
+                    avoid_near_high_ratio: (parseFloat(document.getElementById('avoid_near_high_pct').value) || 0) / 100,
+                    avoid_near_high_dynamic: !!document.getElementById('avoid_near_high_dynamic').checked,
+                    avoid_near_high_vs_vol_mult: parseFloat(document.getElementById('avoid_near_high_vs_vol_mult').value) || 0,
+                    minute_trend_enabled: !!document.getElementById('minute_trend_enabled').checked,
+                    minute_trend_lookback_bars: parseInt(document.getElementById('minute_trend_lookback_bars').value) || 2,
+                    minute_trend_min_green_bars: parseInt(document.getElementById('minute_trend_min_green_bars').value) || 2,
+                    minute_trend_mode: (document.getElementById('minute_trend_mode')?.value || 'green'),
+                    minute_trend_early_only: !!document.getElementById('minute_trend_early_only')?.checked,
+                    entry_confirm_enabled: !!document.getElementById('entry_confirm_enabled').checked,
+                    entry_confirm_min_count: parseInt(document.getElementById('entry_confirm_min_count').value) || 1,
+                    confirm_breakout_enabled: !!document.getElementById('confirm_breakout_enabled').checked,
+                    breakout_lookback_ticks: parseInt(document.getElementById('breakout_lookback_ticks').value) || 20,
+                    breakout_buffer_ratio: (parseFloat(document.getElementById('breakout_buffer_pct').value) || 0) / 100,
+                    confirm_volume_surge_enabled: !!document.getElementById('confirm_volume_surge_enabled').checked,
+                    volume_surge_lookback_ticks: parseInt(document.getElementById('volume_surge_lookback_ticks').value) || 20,
+                    volume_surge_ratio: parseFloat(document.getElementById('volume_surge_ratio').value) || 2.0,
+                    confirm_trade_value_surge_enabled: !!document.getElementById('confirm_trade_value_surge_enabled').checked,
+                    trade_value_surge_lookback_ticks: parseInt(document.getElementById('trade_value_surge_lookback_ticks').value) || 20,
+                    trade_value_surge_ratio: parseFloat(document.getElementById('trade_value_surge_ratio').value) || 2.0,
+                    vol_norm_lookback_ticks: parseInt(document.getElementById('vol_norm_lookback_ticks').value) || 20,
+                    slope_vs_vol_mult: parseFloat(document.getElementById('slope_vs_vol_mult').value) || 0,
+                    range_vs_vol_mult: parseFloat(document.getElementById('range_vs_vol_mult').value) || 0,
+                    enable_morning_regime_split: !!document.getElementById('enable_morning_regime_split').checked,
+                    morning_regime_early_end_hhmm: (document.getElementById('morning_regime_early_end_hhmm').value || '09:10').trim(),
+                    early_min_short_ma_slope_ratio: (parseFloat(document.getElementById('early_min_short_ma_slope_pct').value) || 0) / 100,
+                    early_momentum_lookback_ticks: parseInt(document.getElementById('early_momentum_lookback_ticks').value) || 0,
+                    early_min_momentum_ratio: (parseFloat(document.getElementById('early_min_momentum_pct').value) || 0) / 100,
+                    early_buy_confirm_ticks: parseInt(document.getElementById('early_buy_confirm_ticks').value) || 1,
+                    early_max_spread_ratio: (parseFloat(document.getElementById('early_max_spread_pct').value) || 0) / 100,
+                    early_range_lookback_ticks: parseInt(document.getElementById('early_range_lookback_ticks').value) || 0,
+                    early_min_range_ratio: (parseFloat(document.getElementById('early_min_range_pct').value) || 0) / 100,
                     reentry_cooldown_seconds: parseInt(document.getElementById('reentry_cooldown_seconds').value) || 0,
                     buy_confirm_ticks: parseInt(document.getElementById('buy_confirm_ticks').value) || 1,
                     enable_time_liquidation: !!document.getElementById('enable_time_liquidation').checked,
@@ -1650,11 +2199,153 @@ def get_dashboard_html_mobile(username: str) -> str:
             }}
         }}
 
-        async function applyMaPreset(shortPeriod, longPeriod) {{
-            document.getElementById('short_ma_period').value = shortPeriod;
-            document.getElementById('long_ma_period').value = longPeriod;
-            addLog(`MA 프리셋 적용: short=${{shortPeriod}}, long=${{longPeriod}}`, 'info');
-            await updateStrategyConfig();
+        async function applyStrategyPreset(name) {{
+            try {{
+                const n = (name || '').toString();
+                if (!n) return;
+
+                // MA-only 프리셋: 고급값은 유지하고 MA만 변경
+                if (n === 'ma_fast_3_10' || n === 'ma_safe_5_20' || n === 'ma_mid_8_21') {{
+                    if (n === 'ma_fast_3_10') {{
+                        document.getElementById('short_ma_period').value = 3;
+                        document.getElementById('long_ma_period').value = 10;
+                    }} else if (n === 'ma_safe_5_20') {{
+                        document.getElementById('short_ma_period').value = 5;
+                        document.getElementById('long_ma_period').value = 20;
+                    }} else {{
+                        document.getElementById('short_ma_period').value = 8;
+                        document.getElementById('long_ma_period').value = 21;
+                    }}
+                    addLog('MA 프리셋 적용: ' + n, 'info');
+                    await updateStrategyConfig();
+                    updateSettingsSummaries();
+                    return;
+                }}
+
+                // 공통: 기본값(고급 포함)
+                document.getElementById('enable_time_liquidation').checked = true;
+                document.getElementById('liquidate_after_hhmm').value = '11:55';
+                document.getElementById('reentry_cooldown_seconds').value = 180;
+                document.getElementById('buy_window_start_hhmm').value = '09:05';
+                document.getElementById('buy_window_end_hhmm').value = '11:30';
+
+                document.getElementById('vol_norm_lookback_ticks').value = 20;
+                document.getElementById('slope_vs_vol_mult').value = 0;
+                document.getElementById('range_vs_vol_mult').value = 0;
+
+                document.getElementById('enable_morning_regime_split').checked = true;
+                document.getElementById('morning_regime_early_end_hhmm').value = '09:10';
+
+                // 진입 직전(피크 추격 방지)
+                document.getElementById('avoid_chase_near_high_enabled').checked = true;
+                document.getElementById('near_high_lookback_minutes').value = 2;
+                document.getElementById('avoid_near_high_pct').value = 0.30;
+                document.getElementById('avoid_near_high_dynamic').checked = true;
+                document.getElementById('avoid_near_high_vs_vol_mult').value = 3.0;
+
+                // 보강(2단)
+                document.getElementById('entry_confirm_enabled').checked = true;
+                document.getElementById('entry_confirm_min_count').value = 1;
+                document.getElementById('confirm_breakout_enabled').checked = true;
+                document.getElementById('breakout_lookback_ticks').value = 20;
+                document.getElementById('breakout_buffer_pct').value = 0.10;
+                document.getElementById('confirm_volume_surge_enabled').checked = false;
+                document.getElementById('volume_surge_lookback_ticks').value = 20;
+                document.getElementById('volume_surge_ratio').value = 2.0;
+                document.getElementById('confirm_trade_value_surge_enabled').checked = true;
+                document.getElementById('trade_value_surge_lookback_ticks').value = 20;
+                document.getElementById('trade_value_surge_ratio').value = 2.0;
+
+                // 분봉 추세(초반만)
+                document.getElementById('minute_trend_enabled').checked = true;
+                document.getElementById('minute_trend_early_only').checked = true;
+                document.getElementById('minute_trend_lookback_bars').value = 2;
+                document.getElementById('minute_trend_min_green_bars').value = 2;
+                document.getElementById('minute_trend_mode').value = 'hh_hl';
+
+                if (n === 'scalp_light') {{
+                    // 가벼움: 진입 기회↑
+                    document.getElementById('short_ma_period').value = 3;
+                    document.getElementById('long_ma_period').value = 10;
+                    document.getElementById('min_short_ma_slope_pct').value = 0.008;
+                    document.getElementById('momentum_lookback_ticks').value = 6;
+                    document.getElementById('min_momentum_pct').value = 0.15;
+                    document.getElementById('buy_confirm_ticks').value = 1;
+                    document.getElementById('max_spread_pct').value = 0.30;
+                    document.getElementById('range_lookback_ticks').value = 40;
+                    document.getElementById('min_range_pct').value = 0.20;
+
+                    document.getElementById('early_min_short_ma_slope_pct').value = 0.015;
+                    document.getElementById('early_momentum_lookback_ticks').value = 6;
+                    document.getElementById('early_min_momentum_pct').value = 0.20;
+                    document.getElementById('early_buy_confirm_ticks').value = 1;
+                    document.getElementById('early_max_spread_pct').value = 0.35;
+                    document.getElementById('early_range_lookback_ticks').value = 40;
+                    document.getElementById('early_min_range_pct').value = 0.25;
+                }} else if (n === 'scalp_morning_strict') {{
+                    // 엄격: 노이즈↓
+                    document.getElementById('short_ma_period').value = 3;
+                    document.getElementById('long_ma_period').value = 12;
+                    document.getElementById('min_short_ma_slope_pct').value = 0.015;
+                    document.getElementById('momentum_lookback_ticks').value = 8;
+                    document.getElementById('min_momentum_pct').value = 0.25;
+                    document.getElementById('buy_confirm_ticks').value = 2;
+                    document.getElementById('max_spread_pct').value = 0.18;
+                    document.getElementById('range_lookback_ticks').value = 70;
+                    document.getElementById('min_range_pct').value = 0.28;
+
+                    document.getElementById('early_min_short_ma_slope_pct').value = 0.030;
+                    document.getElementById('early_momentum_lookback_ticks').value = 8;
+                    document.getElementById('early_min_momentum_pct').value = 0.40;
+                    document.getElementById('early_buy_confirm_ticks').value = 2;
+                    document.getElementById('early_max_spread_pct').value = 0.22;
+                    document.getElementById('early_range_lookback_ticks').value = 70;
+                    document.getElementById('early_min_range_pct').value = 0.35;
+
+                    // 보강조건 2개 이상
+                    document.getElementById('entry_confirm_min_count').value = 2;
+                    document.getElementById('confirm_volume_surge_enabled').checked = true;
+                }} else {{
+                    // 밸런스
+                    document.getElementById('short_ma_period').value = 3;
+                    document.getElementById('long_ma_period').value = 10;
+                    document.getElementById('min_short_ma_slope_pct').value = 0.010;
+                    document.getElementById('momentum_lookback_ticks').value = 8;
+                    document.getElementById('min_momentum_pct').value = 0.20;
+                    document.getElementById('buy_confirm_ticks').value = 2;
+                    document.getElementById('max_spread_pct').value = 0.20;
+                    document.getElementById('range_lookback_ticks').value = 60;
+                    document.getElementById('min_range_pct').value = 0.25;
+
+                    document.getElementById('early_min_short_ma_slope_pct').value = 0.020;
+                    document.getElementById('early_momentum_lookback_ticks').value = 8;
+                    document.getElementById('early_min_momentum_pct').value = 0.30;
+                    document.getElementById('early_buy_confirm_ticks').value = 2;
+                    document.getElementById('early_max_spread_pct').value = 0.25;
+                    document.getElementById('early_range_lookback_ticks').value = 60;
+                    document.getElementById('early_min_range_pct').value = 0.30;
+                }}
+
+                addLog('전략 프리셋 적용: ' + n, 'info');
+                await updateStrategyConfig();
+                updateSettingsSummaries();
+            }} catch (e) {{
+                addLog('전략 프리셋 적용 오류: ' + e, 'error');
+            }}
+        }}
+
+        async function onStrategyPresetChange() {{
+            try {{
+                const sel = document.getElementById('strategy_preset_select');
+                if (!sel) return;
+                const v = (sel.value || '').toString();
+                if (!v) return;
+                await applyStrategyPreset(v);
+                // 적용 후에는 "직접 설정"으로 되돌려 혼선 방지
+                sel.value = '';
+            }} catch (e) {{
+                addLog('전략 프리셋 변경 오류: ' + e, 'error');
+            }}
         }}
 
         async function applyScalpMorningPreset() {{
@@ -1679,6 +2370,42 @@ def get_dashboard_html_mobile(username: str) -> str:
                 document.getElementById('buy_window_start_hhmm').value = '09:05';
                 document.getElementById('buy_window_end_hhmm').value = '11:30';
                 document.getElementById('min_short_ma_slope_pct').value = 0.010;
+                document.getElementById('momentum_lookback_ticks').value = 8;
+                document.getElementById('min_momentum_pct').value = 0.20;
+                document.getElementById('avoid_chase_near_high_enabled').checked = true;
+                document.getElementById('near_high_lookback_minutes').value = 2;
+                document.getElementById('avoid_near_high_pct').value = 0.30;
+                document.getElementById('avoid_near_high_dynamic').checked = true;
+                document.getElementById('avoid_near_high_vs_vol_mult').value = 3.0;
+                // 초반 레짐(09:00~09:10)에서만 분봉 추세 필터 ON (노이즈/피크 추격 완화)
+                document.getElementById('minute_trend_enabled').checked = true;
+                document.getElementById('minute_trend_lookback_bars').value = 2;
+                document.getElementById('minute_trend_min_green_bars').value = 2;
+                document.getElementById('minute_trend_mode').value = 'hh_hl';
+                document.getElementById('minute_trend_early_only').checked = true;
+                document.getElementById('entry_confirm_enabled').checked = true;
+                document.getElementById('entry_confirm_min_count').value = 1;
+                document.getElementById('confirm_breakout_enabled').checked = true;
+                document.getElementById('breakout_lookback_ticks').value = 20;
+                document.getElementById('breakout_buffer_pct').value = 0.10;
+                document.getElementById('confirm_volume_surge_enabled').checked = false;
+                document.getElementById('volume_surge_lookback_ticks').value = 20;
+                document.getElementById('volume_surge_ratio').value = 2.0;
+                document.getElementById('confirm_trade_value_surge_enabled').checked = true;
+                document.getElementById('trade_value_surge_lookback_ticks').value = 20;
+                document.getElementById('trade_value_surge_ratio').value = 2.0;
+                document.getElementById('vol_norm_lookback_ticks').value = 20;
+                document.getElementById('slope_vs_vol_mult').value = 0;
+                document.getElementById('range_vs_vol_mult').value = 0;
+                document.getElementById('enable_morning_regime_split').checked = true;
+                document.getElementById('morning_regime_early_end_hhmm').value = '09:10';
+                document.getElementById('early_min_short_ma_slope_pct').value = 0.020;
+                document.getElementById('early_momentum_lookback_ticks').value = 8;
+                document.getElementById('early_min_momentum_pct').value = 0.30;
+                document.getElementById('early_buy_confirm_ticks').value = 2;
+                document.getElementById('early_max_spread_pct').value = 0.25;
+                document.getElementById('early_range_lookback_ticks').value = 60;
+                document.getElementById('early_min_range_pct').value = 0.30;
                 document.getElementById('reentry_cooldown_seconds').value = 180;
                 document.getElementById('buy_confirm_ticks').value = 2;
                 // 스프레드/횡보장 필터 기본값 튜닝(너무 타이트하면 매수 자체가 안 걸릴 수 있음)
@@ -1724,6 +2451,8 @@ def get_dashboard_html_mobile(username: str) -> str:
                     min_trade_amount: parseInt(document.getElementById('min_trade_amount').value) || 0,
                     max_stocks: parseInt(document.getElementById('max_stocks').value),
                     exclude_risk_stocks: true,
+                    sort_by: (document.getElementById('stock_sort_by')?.value || 'change'),
+                    prev_day_rank_pool_size: parseInt(document.getElementById('prev_day_rank_pool_size')?.value) || 80,
 
                     market_open_hhmm: (document.getElementById('market_open_hhmm').value || '09:00').trim(),
                     warmup_minutes: parseInt(document.getElementById('warmup_minutes').value) || 0,

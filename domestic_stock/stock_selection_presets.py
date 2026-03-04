@@ -98,7 +98,7 @@ PRESET_SCALP_MORNING = {
     "max_price": 50000,
     "min_volume": 100000,
     "min_trade_amount": 2000000000,  # 20억
-    "max_stocks": 5,
+    "max_stocks": 12,
     "exclude_risk_stocks": True,
     # 장초/장중 품질 개선 옵션 (UI에 그대로 매핑됨)
     "market_open_hhmm": "09:00",

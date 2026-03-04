@@ -13,7 +13,8 @@
 
 import sys
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+import time
 from typing import Dict, Optional, Tuple
 import pandas as pd
 
@@ -56,6 +57,27 @@ class RiskManager:
         self.daily_loss_limit = 500000  # 일일 최대 50만원 손실
         # 일일 이익 한도(목표). 0이면 사용 안 함.
         self.daily_profit_limit = 0
+        # (실현+미실현) 합산 기준 일일 손실 한도. 0이면 사용 안 함.
+        self.daily_total_loss_limit = 0
+        # 이익/손실 트리거 등으로 "오늘 신규 매수 중지" (하루 단위)
+        self.halt_new_buys_day = ""
+        self.halt_new_buys_reason = ""
+        # 일일 손익 한도 기준(실현/합산)
+        self.daily_profit_limit_basis = "total"  # realized | total
+        self.daily_loss_limit_basis = "realized"  # realized | total
+
+        # 주문 실행 방식/재시도
+        self.buy_order_style = "market"  # market | best_limit
+        self.sell_order_style = "market"  # market | best_limit
+        self.order_retry_count = 0
+        self.order_retry_delay_ms = 300
+        self.order_fallback_to_market = True
+
+        # 변동성 기반 포지션 사이징/종목당 최대 손실액
+        self.enable_volatility_sizing = False
+        self.volatility_lookback_ticks = 20
+        self.volatility_stop_mult = 1.0
+        self.max_loss_per_stock_krw = 0
         
         # 거래 제한
         self.max_trades_per_day = 5  # 하루 최대 거래 횟수 (매수+매도 = 1회)
@@ -66,6 +88,7 @@ class RiskManager:
         self.daily_pnl = 0.0
         self.positions: Dict[str, Dict] = {}  # {종목코드: {매수가, 수량, 시간}}
         self.last_prices: Dict[str, float] = {}  # 가격 변동 추적용
+        self._price_history: Dict[str, list] = {}  # 변동성 계산용(최근 N틱 가격)
         # 재진입 쿨다운
         self.reentry_cooldown_seconds = 0
         self._last_exit_at: Dict[str, datetime] = {}
@@ -80,20 +103,44 @@ class RiskManager:
         Returns:
             (가능여부, 이유)
         """
+        # 0. 오늘 신규 매수 중지 상태면 차단
+        try:
+            tz = timezone(timedelta(hours=9))
+            today_key = datetime.now(tz).strftime("%Y%m%d")
+            if self.halt_new_buys_day and str(self.halt_new_buys_day) != today_key:
+                self.halt_new_buys_day = ""
+                self.halt_new_buys_reason = ""
+            if str(self.halt_new_buys_day or "") == today_key:
+                return False, str(self.halt_new_buys_reason or "일일 신규 매수 중지")
+        except Exception:
+            pass
+
         # 1. 일일 거래 횟수 체크
         if self.daily_trades >= self.max_trades_per_day:
             return False, "일일 거래 횟수 초과"
         
-        # 2. 일일 손실 한도 체크
-        if self.daily_pnl <= -self.daily_loss_limit:
-            return False, "일일 손실 한도 초과"
-
-        # 2-1. 일일 이익 한도(목표) 체크: 목표 달성 시 신규 매수 차단
+        # 2. 일일 손익 한도 체크 (실현/합산 옵션)
         try:
-            if getattr(self, "daily_profit_limit", 0) and float(self.daily_pnl) >= float(self.daily_profit_limit):
-                return False, "일일 이익 한도(목표) 달성"
+            loss_limit = int(getattr(self, "daily_loss_limit", 0) or 0)
         except Exception:
-            pass
+            loss_limit = 0
+        try:
+            profit_limit = int(getattr(self, "daily_profit_limit", 0) or 0)
+        except Exception:
+            profit_limit = 0
+
+        realized = float(getattr(self, "daily_pnl", 0.0) or 0.0)
+        total = float(self.get_total_pnl() or realized)
+
+        loss_basis = str(getattr(self, "daily_loss_limit_basis", "realized") or "realized").strip().lower()
+        profit_basis = str(getattr(self, "daily_profit_limit_basis", "total") or "total").strip().lower()
+        loss_pnl = total if loss_basis == "total" else realized
+        profit_pnl = total if profit_basis == "total" else realized
+
+        if loss_limit > 0 and float(loss_pnl) <= -float(loss_limit):
+            return False, "일일 손실 한도 도달"
+        if profit_limit > 0 and float(profit_pnl) >= float(profit_limit):
+            return False, "일일 이익 한도(목표) 달성"
         
         # 3. 거래 금액 체크
         trade_amount = price * quantity
@@ -123,6 +170,19 @@ class RiskManager:
             price_change = abs(price - self.last_prices[stock_code]) / self.last_prices[stock_code]
             if price_change < self.min_price_change_ratio:
                 return False, f"가격 변동 부족 (최소 {self.min_price_change_ratio*100}% 필요)"
+
+        # 7. 종목당 최대 손실액(원) 기반 리스크 체크 (변동성 사이징을 쓸 때 특히 중요)
+        try:
+            if bool(getattr(self, "enable_volatility_sizing", False)):
+                max_loss = int(getattr(self, "max_loss_per_stock_krw", 0) or 0)
+                if max_loss > 0 and price > 0 and float(getattr(self, "stop_loss_ratio", 0.0) or 0.0) > 0:
+                    # 최소 손절거리(원/주)를 기준으로 위험액을 근사
+                    stop_by_ratio = float(getattr(self, "stop_loss_ratio", 0.0) or 0.0) * float(price)
+                    est_risk = float(quantity) * float(stop_by_ratio)
+                    if stop_by_ratio > 0 and est_risk > float(max_loss) * 1.001:
+                        return False, f"종목당 최대 손실액 초과(추정 {est_risk:,.0f}원 > {max_loss:,.0f}원)"
+        except Exception:
+            pass
         
         return True, "OK"
     
@@ -137,14 +197,83 @@ class RiskManager:
             self.max_single_trade_amount,
             self.account_balance * self.max_position_size_ratio
         )
-        quantity = int(max_trade_amount / price)
+        # 기본: 금액 기반 수량
+        quantity = int(max_trade_amount / price) if price > 0 else 0
         min_q = 1
         try:
             min_q = int(self.min_order_quantity or 1)
         except Exception:
             min_q = 1
         min_q = max(1, min_q)
-        return max(min_q, quantity)
+        quantity = max(min_q, quantity)
+        return quantity
+
+    def calculate_quantity_with_volatility(
+        self,
+        stock_code: str,
+        price: float,
+        fallback_quantity: int,
+    ) -> int:
+        """
+        변동성 기반(ATR 유사) 사이징:
+        - risk_per_share = max(stop_loss_ratio*price, vol_mult*avg_abs_diff)
+        - qty_risk = floor(max_loss_per_stock / risk_per_share)
+        - 금액/비율 제한과 함께 최소값 선택
+        """
+        try:
+            if not bool(getattr(self, "enable_volatility_sizing", False)):
+                return int(fallback_quantity)
+            max_loss = int(getattr(self, "max_loss_per_stock_krw", 0) or 0)
+            if max_loss <= 0:
+                return int(fallback_quantity)
+            if price <= 0:
+                return int(fallback_quantity)
+
+            lookback = int(getattr(self, "volatility_lookback_ticks", 20) or 20)
+            lookback = max(2, min(300, lookback))
+            mult = float(getattr(self, "volatility_stop_mult", 1.0) or 1.0)
+            mult = max(0.1, min(10.0, mult))
+
+            hist = self._price_history.get(stock_code) or []
+            if len(hist) < lookback + 1:
+                return int(fallback_quantity)
+
+            diffs = []
+            start = max(1, len(hist) - (lookback + 1))
+            for i in range(start, len(hist)):
+                try:
+                    diffs.append(abs(float(hist[i]) - float(hist[i - 1])))
+                except Exception:
+                    continue
+            if not diffs:
+                return int(fallback_quantity)
+            avg_abs = float(sum(diffs) / float(len(diffs)))
+            stop_by_ratio = float(getattr(self, "stop_loss_ratio", 0.0) or 0.0) * float(price)
+            risk_per_share = max(stop_by_ratio, mult * avg_abs)
+            if risk_per_share <= 0:
+                return int(fallback_quantity)
+
+            qty_risk = int(max_loss / risk_per_share)
+            if qty_risk <= 0:
+                return 0
+
+            # 금액 기반 상한도 같이 적용
+            max_trade_amount = min(
+                float(getattr(self, "max_single_trade_amount", 0) or 0),
+                float(getattr(self, "account_balance", 0) or 0) * float(getattr(self, "max_position_size_ratio", 0) or 0),
+            )
+            qty_amount = int(max_trade_amount / price) if max_trade_amount > 0 else qty_risk
+            min_q = 1
+            try:
+                min_q = int(self.min_order_quantity or 1)
+            except Exception:
+                min_q = 1
+            min_q = max(1, min_q)
+
+            qty = max(min_q, min(qty_risk, qty_amount))
+            return int(qty)
+        except Exception:
+            return int(fallback_quantity)
     
     def update_position(self, stock_code: str, price: float, quantity: int, action: str):
         """포지션 업데이트"""
@@ -154,6 +283,7 @@ class RiskManager:
                 "quantity": quantity,
                 "buy_time": datetime.now(),
                 "partial_taken": False,
+                "current_price": float(price),
             }
             self.daily_trades += 1  # 매수 시 거래 횟수 증가
             self.last_prices[stock_code] = price
@@ -190,6 +320,55 @@ class RiskManager:
                         del self._highest_price[stock_code]
                 return pnl
         return 0.0
+
+    def update_price(self, stock_code: str, price: float):
+        """가격 업데이트 (변동 추적/미실현 손익 계산용)"""
+        try:
+            px = float(price)
+        except Exception:
+            return
+        self.last_prices[stock_code] = px
+        hist = self._price_history.get(stock_code)
+        if hist is None:
+            hist = []
+            self._price_history[stock_code] = hist
+        hist.append(px)
+        # 최근 600틱까지만 유지
+        if len(hist) > 600:
+            self._price_history[stock_code] = hist[-600:]
+
+        if stock_code in self.positions:
+            try:
+                self.positions[stock_code]["current_price"] = px
+            except Exception:
+                pass
+            prev = self._highest_price.get(stock_code, 0.0)
+            if float(px) > float(prev or 0.0):
+                self._highest_price[stock_code] = float(px)
+
+    def get_unrealized_pnl(self) -> float:
+        try:
+            unreal = 0.0
+            for code, pos in list(self.positions.items()):
+                try:
+                    qty = int(pos.get("quantity") or 0)
+                    if qty <= 0:
+                        continue
+                    buy_px = float(pos.get("buy_price") or 0)
+                    cur_px = float(pos.get("current_price") or self.last_prices.get(code) or buy_px or 0)
+                    if buy_px > 0 and cur_px > 0:
+                        unreal += (cur_px - buy_px) * qty
+                except Exception:
+                    continue
+            return float(unreal)
+        except Exception:
+            return 0.0
+
+    def get_total_pnl(self) -> float:
+        try:
+            return float(self.daily_pnl or 0.0) + float(self.get_unrealized_pnl() or 0.0)
+        except Exception:
+            return float(self.daily_pnl or 0.0)
 
     def check_exit_signal(self, stock_code: str, current_price: float) -> Optional[Dict]:
         """
@@ -249,14 +428,6 @@ class RiskManager:
 
         return None
     
-    def update_price(self, stock_code: str, price: float):
-        """가격 업데이트 (변동 추적용)"""
-        self.last_prices[stock_code] = price
-        if stock_code in self.positions:
-            prev = self._highest_price.get(stock_code, 0.0)
-            if float(price) > float(prev or 0.0):
-                self._highest_price[stock_code] = float(price)
-
     def is_in_reentry_cooldown(self, stock_code: str) -> bool:
         if not self.reentry_cooldown_seconds or self.reentry_cooldown_seconds <= 0:
             return False
@@ -475,7 +646,8 @@ def safe_execute_order(
         except Exception:
             quantity = None
         if quantity is None:
-            quantity = risk_mgr.calculate_quantity(price)
+            base_qty = risk_mgr.calculate_quantity(price)
+            quantity = risk_mgr.calculate_quantity_with_volatility(stock_code, price, fallback_quantity=base_qty)
         details["quantity"] = int(quantity)
         
         # 거래 가능 여부 확인
@@ -504,22 +676,48 @@ def safe_execute_order(
                 logging.info(f"[매수 취소] {stock_code}: 사용자 취소")
                 return False
         
-        # 주문 실행
+        # 주문 실행 (시장가/최우선 지정가 + 재시도)
         try:
-            result = order_cash(
-                env_dv=details["env_dv"],
-                ord_dv="buy",
-                cano=trenv.my_acct,
-                acnt_prdt_cd=trenv.my_prod,
-                pdno=stock_code,
-                ord_dvsn="01",  # 시장가 (체결 보장)
-                ord_qty=str(quantity),
-                ord_unpr="0",  # 시장가는 가격 0
-                excg_id_dvsn_cd="KRX"
-            )
-            details["order_response"] = _extract_order_response(result)
-            
-            if not result.empty:
+            style = str(getattr(risk_mgr, "buy_order_style", "market") or "market").strip().lower()
+            retries = int(getattr(risk_mgr, "order_retry_count", 0) or 0)
+            delay_ms = int(getattr(risk_mgr, "order_retry_delay_ms", 300) or 300)
+            fallback_to_mkt = bool(getattr(risk_mgr, "order_fallback_to_market", True))
+            retries = max(0, min(10, retries))
+            delay_ms = max(0, min(10000, delay_ms))
+
+            attempts = []
+            last_result = pd.DataFrame()
+            last_style_used = style
+            for i in range(retries + 1):
+                style_used = last_style_used
+                ord_dvsn = "01" if style_used == "market" else "04"  # 04: 최우선 지정가
+                ord_unpr = "0"
+                result = order_cash(
+                    env_dv=details["env_dv"],
+                    ord_dv="buy",
+                    cano=trenv.my_acct,
+                    acnt_prdt_cd=trenv.my_prod,
+                    pdno=stock_code,
+                    ord_dvsn=ord_dvsn,
+                    ord_qty=str(quantity),
+                    ord_unpr=ord_unpr,
+                    excg_id_dvsn_cd="KRX",
+                )
+                last_result = result
+                attempts.append({"try": i + 1, "order_style": style_used, "ord_dvsn": ord_dvsn, "empty": bool(result.empty)})
+                if not result.empty:
+                    break
+                # 최우선 지정가가 비면 시장가로 폴백
+                if style_used == "best_limit" and fallback_to_mkt:
+                    last_style_used = "market"
+                if i < retries and delay_ms > 0:
+                    time.sleep(delay_ms / 1000.0)
+
+            details["order_attempts"] = attempts
+            details["order_response"] = _extract_order_response(last_result)
+            details["order_style_used"] = attempts[-1]["order_style"] if attempts else style
+
+            if not last_result.empty:
                 risk_mgr.update_position(stock_code, price, quantity, "buy")
                 logging.info(f"[매수 체결] {stock_code}: {price:,.0f}원, {quantity}주, 금액: {price*quantity:,.0f}원")
                 details["ok"] = True
@@ -532,7 +730,7 @@ def safe_execute_order(
                 if return_details:
                     return False, details
                 return False
-                
+
         except Exception as e:
             logging.error(f"[매수 오류] {stock_code}: {e}")
             import traceback
@@ -577,22 +775,47 @@ def safe_execute_order(
                 logging.info(f"[매도 취소] {stock_code}: 사용자 취소")
                 return False
         
-        # 주문 실행
+        # 주문 실행 (시장가/최우선 지정가 + 재시도)
         try:
-            result = order_cash(
-                env_dv=details["env_dv"],
-                ord_dv="sell",
-                cano=trenv.my_acct,
-                acnt_prdt_cd=trenv.my_prod,
-                pdno=stock_code,
-                ord_dvsn="01",  # 시장가 (체결 보장)
-                ord_qty=str(quantity),
-                ord_unpr="0",  # 시장가는 가격 0
-                excg_id_dvsn_cd="KRX"
-            )
-            details["order_response"] = _extract_order_response(result)
-            
-            if not result.empty:
+            style = str(getattr(risk_mgr, "sell_order_style", "market") or "market").strip().lower()
+            retries = int(getattr(risk_mgr, "order_retry_count", 0) or 0)
+            delay_ms = int(getattr(risk_mgr, "order_retry_delay_ms", 300) or 300)
+            fallback_to_mkt = bool(getattr(risk_mgr, "order_fallback_to_market", True))
+            retries = max(0, min(10, retries))
+            delay_ms = max(0, min(10000, delay_ms))
+
+            attempts = []
+            last_result = pd.DataFrame()
+            last_style_used = style
+            for i in range(retries + 1):
+                style_used = last_style_used
+                ord_dvsn = "01" if style_used == "market" else "04"
+                ord_unpr = "0"
+                result = order_cash(
+                    env_dv=details["env_dv"],
+                    ord_dv="sell",
+                    cano=trenv.my_acct,
+                    acnt_prdt_cd=trenv.my_prod,
+                    pdno=stock_code,
+                    ord_dvsn=ord_dvsn,
+                    ord_qty=str(quantity),
+                    ord_unpr=ord_unpr,
+                    excg_id_dvsn_cd="KRX",
+                )
+                last_result = result
+                attempts.append({"try": i + 1, "order_style": style_used, "ord_dvsn": ord_dvsn, "empty": bool(result.empty)})
+                if not result.empty:
+                    break
+                if style_used == "best_limit" and fallback_to_mkt:
+                    last_style_used = "market"
+                if i < retries and delay_ms > 0:
+                    time.sleep(delay_ms / 1000.0)
+
+            details["order_attempts"] = attempts
+            details["order_response"] = _extract_order_response(last_result)
+            details["order_style_used"] = attempts[-1]["order_style"] if attempts else style
+
+            if not last_result.empty:
                 pnl = risk_mgr.update_position(stock_code, price, quantity, "sell")
                 logging.info(f"[매도 체결] {stock_code}: {price:,.0f}원, {quantity}주, 손익: {pnl:+,.0f}원")
                 details["ok"] = True
@@ -606,7 +829,7 @@ def safe_execute_order(
                 if return_details:
                     return False, details
                 return False
-                
+
         except Exception as e:
             logging.error(f"[매도 오류] {stock_code}: {e}")
             import traceback

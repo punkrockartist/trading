@@ -106,6 +106,21 @@ class RiskConfig(BaseModel):
     take_profit_ratio: float
     daily_loss_limit: int
     daily_profit_limit: int = 0  # 0이면 사용 안 함 (원). 도달 시 신규 매수 차단 + 전량매도 트리거에 사용 가능
+    daily_total_loss_limit: int = 0  # 0이면 사용 안 함 (원). (실현+미실현) 합산이 -한도 이하이면 전량매도 + 신규매수 차단
+    # 일일 손익 한도 기준(실현/실현+미실현)
+    daily_profit_limit_basis: str = "total"  # realized | total
+    daily_loss_limit_basis: str = "realized"  # realized | total
+    # 주문 실행 방식/재시도
+    buy_order_style: str = "market"  # market | best_limit
+    sell_order_style: str = "market"  # market | best_limit
+    order_retry_count: int = 0
+    order_retry_delay_ms: int = 300
+    order_fallback_to_market: bool = True
+    # 변동성 기반 포지션 사이징 + 종목당 최대 손실액
+    enable_volatility_sizing: bool = False
+    volatility_lookback_ticks: int = 20
+    volatility_stop_mult: float = 1.0
+    max_loss_per_stock_krw: int = 0  # 0이면 사용 안 함
     max_trades_per_day: int
     max_position_size_ratio: float
     trailing_stop_ratio: float = 0.0
@@ -122,6 +137,13 @@ class StockSelectionConfig(BaseModel):
     min_trade_amount: int = 0
     max_stocks: int
     exclude_risk_stocks: bool
+    # 정렬 기준(최종 후보 중 무엇을 우선으로 뽑을지)
+    # - change: 등락률(기본, API 랭킹 그대로)
+    # - trade_amount: (가능할 때) 당일 누적 거래대금 우선
+    # - prev_day_trade_value: 전일 거래대금(또는 거래량*종가) 우선 (비용↑, 상위 pool만 조회)
+    sort_by: str = "change"
+    # prev_day_trade_value 정렬 시 조회할 후보 pool 크기 (비용 제한)
+    prev_day_rank_pool_size: int = 80
     # 장초/장중 품질 개선 옵션 (기존 env 기반 옵션을 UI로 노출)
     market_open_hhmm: str = "09:00"
     warmup_minutes: int = 5
@@ -139,6 +161,47 @@ class StrategyConfig(BaseModel):
     buy_window_start_hhmm: str = "09:05"
     buy_window_end_hhmm: str = "11:30"
     min_short_ma_slope_ratio: float = 0.0
+    # 모멘텀(추가 진입 필터): lookback N틱 전 대비 상승률
+    momentum_lookback_ticks: int = 0
+    min_momentum_ratio: float = 0.0
+    # 진입 보강(2단): 추세 조건 + (아래 조건 중 N개 이상) 만족 시에만 매수
+    entry_confirm_enabled: bool = False
+    entry_confirm_min_count: int = 1
+    confirm_breakout_enabled: bool = False
+    breakout_lookback_ticks: int = 20
+    breakout_buffer_ratio: float = 0.0
+    confirm_volume_surge_enabled: bool = False
+    volume_surge_lookback_ticks: int = 20
+    volume_surge_ratio: float = 2.0
+    confirm_trade_value_surge_enabled: bool = False
+    trade_value_surge_lookback_ticks: int = 20
+    trade_value_surge_ratio: float = 2.0
+    # 변동성 정규화(보조): 평균 변동폭 대비 slope/range 기준을 추가로 적용
+    vol_norm_lookback_ticks: int = 20
+    slope_vs_vol_mult: float = 0.0
+    range_vs_vol_mult: float = 0.0
+    # 오전장 레짐 분기(초반/메인): 초반(예: 09:00~09:10)에는 다른 임계값 적용
+    enable_morning_regime_split: bool = False
+    morning_regime_early_end_hhmm: str = "09:10"
+    early_min_short_ma_slope_ratio: float = 0.0
+    early_momentum_lookback_ticks: int = 0
+    early_min_momentum_ratio: float = 0.0
+    early_buy_confirm_ticks: int = 1
+    early_max_spread_ratio: float = 0.0
+    early_range_lookback_ticks: int = 0
+    early_min_range_ratio: float = 0.0
+    # 진입 직전 추가 필터(피크 추격 완화/초단기 추세 유지)
+    avoid_chase_near_high_enabled: bool = False
+    near_high_lookback_minutes: int = 2
+    avoid_near_high_ratio: float = 0.003  # 0.003=0.3% 이내(고점에 너무 근접하면 스킵)
+    # 변동성 기반으로 고점근접 회피 임계값을 자동 상향(피크 추격 더 강하게 차단)
+    avoid_near_high_dynamic: bool = False
+    avoid_near_high_vs_vol_mult: float = 0.0
+    minute_trend_enabled: bool = False
+    minute_trend_lookback_bars: int = 2  # 1~2분봉 추세 유지(최근 N개)
+    minute_trend_min_green_bars: int = 2  # 최근 N개 중 양봉 최소 개수
+    minute_trend_mode: str = "green"  # green | higher_close | higher_low | hh_hl
+    minute_trend_early_only: bool = False
     reentry_cooldown_seconds: int = 0
     buy_confirm_ticks: int = 1
     enable_time_liquidation: bool = False

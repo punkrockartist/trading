@@ -614,7 +614,7 @@ def _start_trading_engine_thread():
                 except Exception:
                     pass
 
-                # 일일 이익 한도 도달 시: 현재 보유 포지션을 "지금 시장가 전량매도" 가정으로 합산 손익이 한도를 넘으면 오늘 1회 전량 매도
+                # 일일 이익 한도 도달 시: 기준(실현/합산)에 따라 신규매수 차단 + (합산일 때) 오늘 1회 전량 매도 신호 생성
                 try:
                     rm = getattr(state, "risk_manager", None)
                     if rm and getattr(rm, "positions", None):
@@ -625,27 +625,63 @@ def _start_trading_engine_thread():
                             today_key = now_dt.strftime("%Y%m%d")
                             if getattr(state, "_profit_limit_done_day", "") != today_key:
                                 realized = float(getattr(rm, "daily_pnl", 0.0) or 0.0)
-                                unreal = 0.0
-                                for code, pos in list(rm.positions.items()):
-                                    try:
-                                        qty = int(pos.get("quantity") or 0)
-                                        if qty <= 0:
-                                            continue
-                                        buy_px = float(pos.get("buy_price") or 0)
-                                        cur_px = float(pos.get("current_price") or pos.get("buy_price") or 0)
-                                        if cur_px <= 0:
-                                            cur_px = float(rm.last_prices.get(code) or buy_px or 0)
-                                        if buy_px > 0 and cur_px > 0:
-                                            unreal += (cur_px - buy_px) * qty
-                                    except Exception:
-                                        continue
-                                total_if_liq = realized + unreal
-                                if total_if_liq >= float(limit):
+                                total_if_liq = float(getattr(rm, "get_total_pnl", lambda: realized)() or realized)
+                                basis = str(getattr(rm, "daily_profit_limit_basis", "total") or "total").strip().lower()
+                                cur_pnl = total_if_liq if basis == "total" else realized
+                                if cur_pnl >= float(limit):
                                     state._profit_limit_done_day = today_key
+                                    try:
+                                        rm.halt_new_buys_day = today_key
+                                        rm.halt_new_buys_reason = f"일일 이익 한도({limit:,}원) 도달"
+                                    except Exception:
+                                        pass
+                                    if basis == "total":
+                                        _run_async_broadcast({
+                                            "type": "log",
+                                            "level": "warning",
+                                            "message": f"일일 이익 한도 도달(total): {cur_pnl:,.0f}원 >= {limit:,.0f}원 (전량 매도 신호 생성)",
+                                        })
+                                        for code, pos in list(rm.positions.items()):
+                                            qty = int(pos.get("quantity", 0) or 0)
+                                            if qty <= 0:
+                                                continue
+                                            px = float(pos.get("current_price") or rm.last_prices.get(code) or pos.get("buy_price") or 0)
+                                            if px <= 0:
+                                                continue
+                                            _handle_signal(code, "sell", px, f"일일 이익 한도({limit:,}원) 도달", suggested_qty_override=qty)
+                                    else:
+                                        _run_async_broadcast({
+                                            "type": "log",
+                                            "level": "warning",
+                                            "message": f"일일 이익 한도 도달(realized): {cur_pnl:,.0f}원 >= {limit:,.0f}원 (신규매수 차단)",
+                                        })
+                except Exception:
+                    pass
+
+                # 일일 손실 한도(total basis) 도달 시: 합산 손익이 -한도 이하이면 오늘 1회 전량 매도 + 신규매수 차단
+                try:
+                    rm = getattr(state, "risk_manager", None)
+                    if rm and getattr(rm, "positions", None):
+                        basis = str(getattr(rm, "daily_loss_limit_basis", "realized") or "realized").strip().lower()
+                        limit = int(getattr(rm, "daily_loss_limit", 0) or 0) if basis == "total" else 0
+                        if limit and limit > 0 and basis == "total":
+                            tz = timezone(timedelta(hours=9))
+                            now_dt = datetime.now(tz)
+                            today_key = now_dt.strftime("%Y%m%d")
+                            if getattr(state, "_loss_limit_total_done_day", "") != today_key:
+                                realized = float(getattr(rm, "daily_pnl", 0.0) or 0.0)
+                                total_if_liq = float(getattr(rm, "get_total_pnl", lambda: realized)() or realized)
+                                if total_if_liq <= -float(limit):
+                                    state._loss_limit_total_done_day = today_key
+                                    try:
+                                        rm.halt_new_buys_day = today_key
+                                        rm.halt_new_buys_reason = f"일일 손실 한도(total)({limit:,}원) 도달"
+                                    except Exception:
+                                        pass
                                     _run_async_broadcast({
                                         "type": "log",
-                                        "level": "warning",
-                                        "message": f"일일 이익 한도 도달: {total_if_liq:,.0f}원 >= {limit:,.0f}원 (전량 시장가 매도 신호 생성)",
+                                        "level": "error",
+                                        "message": f"일일 손실 한도(total) 도달: {total_if_liq:,.0f}원 <= -{limit:,.0f}원 (전량 매도 신호 생성)",
                                     })
                                     for code, pos in list(rm.positions.items()):
                                         qty = int(pos.get("quantity", 0) or 0)
@@ -654,7 +690,46 @@ def _start_trading_engine_thread():
                                         px = float(pos.get("current_price") or rm.last_prices.get(code) or pos.get("buy_price") or 0)
                                         if px <= 0:
                                             continue
-                                        _handle_signal(code, "sell", px, f"일일 이익 한도({limit:,}원) 도달", suggested_qty_override=qty)
+                                        _handle_signal(code, "sell", px, f"일일 손실 한도(total)({limit:,}원) 도달", suggested_qty_override=qty)
+                except Exception:
+                    pass
+
+                # (레거시/추가) 일일 손실 한도(합산 전용 필드) 도달 시: 오늘 1회 전량 매도 + 신규매수 차단
+                try:
+                    rm = getattr(state, "risk_manager", None)
+                    if rm and getattr(rm, "positions", None):
+                        limit = int(getattr(rm, "daily_total_loss_limit", 0) or 0)
+                        basis = str(getattr(rm, "daily_loss_limit_basis", "realized") or "realized").strip().lower()
+                        # 신규 total-basis를 쓰는 경우에는 레거시 트리거는 비활성(중복 방지)
+                        if basis == "total":
+                            limit = 0
+                        if limit and limit > 0:
+                            tz = timezone(timedelta(hours=9))
+                            now_dt = datetime.now(tz)
+                            today_key = now_dt.strftime("%Y%m%d")
+                            if getattr(state, "_total_loss_limit_done_day", "") != today_key:
+                                realized = float(getattr(rm, "daily_pnl", 0.0) or 0.0)
+                                total_if_liq = float(getattr(rm, "get_total_pnl", lambda: realized)() or realized)
+                                if total_if_liq <= -float(limit):
+                                    state._total_loss_limit_done_day = today_key
+                                    try:
+                                        rm.halt_new_buys_day = today_key
+                                        rm.halt_new_buys_reason = f"일일 손실 한도(합산)({limit:,}원) 도달"
+                                    except Exception:
+                                        pass
+                                    _run_async_broadcast({
+                                        "type": "log",
+                                        "level": "error",
+                                        "message": f"일일 손실 한도(합산) 도달: {total_if_liq:,.0f}원 <= -{limit:,.0f}원 (전량 매도 신호 생성)",
+                                    })
+                                    for code, pos in list(rm.positions.items()):
+                                        qty = int(pos.get("quantity", 0) or 0)
+                                        if qty <= 0:
+                                            continue
+                                        px = float(pos.get("current_price") or rm.last_prices.get(code) or pos.get("buy_price") or 0)
+                                        if px <= 0:
+                                            continue
+                                        _handle_signal(code, "sell", px, f"일일 손실 한도(합산)({limit:,}원) 도달", suggested_qty_override=qty)
                 except Exception:
                     pass
 
@@ -666,9 +741,86 @@ def _start_trading_engine_thread():
                         if not stock_code or current_price <= 0:
                             continue
 
+                        # 오전장 레짐(초반/메인) 판별 (KST)
+                        early_regime = False
+                        try:
+                            if bool(getattr(state, "enable_morning_regime_split", False)):
+                                tz = timezone(timedelta(hours=9))
+                                now_t = datetime.now(tz).time()
+                                end_hhmm = str(getattr(state, "morning_regime_early_end_hhmm", "09:10") or "09:10")
+                                end_t = _parse_hhmm(end_hhmm)
+                                start_t = _parse_hhmm("09:00")
+                                if start_t and end_t and start_t <= now_t < end_t:
+                                    early_regime = True
+                        except Exception:
+                            early_regime = False
+
+                        def _eff_float(key: str, default: float) -> float:
+                            try:
+                                if early_regime:
+                                    return float(getattr(state, f"early_{key}", getattr(state, key, default)) or 0.0)
+                                return float(getattr(state, key, default) or 0.0)
+                            except Exception:
+                                try:
+                                    return float(getattr(state, key, default) or 0.0)
+                                except Exception:
+                                    return float(default or 0.0)
+
+                        def _eff_int(key: str, default: int) -> int:
+                            try:
+                                if early_regime:
+                                    v = int(getattr(state, f"early_{key}", getattr(state, key, default)) or 0)
+                                    return int(v)
+                                return int(getattr(state, key, default) or 0)
+                            except Exception:
+                                try:
+                                    return int(getattr(state, key, default) or 0)
+                                except Exception:
+                                    return int(default or 0)
+
+                        def _avg_abs_diff_ratio(prices: list, lookback: int, cur_px: float) -> float:
+                            try:
+                                if cur_px <= 0:
+                                    return 0.0
+                                n = int(lookback or 0)
+                                n = max(2, min(300, n))
+                                if len(prices) < n + 1:
+                                    return 0.0
+                                window = prices[-(n + 1):]
+                                diffs = []
+                                for i in range(1, len(window)):
+                                    diffs.append(abs(float(window[i]) - float(window[i - 1])))
+                                if not diffs:
+                                    return 0.0
+                                avg_abs = float(sum(diffs) / float(len(diffs)))
+                                return float(avg_abs / float(cur_px))
+                            except Exception:
+                                return 0.0
+
                         state.risk_manager.update_price(stock_code, current_price)
                         state.strategy.update_price(stock_code, current_price)
                         _print_signal_decision(stock_code, current_price)
+
+                        # 1~2분봉 추세 유지/고점 근접 회피를 위해 간단 분봉(1분) 생성
+                        try:
+                            now_ts = time.time()
+                            cur_min = int(now_ts // 60)
+                            if not hasattr(state, "_minute_bars"):
+                                state._minute_bars = {}
+                            bars = state._minute_bars.get(stock_code) or []
+                            if not bars or int(bars[-1].get("m", -1)) != cur_min:
+                                bars.append({"m": cur_min, "o": float(current_price), "h": float(current_price), "l": float(current_price), "c": float(current_price)})
+                            else:
+                                b = bars[-1]
+                                b["h"] = float(max(float(b.get("h", current_price)), float(current_price)))
+                                b["l"] = float(min(float(b.get("l", current_price)), float(current_price)))
+                                b["c"] = float(current_price)
+                            # 최근 120분까지만 유지
+                            if len(bars) > 120:
+                                bars = bars[-120:]
+                            state._minute_bars[stock_code] = bars
+                        except Exception:
+                            pass
 
                         exit_sig = None
                         try:
@@ -694,7 +846,7 @@ def _start_trading_engine_thread():
                             if short_ma > long_ma and current_price > short_ma and stock_code not in state.risk_manager.positions:
                                 # (0) 스프레드 필터: 호가 스프레드가 너무 크면 매수 스킵
                                 try:
-                                    max_spread = float(getattr(state, "max_spread_ratio", 0.0) or 0.0)
+                                    max_spread = float(_eff_float("max_spread_ratio", 0.0) or 0.0)
                                     if max_spread > 0:
                                         q = (getattr(state, "latest_quotes", {}) or {}).get(stock_code) or {}
                                         ask = float(q.get("ask") or 0)
@@ -713,8 +865,8 @@ def _start_trading_engine_thread():
 
                                 # (0-1) 횡보장(레인지) 필터: 최근 N틱 박스권이면 매수 스킵
                                 try:
-                                    lookback = int(getattr(state, "range_lookback_ticks", 0) or 0)
-                                    min_range = float(getattr(state, "min_range_ratio", 0.0) or 0.0)
+                                    lookback = int(_eff_int("range_lookback_ticks", 0) or 0)
+                                    min_range = float(_eff_float("min_range_ratio", 0.0) or 0.0)
                                     if lookback > 0 and min_range > 0:
                                         prices = (state.strategy.price_history.get(stock_code) or [])
                                         if len(prices) >= lookback:
@@ -723,11 +875,18 @@ def _start_trading_engine_thread():
                                             lo = float(min(window))
                                             if current_price > 0:
                                                 rr = (hi - lo) / float(current_price)
-                                                if rr < min_range:
+                                                # 변동성 정규화(보조): avgAbsDiff/current_price 비율에 비례한 최소 레인지 추가
+                                                vol_lb = int(getattr(state, "vol_norm_lookback_ticks", 20) or 20)
+                                                vol_ratio = _avg_abs_diff_ratio(prices, vol_lb, current_price)
+                                                mult = float(getattr(state, "range_vs_vol_mult", 0.0) or 0.0)
+                                                thr = float(min_range)
+                                                if mult and mult > 0 and vol_ratio > 0:
+                                                    thr = max(thr, float(mult) * float(vol_ratio))
+                                                if rr < thr:
                                                     _record_buy_skip(stock_code, "range")
                                                     _throttled_skip_log(
                                                         stock_code,
-                                                        f"횡보장 제외(range {rr*100:.3f}% < {min_range*100:.3f}%, N={lookback})",
+                                                        f"횡보장 제외(range {rr*100:.3f}% < {thr*100:.3f}%, N={lookback})",
                                                     )
                                                     continue
                                 except Exception:
@@ -745,24 +904,262 @@ def _start_trading_engine_thread():
 
                                 # (2) 추세 강도: 단기 MA 기울기(직전 대비)가 일정 이상일 때만 buy
                                 try:
-                                    min_slope = float(getattr(state, "min_short_ma_slope_ratio", 0.0) or 0.0)
+                                    min_slope = float(_eff_float("min_short_ma_slope_ratio", 0.0) or 0.0)
                                     if min_slope > 0 and hasattr(state.strategy, "calculate_ma_offset"):
                                         prev_short = state.strategy.calculate_ma_offset(stock_code, state.strategy.short_ma_period, offset=1)
                                         if prev_short is not None and current_price > 0:
                                             slope_ratio = (float(short_ma) - float(prev_short)) / float(current_price)
-                                            if slope_ratio < min_slope:
+                                            # 변동성 정규화(보조): slope가 평균 변동폭 대비 충분히 커야 함
+                                            prices = (state.strategy.price_history.get(stock_code) or [])
+                                            vol_lb = int(getattr(state, "vol_norm_lookback_ticks", 20) or 20)
+                                            vol_ratio = _avg_abs_diff_ratio(prices, vol_lb, current_price)
+                                            mult = float(getattr(state, "slope_vs_vol_mult", 0.0) or 0.0)
+                                            thr = float(min_slope)
+                                            if mult and mult > 0 and vol_ratio > 0:
+                                                thr = max(thr, float(mult) * float(vol_ratio))
+                                            if slope_ratio < thr:
                                                 _record_buy_skip(stock_code, "slope")
                                                 _throttled_skip_log(
                                                     stock_code,
-                                                    f"단기MA 기울기 부족({slope_ratio*100:.3f}%/tick < {min_slope*100:.3f}%/tick)",
+                                                    f"단기MA 기울기 부족({slope_ratio*100:.3f}%/tick < {thr*100:.3f}%/tick)",
                                                 )
                                                 continue
                                 except Exception:
                                     pass
 
+                                # (2-1) 모멘텀 필터: 최근 N틱 전 대비 상승률이 일정 이상일 때만 buy
+                                try:
+                                    mom_n = int(_eff_int("momentum_lookback_ticks", 0) or 0)
+                                    mom_r = float(_eff_float("min_momentum_ratio", 0.0) or 0.0)
+                                    if mom_n > 0 and mom_r > 0:
+                                        prices = (state.strategy.price_history.get(stock_code) or [])
+                                        if len(prices) > mom_n:
+                                            prev_px = float(prices[-mom_n - 1])
+                                            if prev_px > 0:
+                                                mr = (float(current_price) - prev_px) / prev_px
+                                                if mr < mom_r:
+                                                    _record_buy_skip(stock_code, "momentum")
+                                                    _throttled_skip_log(
+                                                        stock_code,
+                                                        f"모멘텀 부족({mr*100:.3f}% < {mom_r*100:.3f}%, N={mom_n})",
+                                                    )
+                                                    continue
+                                        else:
+                                            _record_buy_skip(stock_code, "momentum")
+                                            _throttled_skip_log(stock_code, f"모멘텀 히스토리 부족(N={mom_n})", ttl_sec=20)
+                                            continue
+                                except Exception:
+                                    pass
+
+                                # (2-1-1) 진입 직전 추가 필터: 고점 근접(피크 추격) 회피
+                                try:
+                                    if bool(getattr(state, "avoid_chase_near_high_enabled", False)):
+                                        mins = int(getattr(state, "near_high_lookback_minutes", 2) or 2)
+                                        mins = max(1, min(30, mins))
+                                        r = float(getattr(state, "avoid_near_high_ratio", 0.003) or 0.003)
+                                        r = max(0.0, min(0.05, r))
+                                        # 변동성 기반 동적 임계값(기본 r 보다 더 크게)
+                                        try:
+                                            if bool(getattr(state, "avoid_near_high_dynamic", False)):
+                                                prices = (state.strategy.price_history.get(stock_code) or [])
+                                                vol_lb = int(getattr(state, "vol_norm_lookback_ticks", 20) or 20)
+                                                vol_ratio = _avg_abs_diff_ratio(prices, vol_lb, current_price)
+                                                mult = float(getattr(state, "avoid_near_high_vs_vol_mult", 0.0) or 0.0)
+                                                if mult and mult > 0 and vol_ratio > 0:
+                                                    r = max(r, float(mult) * float(vol_ratio))
+                                                    r = max(0.0, min(0.05, r))
+                                        except Exception:
+                                            pass
+                                        bars = (getattr(state, "_minute_bars", {}) or {}).get(stock_code) or []
+                                        if bars:
+                                            cur_min = int(time.time() // 60)
+                                            window = [b for b in bars if int(b.get("m", -1)) >= cur_min - mins]
+                                            if window:
+                                                hi = max(float(b.get("h", 0.0) or 0.0) for b in window)
+                                                if hi > 0:
+                                                    near = (hi - float(current_price)) / float(hi)
+                                                    if near < r:
+                                                        _record_buy_skip(stock_code, "near_high")
+                                                        _throttled_skip_log(stock_code, f"고점 근접 추격 회피({near*100:.2f}% < {r*100:.2f}%/{mins}m)", ttl_sec=10)
+                                                        continue
+                                except Exception:
+                                    pass
+
+                                # (2-1-2) 진입 직전 추가 필터: 1~2분봉 추세 유지
+                                try:
+                                    if bool(getattr(state, "minute_trend_enabled", False)):
+                                        # 레짐 초반에만 적용 옵션
+                                        apply_now = True
+                                        try:
+                                            if bool(getattr(state, "minute_trend_early_only", False)) and not early_regime:
+                                                apply_now = False
+                                        except Exception:
+                                            apply_now = True
+
+                                        if apply_now:
+                                            mode = str(getattr(state, "minute_trend_mode", "green") or "green").strip().lower()
+                                            n = int(getattr(state, "minute_trend_lookback_bars", 2) or 2)
+                                            n = max(1, min(5, n))
+                                            min_green = int(getattr(state, "minute_trend_min_green_bars", 2) or 2)
+                                            min_green = max(0, min(n, min_green))
+                                            bars = (getattr(state, "_minute_bars", {}) or {}).get(stock_code) or []
+
+                                            if len(bars) < n:
+                                                _record_buy_skip(stock_code, "minute_trend")
+                                                _throttled_skip_log(stock_code, f"분봉 히스토리 부족(N={n})", ttl_sec=20)
+                                                continue
+
+                                            last = bars[-n:]
+                                            if mode == "higher_close":
+                                                ok = True
+                                                prev_c = None
+                                                for b in last:
+                                                    c = float(b.get("c", 0.0) or 0.0)
+                                                    if prev_c is not None and c < prev_c:
+                                                        ok = False
+                                                        break
+                                                    prev_c = c
+                                                if not ok:
+                                                    _record_buy_skip(stock_code, "minute_trend")
+                                                    _throttled_skip_log(stock_code, f"분봉 추세 유지 실패(higher_close, N={n})", ttl_sec=10)
+                                                    continue
+                                            elif mode == "higher_low":
+                                                ok = True
+                                                prev_l = None
+                                                for b in last:
+                                                    l = float(b.get("l", 0.0) or 0.0)
+                                                    if prev_l is not None and l < prev_l:
+                                                        ok = False
+                                                        break
+                                                    prev_l = l
+                                                if not ok:
+                                                    _record_buy_skip(stock_code, "minute_trend")
+                                                    _throttled_skip_log(stock_code, f"분봉 추세 유지 실패(higher_low, N={n})", ttl_sec=10)
+                                                    continue
+                                            elif mode == "hh_hl":
+                                                ok = True
+                                                prev_h = None
+                                                prev_l = None
+                                                for b in last:
+                                                    h = float(b.get("h", 0.0) or 0.0)
+                                                    l = float(b.get("l", 0.0) or 0.0)
+                                                    if prev_h is not None and h < prev_h:
+                                                        ok = False
+                                                        break
+                                                    if prev_l is not None and l < prev_l:
+                                                        ok = False
+                                                        break
+                                                    prev_h = h
+                                                    prev_l = l
+                                                if not ok:
+                                                    _record_buy_skip(stock_code, "minute_trend")
+                                                    _throttled_skip_log(stock_code, f"분봉 추세 유지 실패(hh_hl, N={n})", ttl_sec=10)
+                                                    continue
+                                            else:
+                                                green = 0
+                                                for b in last:
+                                                    o = float(b.get("o", 0.0) or 0.0)
+                                                    c = float(b.get("c", 0.0) or 0.0)
+                                                    if c >= o and o > 0 and c > 0:
+                                                        green += 1
+                                                if green < min_green:
+                                                    _record_buy_skip(stock_code, "minute_trend")
+                                                    _throttled_skip_log(stock_code, f"분봉 추세 유지 실패(green {green}/{n} < {min_green})", ttl_sec=10)
+                                                    continue
+                                except Exception:
+                                    pass
+
+                                # (2-2) 진입 보강(2단): 추세 조건 + (보강조건 N개 이상) 만족 필요
+                                try:
+                                    if bool(getattr(state, "entry_confirm_enabled", False)):
+                                        need = int(getattr(state, "entry_confirm_min_count", 1) or 1)
+                                        need = max(1, min(3, need))
+                                        prices = (state.strategy.price_history.get(stock_code) or [])
+
+                                        hit = 0
+                                        hits = []
+
+                                        # (a) 신고가(최근 N틱 고점) 돌파
+                                        if bool(getattr(state, "confirm_breakout_enabled", False)):
+                                            n = int(getattr(state, "breakout_lookback_ticks", 20) or 20)
+                                            n = max(2, min(300, n))
+                                            buf = float(getattr(state, "breakout_buffer_ratio", 0.0) or 0.0)
+                                            if len(prices) > n:
+                                                prev_window = prices[-n-1:-1]
+                                                hi = float(max(prev_window)) if prev_window else 0.0
+                                                ok = (hi > 0 and float(current_price) >= hi * (1.0 + float(buf)))
+                                                if ok:
+                                                    hit += 1
+                                                    hits.append("breakout")
+
+                                        # (b) 거래량 급증 (틱 체결량 기준)
+                                        vol_tick = None
+                                        try:
+                                            if row.get("CNTG_VOL") is not None:
+                                                vol_tick = float(row.get("CNTG_VOL") or 0.0)
+                                            elif row.get("ACML_VOL") is not None:
+                                                cur_acml = float(row.get("ACML_VOL") or 0.0)
+                                                if not hasattr(state, "_acml_vol_last"):
+                                                    state._acml_vol_last = {}
+                                                prev_acml = float((state._acml_vol_last.get(stock_code) or 0.0))
+                                                state._acml_vol_last[stock_code] = cur_acml
+                                                dv = cur_acml - prev_acml
+                                                vol_tick = float(dv) if dv >= 0 else 0.0
+                                        except Exception:
+                                            vol_tick = None
+
+                                        if bool(getattr(state, "confirm_volume_surge_enabled", False)):
+                                            n = int(getattr(state, "volume_surge_lookback_ticks", 20) or 20)
+                                            n = max(2, min(200, n))
+                                            ratio = float(getattr(state, "volume_surge_ratio", 2.0) or 2.0)
+                                            if vol_tick is not None and vol_tick > 0:
+                                                if not hasattr(state, "_vol_tick_hist"):
+                                                    state._vol_tick_hist = {}
+                                                h = state._vol_tick_hist.get(stock_code) or []
+                                                avg = float(sum(h) / len(h)) if len(h) > 0 else 0.0
+                                                ok = (avg > 0 and float(vol_tick) >= float(avg) * float(ratio))
+                                                h.append(float(vol_tick))
+                                                if len(h) > n:
+                                                    h = h[-n:]
+                                                state._vol_tick_hist[stock_code] = h
+                                                if ok:
+                                                    hit += 1
+                                                    hits.append("vol_surge")
+
+                                        # (c) 거래대금 급증 (틱 체결량 * 가격 기준)
+                                        if bool(getattr(state, "confirm_trade_value_surge_enabled", False)):
+                                            n = int(getattr(state, "trade_value_surge_lookback_ticks", 20) or 20)
+                                            n = max(2, min(200, n))
+                                            ratio = float(getattr(state, "trade_value_surge_ratio", 2.0) or 2.0)
+                                            if vol_tick is not None and vol_tick > 0 and current_price > 0:
+                                                tv_tick = float(vol_tick) * float(current_price)
+                                                if not hasattr(state, "_tv_tick_hist"):
+                                                    state._tv_tick_hist = {}
+                                                h = state._tv_tick_hist.get(stock_code) or []
+                                                avg = float(sum(h) / len(h)) if len(h) > 0 else 0.0
+                                                ok = (avg > 0 and float(tv_tick) >= float(avg) * float(ratio))
+                                                h.append(float(tv_tick))
+                                                if len(h) > n:
+                                                    h = h[-n:]
+                                                state._tv_tick_hist[stock_code] = h
+                                                if ok:
+                                                    hit += 1
+                                                    hits.append("tv_surge")
+
+                                        if hit < need:
+                                            _record_buy_skip(stock_code, "confirm2")
+                                            _throttled_skip_log(
+                                                stock_code,
+                                                f"진입 보강 조건 미충족({hit}/{need}, hits={hits})",
+                                                ttl_sec=10,
+                                            )
+                                            continue
+                                except Exception:
+                                    pass
+
                                 # (3) 2틱 확인(confirmation): 조건이 연속으로 유지될 때만 진입
                                 try:
-                                    ticks = int(getattr(state, "buy_confirm_ticks", 1) or 1)
+                                    ticks = int(_eff_int("buy_confirm_ticks", 1) or 1)
                                     ticks = max(1, min(10, ticks))
                                     if not hasattr(state, "_buy_confirm_counts"):
                                         state._buy_confirm_counts = {}
@@ -894,6 +1291,8 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
             "buy_window_start_hhmm": getattr(state, "buy_window_start_hhmm", "09:05"),
             "buy_window_end_hhmm": getattr(state, "buy_window_end_hhmm", "11:30"),
             "min_short_ma_slope_ratio": getattr(state, "min_short_ma_slope_ratio", 0.0),
+            "momentum_lookback_ticks": getattr(state, "momentum_lookback_ticks", 0),
+            "min_momentum_ratio": getattr(state, "min_momentum_ratio", 0.0),
             "reentry_cooldown_seconds": getattr(state, "reentry_cooldown_seconds", 0),
             "buy_confirm_ticks": getattr(state, "buy_confirm_ticks", 1),
             "enable_time_liquidation": getattr(state, "enable_time_liquidation", False),
@@ -920,6 +1319,8 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
         "buy_window_start_hhmm": getattr(state, "buy_window_start_hhmm", "09:05"),
         "buy_window_end_hhmm": getattr(state, "buy_window_end_hhmm", "11:30"),
         "min_short_ma_slope_ratio": getattr(state, "min_short_ma_slope_ratio", 0.0),
+        "momentum_lookback_ticks": getattr(state, "momentum_lookback_ticks", 0),
+        "min_momentum_ratio": getattr(state, "min_momentum_ratio", 0.0),
         "reentry_cooldown_seconds": getattr(state, "reentry_cooldown_seconds", 0),
         "buy_confirm_ticks": getattr(state, "buy_confirm_ticks", 1),
         "enable_time_liquidation": getattr(state, "enable_time_liquidation", False),
@@ -1334,6 +1735,42 @@ async def update_risk_config(config: RiskConfig, current_user: str = Depends(get
             state.risk_manager.daily_profit_limit = int(getattr(config, "daily_profit_limit", 0) or 0)
         except Exception:
             state.risk_manager.daily_profit_limit = 0
+        try:
+            state.risk_manager.daily_total_loss_limit = int(getattr(config, "daily_total_loss_limit", 0) or 0)
+        except Exception:
+            state.risk_manager.daily_total_loss_limit = 0
+        try:
+            state.risk_manager.daily_profit_limit_basis = str(getattr(config, "daily_profit_limit_basis", "total") or "total")
+        except Exception:
+            state.risk_manager.daily_profit_limit_basis = "total"
+        try:
+            state.risk_manager.daily_loss_limit_basis = str(getattr(config, "daily_loss_limit_basis", "realized") or "realized")
+        except Exception:
+            state.risk_manager.daily_loss_limit_basis = "realized"
+        try:
+            state.risk_manager.buy_order_style = str(getattr(config, "buy_order_style", "market") or "market")
+            state.risk_manager.sell_order_style = str(getattr(config, "sell_order_style", "market") or "market")
+        except Exception:
+            state.risk_manager.buy_order_style = "market"
+            state.risk_manager.sell_order_style = "market"
+        try:
+            state.risk_manager.order_retry_count = int(getattr(config, "order_retry_count", 0) or 0)
+            state.risk_manager.order_retry_delay_ms = int(getattr(config, "order_retry_delay_ms", 300) or 300)
+            state.risk_manager.order_fallback_to_market = bool(getattr(config, "order_fallback_to_market", True))
+        except Exception:
+            state.risk_manager.order_retry_count = 0
+            state.risk_manager.order_retry_delay_ms = 300
+            state.risk_manager.order_fallback_to_market = True
+        try:
+            state.risk_manager.enable_volatility_sizing = bool(getattr(config, "enable_volatility_sizing", False))
+            state.risk_manager.volatility_lookback_ticks = int(getattr(config, "volatility_lookback_ticks", 20) or 20)
+            state.risk_manager.volatility_stop_mult = float(getattr(config, "volatility_stop_mult", 1.0) or 1.0)
+            state.risk_manager.max_loss_per_stock_krw = int(getattr(config, "max_loss_per_stock_krw", 0) or 0)
+        except Exception:
+            state.risk_manager.enable_volatility_sizing = False
+            state.risk_manager.volatility_lookback_ticks = 20
+            state.risk_manager.volatility_stop_mult = 1.0
+            state.risk_manager.max_loss_per_stock_krw = 0
         state.risk_manager.max_trades_per_day = config.max_trades_per_day
         state.risk_manager.max_position_size_ratio = config.max_position_size_ratio
         state.risk_manager.trailing_stop_ratio = getattr(config, "trailing_stop_ratio", 0.0) or 0.0
@@ -1353,6 +1790,18 @@ async def update_risk_config(config: RiskConfig, current_user: str = Depends(get
                 "message": "리스크 설정 저장: DynamoDB 설정 저장소가 비활성화되어 저장되지 않았습니다. (/api/config/user-settings/store-status 로 원인 확인)",
             })
         
+        # 신규 total-basis와 레거시 daily_total_loss_limit이 동시에 켜지면 혼선을 줄이기 위해 경고
+        try:
+            if str(getattr(state.risk_manager, "daily_loss_limit_basis", "realized") or "realized").strip().lower() == "total":
+                if int(getattr(state.risk_manager, "daily_total_loss_limit", 0) or 0) > 0:
+                    await state.broadcast({
+                        "type": "log",
+                        "level": "warning",
+                        "message": "리스크 설정: daily_loss_limit_basis=total 사용 중에는 레거시 daily_total_loss_limit 트리거는 중복 방지를 위해 무시됩니다.",
+                    })
+        except Exception:
+            pass
+
         await state.broadcast({"type": "log", "message": "리스크 설정이 업데이트되었습니다.", "level": "info"})
         return JSONResponse({"success": True, "persisted": persisted})
     except Exception as e:
@@ -1387,6 +1836,45 @@ async def update_strategy_config(config: StrategyConfig, current_user: str = Dep
         state.buy_window_end_hhmm = end_hhmm
         # 추세 강도 필터 + 재진입 쿨다운
         state.min_short_ma_slope_ratio = float(getattr(config, "min_short_ma_slope_ratio", getattr(state, "min_short_ma_slope_ratio", 0.0)) or 0.0)
+        state.momentum_lookback_ticks = int(getattr(config, "momentum_lookback_ticks", getattr(state, "momentum_lookback_ticks", 0)) or 0)
+        state.min_momentum_ratio = float(getattr(config, "min_momentum_ratio", getattr(state, "min_momentum_ratio", 0.0)) or 0.0)
+        # 진입 보강(2단)
+        state.entry_confirm_enabled = bool(getattr(config, "entry_confirm_enabled", getattr(state, "entry_confirm_enabled", False)))
+        state.entry_confirm_min_count = int(getattr(config, "entry_confirm_min_count", getattr(state, "entry_confirm_min_count", 1)) or 1)
+        state.confirm_breakout_enabled = bool(getattr(config, "confirm_breakout_enabled", getattr(state, "confirm_breakout_enabled", False)))
+        state.breakout_lookback_ticks = int(getattr(config, "breakout_lookback_ticks", getattr(state, "breakout_lookback_ticks", 20)) or 20)
+        state.breakout_buffer_ratio = float(getattr(config, "breakout_buffer_ratio", getattr(state, "breakout_buffer_ratio", 0.0)) or 0.0)
+        state.confirm_volume_surge_enabled = bool(getattr(config, "confirm_volume_surge_enabled", getattr(state, "confirm_volume_surge_enabled", False)))
+        state.volume_surge_lookback_ticks = int(getattr(config, "volume_surge_lookback_ticks", getattr(state, "volume_surge_lookback_ticks", 20)) or 20)
+        state.volume_surge_ratio = float(getattr(config, "volume_surge_ratio", getattr(state, "volume_surge_ratio", 2.0)) or 2.0)
+        state.confirm_trade_value_surge_enabled = bool(getattr(config, "confirm_trade_value_surge_enabled", getattr(state, "confirm_trade_value_surge_enabled", False)))
+        state.trade_value_surge_lookback_ticks = int(getattr(config, "trade_value_surge_lookback_ticks", getattr(state, "trade_value_surge_lookback_ticks", 20)) or 20)
+        state.trade_value_surge_ratio = float(getattr(config, "trade_value_surge_ratio", getattr(state, "trade_value_surge_ratio", 2.0)) or 2.0)
+        # 진입 직전 추가 필터(피크 추격/초단기 추세)
+        state.avoid_chase_near_high_enabled = bool(getattr(config, "avoid_chase_near_high_enabled", getattr(state, "avoid_chase_near_high_enabled", False)))
+        state.near_high_lookback_minutes = int(getattr(config, "near_high_lookback_minutes", getattr(state, "near_high_lookback_minutes", 2)) or 2)
+        state.avoid_near_high_ratio = float(getattr(config, "avoid_near_high_ratio", getattr(state, "avoid_near_high_ratio", 0.003)) or 0.003)
+        state.avoid_near_high_dynamic = bool(getattr(config, "avoid_near_high_dynamic", getattr(state, "avoid_near_high_dynamic", False)))
+        state.avoid_near_high_vs_vol_mult = float(getattr(config, "avoid_near_high_vs_vol_mult", getattr(state, "avoid_near_high_vs_vol_mult", 0.0)) or 0.0)
+        state.minute_trend_enabled = bool(getattr(config, "minute_trend_enabled", getattr(state, "minute_trend_enabled", False)))
+        state.minute_trend_lookback_bars = int(getattr(config, "minute_trend_lookback_bars", getattr(state, "minute_trend_lookback_bars", 2)) or 2)
+        state.minute_trend_min_green_bars = int(getattr(config, "minute_trend_min_green_bars", getattr(state, "minute_trend_min_green_bars", 2)) or 2)
+        state.minute_trend_mode = str(getattr(config, "minute_trend_mode", getattr(state, "minute_trend_mode", "green")) or "green")
+        state.minute_trend_early_only = bool(getattr(config, "minute_trend_early_only", getattr(state, "minute_trend_early_only", False)))
+        # 변동성 정규화(보조)
+        state.vol_norm_lookback_ticks = int(getattr(config, "vol_norm_lookback_ticks", getattr(state, "vol_norm_lookback_ticks", 20)) or 20)
+        state.slope_vs_vol_mult = float(getattr(config, "slope_vs_vol_mult", getattr(state, "slope_vs_vol_mult", 0.0)) or 0.0)
+        state.range_vs_vol_mult = float(getattr(config, "range_vs_vol_mult", getattr(state, "range_vs_vol_mult", 0.0)) or 0.0)
+        # 오전장 레짐 분기(초반/메인)
+        state.enable_morning_regime_split = bool(getattr(config, "enable_morning_regime_split", getattr(state, "enable_morning_regime_split", False)))
+        state.morning_regime_early_end_hhmm = str(getattr(config, "morning_regime_early_end_hhmm", getattr(state, "morning_regime_early_end_hhmm", "09:10")) or "09:10")
+        state.early_min_short_ma_slope_ratio = float(getattr(config, "early_min_short_ma_slope_ratio", getattr(state, "early_min_short_ma_slope_ratio", 0.0)) or 0.0)
+        state.early_momentum_lookback_ticks = int(getattr(config, "early_momentum_lookback_ticks", getattr(state, "early_momentum_lookback_ticks", 0)) or 0)
+        state.early_min_momentum_ratio = float(getattr(config, "early_min_momentum_ratio", getattr(state, "early_min_momentum_ratio", 0.0)) or 0.0)
+        state.early_buy_confirm_ticks = int(getattr(config, "early_buy_confirm_ticks", getattr(state, "early_buy_confirm_ticks", 1)) or 1)
+        state.early_max_spread_ratio = float(getattr(config, "early_max_spread_ratio", getattr(state, "early_max_spread_ratio", 0.0)) or 0.0)
+        state.early_range_lookback_ticks = int(getattr(config, "early_range_lookback_ticks", getattr(state, "early_range_lookback_ticks", 0)) or 0)
+        state.early_min_range_ratio = float(getattr(config, "early_min_range_ratio", getattr(state, "early_min_range_ratio", 0.0)) or 0.0)
         state.reentry_cooldown_seconds = int(getattr(config, "reentry_cooldown_seconds", getattr(state, "reentry_cooldown_seconds", 0)) or 0)
         if getattr(state, "risk_manager", None):
             state.risk_manager.reentry_cooldown_seconds = int(state.reentry_cooldown_seconds or 0)
@@ -1417,6 +1905,10 @@ async def update_strategy_config(config: StrategyConfig, current_user: str = Dep
                 f"전략 설정 업데이트: short={short_period}, long={long_period}, "
                 f"buy_window={start_hhmm}-{end_hhmm}, "
                 f"slope>={state.min_short_ma_slope_ratio*100:.3f}%/tick, "
+                f"momentum>={getattr(state,'min_momentum_ratio',0.0)*100:.2f}%/N{int(getattr(state,'momentum_lookback_ticks',0) or 0)}, "
+                f"entryConfirm={'on' if getattr(state,'entry_confirm_enabled',False) else 'off'}(min={int(getattr(state,'entry_confirm_min_count',1) or 1)}), "
+                f"volNorm=N{int(getattr(state,'vol_norm_lookback_ticks',20) or 20)} slopeMult={float(getattr(state,'slope_vs_vol_mult',0.0) or 0.0):.2f} rangeMult={float(getattr(state,'range_vs_vol_mult',0.0) or 0.0):.2f}, "
+                f"regimeSplit={'on' if getattr(state,'enable_morning_regime_split',False) else 'off'}@{getattr(state,'morning_regime_early_end_hhmm','09:10')}, "
                 f"cooldown={state.reentry_cooldown_seconds}s, "
                 f"confirm={int(state.buy_confirm_ticks)}tick, "
                 f"time_liq={'on' if state.enable_time_liquidation else 'off'}@{state.liquidate_after_hhmm}, "
@@ -1464,6 +1956,8 @@ async def update_stock_selection_config(config: StockSelectionConfig, current_us
             min_trade_amount=config.min_trade_amount,
             max_stocks=config.max_stocks,
             exclude_risk_stocks=config.exclude_risk_stocks,
+            sort_by=str(getattr(config, "sort_by", "change") or "change"),
+            prev_day_rank_pool_size=int(getattr(config, "prev_day_rank_pool_size", 80) or 80),
             market_open_hhmm=getattr(config, "market_open_hhmm", "09:00"),
             warmup_minutes=int(getattr(config, "warmup_minutes", 5) or 5),
             early_strict=bool(getattr(config, "early_strict", False)),
@@ -1549,7 +2043,10 @@ async def select_stocks(current_user: str = Depends(get_current_user)):
                 if "워밍업" in detail or "다시 시도" in detail or "장 시작" in detail:
                     message = detail
                 else:
-                    message = f"종목 선정 API 실패: {detail}"
+                    if "API OK but output" in detail:
+                        message = f"종목 선정 결과 없음: {detail} (조건을 완화해보세요)"
+                    else:
+                        message = f"종목 선정 API 실패: {detail}"
             else:
                 message = "조건에 맞는 종목이 없습니다. (가격/거래량/등락률 조건을 완화해보세요)"
             await state.broadcast({"type": "log", "message": message, "level": "warning"})
