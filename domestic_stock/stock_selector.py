@@ -6,10 +6,17 @@
 
 import sys
 import logging
-from typing import Dict, List
+import threading
+from typing import Dict, List, Optional
 
+import os
 sys.path.extend(['..', '.'])
 from domestic_stock_functions import fluctuation
+import kis_auth as ka
+import pandas as pd
+from datetime import datetime, time as dtime, timedelta, timezone
+
+_KIS_ENV_LOCK = threading.Lock()
 
 # ============================================================================
 # 자동 종목 선정 클래스
@@ -28,7 +35,16 @@ class StockSelector:
         min_volume: int = 100000,  # 최소 거래량 (10만주)
         min_trade_amount: int = 0,  # 최소 거래대금 (0 = 사용 안 함)
         max_stocks: int = 10,  # 최대 선정 종목 수
-        exclude_risk_stocks: bool = True  # 위험/경고/주의 종목 제외
+        exclude_risk_stocks: bool = True,  # 위험/경고/주의 종목 제외
+        market_open_hhmm: Optional[str] = None,
+        warmup_minutes: Optional[int] = None,
+        early_strict: Optional[bool] = None,
+        early_strict_minutes: Optional[int] = None,
+        early_min_volume: Optional[int] = None,
+        early_min_trade_amount: Optional[int] = None,
+        exclude_drawdown: Optional[bool] = None,
+        max_drawdown_from_high_ratio: Optional[float] = None,
+        drawdown_filter_after_hhmm: Optional[str] = None,
     ):
         """
         Args:
@@ -51,7 +67,32 @@ class StockSelector:
         self.min_trade_amount = min_trade_amount
         self.max_stocks = max_stocks
         self.exclude_risk_stocks = exclude_risk_stocks
+
+        # 기존 환경변수 기반 옵션들을 UI/저장값으로도 제어할 수 있게 확장.
+        self.market_open_hhmm = (market_open_hhmm or os.getenv("MARKET_OPEN_HHMM", "09:00")).strip()
+        self.warmup_minutes = int(warmup_minutes) if warmup_minutes is not None else int(os.getenv("STOCK_SELECTION_WARMUP_MINUTES", "5") or "5")
+
+        if early_strict is None:
+            self.early_strict = str(os.getenv("STOCK_SELECTION_EARLY_STRICT", "false")).strip().lower() in {
+                "1", "true", "t", "yes", "y", "on"
+            }
+        else:
+            self.early_strict = bool(early_strict)
+        self.early_strict_minutes = int(early_strict_minutes) if early_strict_minutes is not None else int(os.getenv("STOCK_SELECTION_EARLY_STRICT_MINUTES", "30") or "30")
+        self.early_min_volume = int(early_min_volume) if early_min_volume is not None else int(os.getenv("STOCK_SELECTION_EARLY_MIN_VOLUME", "200000") or "200000")
+        self.early_min_trade_amount = int(early_min_trade_amount) if early_min_trade_amount is not None else int(os.getenv("STOCK_SELECTION_EARLY_MIN_TRADE_AMOUNT", "0") or "0")
+
+        if exclude_drawdown is None:
+            self.exclude_drawdown = str(os.getenv("STOCK_SELECTION_EXCLUDE_DRAWDOWN", "false")).strip().lower() in {
+                "1", "true", "t", "yes", "y", "on"
+            }
+        else:
+            self.exclude_drawdown = bool(exclude_drawdown)
+        self.max_drawdown_from_high_ratio = float(max_drawdown_from_high_ratio) if max_drawdown_from_high_ratio is not None else float(os.getenv("STOCK_SELECTION_MAX_DRAWDOWN_FROM_HIGH_RATIO", "0.02") or "0.02")
+        self.drawdown_filter_after_hhmm = (drawdown_filter_after_hhmm or os.getenv("STOCK_SELECTION_DRAWDOWN_FILTER_AFTER_HHMM", "12:00")).strip()
         self.last_selected_stock_info: List[Dict[str, str]] = []
+        self.last_error_message: str = ""
+        self.last_debug: Dict[str, int] = {}
     
     def select_stocks_by_fluctuation(self) -> List[str]:
         """
@@ -61,6 +102,69 @@ class StockSelector:
             선정된 종목코드 리스트
         """
         try:
+            self.last_error_message = ""
+            self.last_debug = {}
+
+            def _find_col(df_: pd.DataFrame, *candidates: str) -> str:
+                cols = list(df_.columns)
+                lower_map = {str(c).lower(): c for c in cols}
+                for cand in candidates:
+                    key = str(cand).lower()
+                    if key in lower_map:
+                        return lower_map[key]
+                return ""
+
+            def _parse_hhmm(text: str) -> Optional[dtime]:
+                try:
+                    t = str(text or "").strip()
+                    if not t:
+                        return None
+                    hh, mm = t.split(":")
+                    return dtime(hour=int(hh), minute=int(mm))
+                except Exception:
+                    return None
+
+            # 장초 워밍업: 09:00 이후 일정 시간 동안은 종목선정을 막아 장초 노이즈를 피한다.
+            # - 기본: 5분
+            # - UI 설정값(없으면 env 기본값)
+            try:
+                tz = timezone(timedelta(hours=9))
+                now = datetime.now(tz)
+                hh, mm = self.market_open_hhmm.split(":")
+                market_open = datetime.combine(now.date(), dtime(hour=int(hh), minute=int(mm)), tzinfo=tz)
+                warmup_end = market_open + timedelta(minutes=int(self.warmup_minutes))
+                if market_open <= now < warmup_end:
+                    remain = int((warmup_end - now).total_seconds() // 60) + 1
+                    self.last_error_message = f"장 시작 직후 워밍업 중입니다. 약 {remain}분 후 다시 시도하세요."
+                    self.last_debug["blocked_warmup"] = 1
+                    return []
+            except Exception:
+                # 워밍업 계산 실패 시에는 선정 로직 계속 진행
+                pass
+
+            # 장초 강화 옵션(선택): 워밍업 이후에도 일정 시간 동안 최소 거래량/거래대금을 더 강하게 적용
+            # - env:
+            #   STOCK_SELECTION_EARLY_STRICT=true
+            #   STOCK_SELECTION_EARLY_STRICT_MINUTES=30
+            #   STOCK_SELECTION_EARLY_MIN_VOLUME=200000
+            #   STOCK_SELECTION_EARLY_MIN_TRADE_AMOUNT=0
+            effective_min_volume = int(self.min_volume)
+            effective_min_trade_amount = int(self.min_trade_amount)
+            if bool(self.early_strict):
+                try:
+                    tz = timezone(timedelta(hours=9))
+                    now = datetime.now(tz)
+                    hh, mm = self.market_open_hhmm.split(":")
+                    market_open = datetime.combine(now.date(), dtime(hour=int(hh), minute=int(mm)), tzinfo=tz)
+                    strict_minutes = int(self.early_strict_minutes)
+                    strict_end = market_open + timedelta(minutes=strict_minutes)
+                    if market_open <= now < strict_end:
+                        effective_min_volume = max(effective_min_volume, int(self.early_min_volume))
+                        effective_min_trade_amount = max(effective_min_trade_amount, int(self.early_min_trade_amount))
+                        self.last_debug["early_strict"] = 1
+                except Exception:
+                    pass
+
             # 등락률 순위 API 호출
             # 최소 상승률 이상인 종목 조회
             min_change_pct = int(self.min_price_change_ratio * 100)  # 퍼센트로 변환
@@ -73,70 +177,183 @@ class StockSelector:
             else:
                 fid_trgt_exls_cls_code = "0000000000"  # 제외 없음
             
-            df = fluctuation(
-                fid_cond_mrkt_div_code="J",  # KRX
-                fid_cond_scr_div_code="20170",  # 등락률
-                fid_input_iscd="0000",  # 전체
-                fid_rank_sort_cls_code="0000",  # 등락률순
-                fid_input_cnt_1=str(self.max_stocks * 3),  # 여유있게 조회 (필터링 후 최종 선정)
-                fid_prc_cls_code="0",  # 가격 구분 (0: 전체)
-                fid_input_price_1=str(self.min_price),  # 최소 가격
-                fid_input_price_2=str(self.max_price),  # 최대 가격
-                fid_vol_cnt=str(self.min_volume),  # 최소 거래량
-                fid_trgt_cls_code="0",  # 대상 구분 (0: 전체)
-                fid_trgt_exls_cls_code=fid_trgt_exls_cls_code,  # 위험 종목 제외
-                fid_div_cls_code="0",  # 분류 구분 (0: 전체)
-                fid_rsfl_rate1=str(min_change_pct),  # 최소 상승률 (%)
-                fid_rsfl_rate2=str(max_change_pct)  # 최대 상승률 (%)
-            )
+            # 종목선정은 ranking/fluctuation API를 사용.
+            # 모의투자(vps) 환경에서 제한되는 경우가 있어, demo일 때는 prod 조회로 우회한다.
+            with _KIS_ENV_LOCK:
+                prev_is_paper = bool(ka.isPaperTrading())
+                prev_svr = "vps" if prev_is_paper else "prod"
+                switched = False
+                try:
+                    if self.env_dv == "demo" and prev_svr != "prod":
+                        ka.changeTREnv(None, svr="prod", product="01")
+                        ka.auth(svr="prod", product="01")
+                        switched = True
+
+                    # fluctuation()은 실패 시에도 빈 DF로 내려주기 쉬워서,
+                    # 먼저 _url_fetch로 에러코드/메시지를 확보하고, OK면 output으로 DF 구성
+                    api_url = "/uapi/domestic-stock/v1/ranking/fluctuation"
+                    tr_id = "FHPST01700000"
+                    params = {
+                        "fid_rsfl_rate2": str(max_change_pct),
+                        "fid_cond_mrkt_div_code": "J",
+                        "fid_cond_scr_div_code": "20170",
+                        "fid_input_iscd": "0000",
+                        # KIS는 1자리 코드(예: "0")를 요구하는 경우가 많음
+                        "fid_rank_sort_cls_code": "0",
+                        "fid_input_cnt_1": str(self.max_stocks * 3),
+                        "fid_prc_cls_code": "0",
+                        "fid_input_price_1": str(self.min_price),
+                        "fid_input_price_2": str(self.max_price),
+                        "fid_vol_cnt": str(effective_min_volume),
+                        "fid_trgt_cls_code": "0",
+                        "fid_trgt_exls_cls_code": fid_trgt_exls_cls_code,
+                        "fid_div_cls_code": "0",
+                        "fid_rsfl_rate1": str(min_change_pct),
+                    }
+
+                    res = ka._url_fetch(api_url, tr_id, "", params)
+                    ok = False
+                    try:
+                        ok = bool(res.isOK())
+                    except Exception:
+                        ok = False
+
+                    if not ok:
+                        try:
+                            self.last_error_message = f"{res.getErrorCode()} / {res.getErrorMessage()}"
+                        except Exception:
+                            self.last_error_message = "API call failed"
+                        logging.warning(f"종목 선정: API 실패 - {self.last_error_message}")
+                        return []
+
+                    body = res.getBody()
+                    output = getattr(body, "output", None)
+                    if not output:
+                        self.last_error_message = "API OK but output is empty"
+                        logging.warning("종목 선정: API OK but output is empty")
+                        return []
+
+                    df = pd.DataFrame(output)
+                finally:
+                    if switched:
+                        try:
+                            ka.changeTREnv(None, svr=prev_svr, product="01")
+                            ka.auth(svr=prev_svr, product="01")
+                        except Exception as e:
+                            logging.warning(f"종목 선정: TRENV 복구 실패(무시): {e}")
             
             if df.empty:
                 logging.warning("종목 선정: 조회 결과가 없습니다.")
                 return []
+
+            self.last_debug["raw"] = int(len(df))
             
             # 필터링: 최소 상승률 이상
-            if "PRDY_CTRT" in df.columns:  # 전일 대비 등락률 컬럼
+            prdy_ctrt_col = _find_col(df, "PRDY_CTRT", "prdy_ctrt")
+            if prdy_ctrt_col:  # 전일 대비 등락률 컬럼
                 min_change_pct = self.min_price_change_ratio * 100
-                df_filtered = df[df["PRDY_CTRT"].astype(float) >= min_change_pct]
+                df_filtered = df[df[prdy_ctrt_col].astype(float) >= min_change_pct]
             else:
                 df_filtered = df
+            self.last_debug["after_change"] = int(len(df_filtered))
             
             # 최소 거래대금 필터링 (있는 경우)
-            if self.min_trade_amount > 0 and "ACML_TR_PBMN" in df_filtered.columns:
+            acml_tr_pbmn_col = _find_col(df_filtered, "ACML_TR_PBMN", "acml_tr_pbmn")
+            if effective_min_trade_amount > 0 and acml_tr_pbmn_col:
                 df_filtered = df_filtered[
-                    df_filtered["ACML_TR_PBMN"].astype(float) >= self.min_trade_amount
+                    df_filtered[acml_tr_pbmn_col].astype(float) >= effective_min_trade_amount
                 ]
+            self.last_debug["after_trade_amount"] = int(len(df_filtered))
             
             # 가격 범위 필터링
-            if "STCK_PRPR" in df_filtered.columns:  # 현재가 컬럼
+            stck_prpr_col = _find_col(df_filtered, "STCK_PRPR", "stck_prpr")
+            if stck_prpr_col:  # 현재가 컬럼
                 df_filtered = df_filtered[
-                    (df_filtered["STCK_PRPR"].astype(float) >= self.min_price) &
-                    (df_filtered["STCK_PRPR"].astype(float) <= self.max_price)
+                    (df_filtered[stck_prpr_col].astype(float) >= self.min_price) &
+                    (df_filtered[stck_prpr_col].astype(float) <= self.max_price)
                 ]
+            self.last_debug["after_price"] = int(len(df_filtered))
             
             # 거래량 필터링
-            if "ACML_VOL" in df_filtered.columns:  # 누적 거래량 컬럼
+            acml_vol_col = _find_col(df_filtered, "ACML_VOL", "acml_vol")
+            if acml_vol_col:  # 누적 거래량 컬럼
                 df_filtered = df_filtered[
-                    df_filtered["ACML_VOL"].astype(float) >= self.min_volume
+                    df_filtered[acml_vol_col].astype(float) >= effective_min_volume
                 ]
+            self.last_debug["after_volume"] = int(len(df_filtered))
+
+            # (선택) 고점 대비 하락추세(드로우다운) 종목 제외
+            # - 목적: 장중(특히 오후) 시작 시점에 이미 고점 찍고 밀린 종목을 배제
+            # - 기준: 현재가가 고가 대비 일정 비율 이상 하락하면 제외
+            # - env:
+            #   STOCK_SELECTION_EXCLUDE_DRAWDOWN=true/false (default false)
+            #   STOCK_SELECTION_MAX_DRAWDOWN_FROM_HIGH_RATIO=0.02  (2% 이상 밀리면 제외)
+            #   STOCK_SELECTION_DRAWDOWN_FILTER_AFTER_HHMM=12:00   (이 시간 이후에만 적용)
+            try:
+                exclude_dd = bool(self.exclude_drawdown)
+                max_dd = float(self.max_drawdown_from_high_ratio)
+                after_t = _parse_hhmm(self.drawdown_filter_after_hhmm)
+
+                tz = timezone(timedelta(hours=9))
+                now_t = datetime.now(tz).time()
+                apply_dd = bool(exclude_dd and max_dd > 0 and (after_t is None or now_t >= after_t))
+
+                if apply_dd and not df_filtered.empty:
+                    hgpr_col = _find_col(df_filtered, "STCK_HGPR", "stck_hgpr", "HGPR", "hgpr")
+                    if stck_prpr_col and hgpr_col:
+                        self.last_debug["before_drawdown"] = int(len(df_filtered))
+                        pr = df_filtered[stck_prpr_col].astype(float)
+                        hi = df_filtered[hgpr_col].astype(float)
+                        # hi<=0이면 계산 불가 -> 통과 처리
+                        dd = (hi - pr) / hi.replace(0, float("nan"))
+                        df_filtered = df_filtered[(hi <= 0) | (dd <= max_dd)]
+                        self.last_debug["after_drawdown"] = int(len(df_filtered))
+                        if df_filtered.empty:
+                            self.last_error_message = (
+                                f"고점 대비 하락추세 제외 조건으로 모두 제외됨 "
+                                f"(max_drawdown={max_dd*100:.1f}% 이상 제외)"
+                            )
+            except Exception:
+                pass
             
             # 종목코드 추출
-            if "ISCD" in df_filtered.columns:  # 종목코드 컬럼
-                selected_codes = df_filtered["ISCD"].astype(str).str.strip().str.zfill(6).tolist()
-                code_col = "ISCD"
-            elif "MKSC_SHRN_ISCD" in df_filtered.columns:
-                selected_codes = df_filtered["MKSC_SHRN_ISCD"].astype(str).str.strip().str.zfill(6).tolist()
-                code_col = "MKSC_SHRN_ISCD"
-            else:
-                logging.error("종목 선정: 종목코드 컬럼을 찾을 수 없습니다.")
+            code_col = _find_col(
+                df_filtered,
+                "ISCD",
+                "MKSC_SHRN_ISCD",
+                "mksc_shrn_iscd",
+                "STCK_SHRN_ISCD",
+                "stck_shrn_iscd",
+            )
+            if not code_col:
+                cols = [str(c) for c in list(df_filtered.columns)]
+                self.last_error_message = (
+                    "종목코드 컬럼을 찾을 수 없습니다. "
+                    f"(columns={cols[:30]}{'...' if len(cols) > 30 else ''})"
+                )
+                logging.error(f"종목 선정: {self.last_error_message}")
                 return []
+
+            selected_codes = (
+                df_filtered[code_col].astype(str).str.strip().str.zfill(6).tolist()
+            )
             
             # 최대 종목 수로 제한
             selected_codes = selected_codes[:self.max_stocks]
+            self.last_debug["selected"] = int(len(selected_codes))
 
             # 종목명 정보 보관 (대시보드 표시용)
-            name_candidates = ["HTS_KOR_ISNM", "PRDT_NAME", "ISNM", "STCK_SHRN_ISCD_NM"]
-            name_col = next((c for c in name_candidates if c in df_filtered.columns), None)
+            name_col = _find_col(
+                df_filtered,
+                "HTS_KOR_ISNM",
+                "hts_kor_isnm",
+                "PRDT_NAME",
+                "prdt_name",
+                "ISNM",
+                "isnm",
+                "STCK_SHRN_ISCD_NM",
+                "stck_shrn_iscd_nm",
+            ) or None
             selected_info: List[Dict[str, str]] = []
             if name_col:
                 selected_df = df_filtered[[code_col, name_col]].copy()

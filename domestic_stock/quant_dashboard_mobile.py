@@ -61,6 +61,11 @@ class TradingState:
         self.pending_signals: Dict[str, Dict] = {}
         self.engine_thread = None
         self.engine_running = False
+        # 신규 매수 허용 시간(한국시간, HH:MM). 매도/청산은 항상 허용.
+        self.buy_window_start_hhmm: str = "09:05"
+        self.buy_window_end_hhmm: str = "11:30"
+        # 실시간 호가(스프레드) 캐시: {code: {"ask": float, "bid": float, "at": iso}}
+        self.latest_quotes: Dict[str, Dict] = {}
         
     async def broadcast(self, message: dict):
         """모든 WebSocket 클라이언트에 메시지 전송"""
@@ -96,11 +101,17 @@ class RegisterRequest(BaseModel):
 
 class RiskConfig(BaseModel):
     max_single_trade_amount: int
+    min_order_quantity: int = 1
     stop_loss_ratio: float
     take_profit_ratio: float
     daily_loss_limit: int
+    daily_profit_limit: int = 0  # 0이면 사용 안 함 (원). 도달 시 신규 매수 차단 + 전량매도 트리거에 사용 가능
     max_trades_per_day: int
     max_position_size_ratio: float
+    trailing_stop_ratio: float = 0.0
+    trailing_activation_ratio: float = 0.0
+    partial_take_profit_ratio: float = 0.0
+    partial_take_profit_fraction: float = 0.5
 
 class StockSelectionConfig(BaseModel):
     min_price_change_ratio: float
@@ -111,10 +122,31 @@ class StockSelectionConfig(BaseModel):
     min_trade_amount: int = 0
     max_stocks: int
     exclude_risk_stocks: bool
+    # 장초/장중 품질 개선 옵션 (기존 env 기반 옵션을 UI로 노출)
+    market_open_hhmm: str = "09:00"
+    warmup_minutes: int = 5
+    early_strict: bool = False
+    early_strict_minutes: int = 30
+    early_min_volume: int = 200000
+    early_min_trade_amount: int = 0
+    exclude_drawdown: bool = False
+    max_drawdown_from_high_ratio: float = 0.02
+    drawdown_filter_after_hhmm: str = "12:00"
 
 class StrategyConfig(BaseModel):
     short_ma_period: int
     long_ma_period: int
+    buy_window_start_hhmm: str = "09:05"
+    buy_window_end_hhmm: str = "11:30"
+    min_short_ma_slope_ratio: float = 0.0
+    reentry_cooldown_seconds: int = 0
+    buy_confirm_ticks: int = 1
+    enable_time_liquidation: bool = False
+    liquidate_after_hhmm: str = "11:55"
+    # 스프레드/횡보장 필터(0이면 사용 안 함)
+    max_spread_ratio: float = 0.0  # 예: 0.001 = 0.1%
+    range_lookback_ticks: int = 0
+    min_range_ratio: float = 0.0  # 예: 0.003 = 0.3%
 
 class ManualOrder(BaseModel):
     stock_code: str
@@ -221,7 +253,7 @@ def get_login_html() -> str:
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: #f2f3f3;
             min-height: 100vh;
             display: flex;
             align-items: center;
@@ -229,24 +261,27 @@ def get_login_html() -> str:
             padding: 20px;
         }
         .login-container {
-            background: white;
+            background: #ffffff;
+            color: #0f1b2d;
             border-radius: 20px;
             padding: 30px;
             width: 100%;
             max-width: 400px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            box-shadow: 0 18px 55px rgba(0,0,0,0.12);
+            border: 1px solid #d5dbdb;
         }
         .login-header {
             text-align: center;
             margin-bottom: 30px;
         }
         .login-header h1 {
-            color: #667eea;
+            color: #0f1b2d;
             font-size: 28px;
             margin-bottom: 10px;
+            letter-spacing: -0.2px;
         }
         .login-header p {
-            color: #666;
+            color: #5f6b7a;
             font-size: 14px;
         }
         .form-group {
@@ -254,7 +289,7 @@ def get_login_html() -> str:
         }
         .form-group label {
             display: block;
-            color: #333;
+            color: #5f6b7a;
             font-weight: 600;
             margin-bottom: 8px;
             font-size: 14px;
@@ -262,36 +297,41 @@ def get_login_html() -> str:
         .form-group input {
             width: 100%;
             padding: 14px;
-            border: 2px solid #e0e0e0;
+            background: #ffffff;
+            border: 1px solid #d5dbdb;
+            color: #0f1b2d;
             border-radius: 10px;
             font-size: 16px;
-            transition: border-color 0.3s;
+            transition: border-color 0.25s, box-shadow 0.25s, background 0.25s;
         }
+        .form-group input::placeholder { color: rgba(95, 107, 122, 0.75); }
         .form-group input:focus {
             outline: none;
-            border-color: #667eea;
+            border-color: #0972d3;
+            box-shadow: 0 0 0 4px rgba(9, 114, 211, 0.18);
+            background: #ffffff;
         }
         .btn {
             width: 100%;
             padding: 14px;
-            background: #667eea;
+            background: #0972d3;
             color: white;
             border: none;
             border-radius: 10px;
             font-size: 16px;
             font-weight: 600;
             cursor: pointer;
-            transition: background 0.3s;
+            transition: transform 0.08s, filter 0.25s;
             margin-top: 10px;
         }
-        .btn:hover { background: #5568d3; }
+        .btn:hover { filter: brightness(0.95); }
         .btn:active { transform: scale(0.98); }
         .btn-secondary {
             background: #6c757d;
         }
         .btn-secondary:hover { background: #5a6268; }
         .error-message {
-            color: #f44336;
+            color: #d13212;
             font-size: 14px;
             margin-top: 10px;
             text-align: center;
@@ -302,7 +342,7 @@ def get_login_html() -> str:
             margin-top: 20px;
         }
         .link a {
-            color: #667eea;
+            color: #0972d3;
             text-decoration: none;
             font-size: 14px;
         }

@@ -85,6 +85,34 @@ PRESET_BEGINNER = {
 }
 
 # ============================================================================
+# 오전 단타용 기준 (9~12 운용을 가정)
+# ============================================================================
+
+PRESET_SCALP_MORNING = {
+    "name": "오전 단타(9~12) 추천",
+    "description": "장초 노이즈 회피 + 유동성 강화 + (옵션) 고점대비 하락 종목 제외",
+    # 기본 유니버스/모멘텀
+    "min_price_change_ratio": 0.01,  # 최소 1% 상승
+    "max_price_change_ratio": 0.12,  # 최대 12% 상승 (과열 제외)
+    "min_price": 1000,
+    "max_price": 50000,
+    "min_volume": 100000,
+    "min_trade_amount": 2000000000,  # 20억
+    "max_stocks": 5,
+    "exclude_risk_stocks": True,
+    # 장초/장중 품질 개선 옵션 (UI에 그대로 매핑됨)
+    "market_open_hhmm": "09:00",
+    "warmup_minutes": 10,  # 09:10 이후 선정 권장
+    "early_strict": True,
+    "early_strict_minutes": 30,
+    "early_min_volume": 200000,
+    "early_min_trade_amount": 5000000000,  # 50억
+    "exclude_drawdown": True,
+    "max_drawdown_from_high_ratio": 0.02,  # 2%
+    "drawdown_filter_after_hhmm": "10:30",
+}
+
+# ============================================================================
 # 프리셋 딕셔너리
 # ============================================================================
 
@@ -93,6 +121,7 @@ PRESETS = {
     "conservative": PRESET_CONSERVATIVE,
     "aggressive": PRESET_AGGRESSIVE,
     "beginner": PRESET_BEGINNER,
+    "scalp_morning": PRESET_SCALP_MORNING,
 }
 
 def get_preset(preset_name: str) -> Dict:

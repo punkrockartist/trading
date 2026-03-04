@@ -39,13 +39,23 @@ class RiskManager:
         # 포지션 크기 제한 (계좌 자산의 최대 비율)
         self.max_position_size_ratio = 0.1  # 10% (매우 보수적)
         self.max_single_trade_amount = 1000000  # 최대 100만원
+        # 최소 매수 수량 (0/1이면 사실상 제한 없음)
+        self.min_order_quantity = 1
         
         # 손절매/익절매 설정
         self.stop_loss_ratio = 0.02  # 2% 손실 시 매도
         self.take_profit_ratio = 0.05  # 5% 수익 시 매도
+        # 트레일링 스탑 (0이면 사용 안 함)
+        self.trailing_stop_ratio = 0.0
+        self.trailing_activation_ratio = 0.0  # 수익이 이 비율 이상일 때부터 trailing 적용
+        # 부분 익절 (0이면 사용 안 함)
+        self.partial_take_profit_ratio = 0.0
+        self.partial_take_profit_fraction = 0.5  # 0~1
         
         # 일일 손실 한도
         self.daily_loss_limit = 500000  # 일일 최대 50만원 손실
+        # 일일 이익 한도(목표). 0이면 사용 안 함.
+        self.daily_profit_limit = 0
         
         # 거래 제한
         self.max_trades_per_day = 5  # 하루 최대 거래 횟수 (매수+매도 = 1회)
@@ -56,6 +66,12 @@ class RiskManager:
         self.daily_pnl = 0.0
         self.positions: Dict[str, Dict] = {}  # {종목코드: {매수가, 수량, 시간}}
         self.last_prices: Dict[str, float] = {}  # 가격 변동 추적용
+        # 재진입 쿨다운
+        self.reentry_cooldown_seconds = 0
+        self._last_exit_at: Dict[str, datetime] = {}
+        self._last_exit_reason: Dict[str, str] = {}
+        # 포지션별 고점 추적 (트레일링 스탑)
+        self._highest_price: Dict[str, float] = {}
         
     def can_trade(self, stock_code: str, price: float, quantity: int) -> Tuple[bool, str]:
         """
@@ -71,6 +87,13 @@ class RiskManager:
         # 2. 일일 손실 한도 체크
         if self.daily_pnl <= -self.daily_loss_limit:
             return False, "일일 손실 한도 초과"
+
+        # 2-1. 일일 이익 한도(목표) 체크: 목표 달성 시 신규 매수 차단
+        try:
+            if getattr(self, "daily_profit_limit", 0) and float(self.daily_pnl) >= float(self.daily_profit_limit):
+                return False, "일일 이익 한도(목표) 달성"
+        except Exception:
+            pass
         
         # 3. 거래 금액 체크
         trade_amount = price * quantity
@@ -85,6 +108,15 @@ class RiskManager:
         # 5. 기존 포지션 체크 (중복 매수 방지)
         if stock_code in self.positions:
             return False, "이미 보유 중인 종목"
+
+        # 5-1. 재진입 쿨다운(직전 매도 직후 재매수 방지)
+        if self.reentry_cooldown_seconds and self.reentry_cooldown_seconds > 0:
+            last_exit = self._last_exit_at.get(stock_code)
+            if isinstance(last_exit, datetime):
+                elapsed = (datetime.now() - last_exit).total_seconds()
+                if elapsed < float(self.reentry_cooldown_seconds):
+                    remain = int(float(self.reentry_cooldown_seconds) - elapsed)
+                    return False, f"재진입 쿨다운({remain}s 남음)"
         
         # 6. 최소 가격 변동 체크 (매수 시)
         if stock_code in self.last_prices:
@@ -106,7 +138,13 @@ class RiskManager:
             self.account_balance * self.max_position_size_ratio
         )
         quantity = int(max_trade_amount / price)
-        return max(1, quantity)  # 최소 1주
+        min_q = 1
+        try:
+            min_q = int(self.min_order_quantity or 1)
+        except Exception:
+            min_q = 1
+        min_q = max(1, min_q)
+        return max(min_q, quantity)
     
     def update_position(self, stock_code: str, price: float, quantity: int, action: str):
         """포지션 업데이트"""
@@ -114,25 +152,118 @@ class RiskManager:
             self.positions[stock_code] = {
                 "buy_price": price,
                 "quantity": quantity,
-                "buy_time": datetime.now()
+                "buy_time": datetime.now(),
+                "partial_taken": False,
             }
             self.daily_trades += 1  # 매수 시 거래 횟수 증가
             self.last_prices[stock_code] = price
+            self._highest_price[stock_code] = float(price)
         elif action == "sell":
             if stock_code in self.positions:
-                buy_price = self.positions[stock_code]["buy_price"]
-                pnl = (price - buy_price) * quantity
+                pos = self.positions[stock_code]
+                buy_price = float(pos.get("buy_price") or 0)
+                pos_qty = int(pos.get("quantity") or 0)
+                sell_qty = int(quantity or 0)
+                if sell_qty <= 0:
+                    return 0.0
+                if pos_qty <= 0:
+                    del self.positions[stock_code]
+                    return 0.0
+
+                # 부분 매도 지원
+                actual_qty = min(sell_qty, pos_qty)
+                pnl = (price - buy_price) * actual_qty
                 self.daily_pnl += pnl
-                del self.positions[stock_code]
-                # 매도 시에는 거래 횟수를 증가시키지 않음 (매수+매도 = 1회)
-                if stock_code in self.last_prices:
-                    del self.last_prices[stock_code]
+
+                remain = pos_qty - actual_qty
+                if remain > 0:
+                    pos["quantity"] = remain
+                    pos["partial_taken"] = True
+                    # 남은 포지션이면 exit/cooldown은 기록하지 않음
+                else:
+                    del self.positions[stock_code]
+                    # 매도 시에는 거래 횟수를 증가시키지 않음 (매수+매도 = 1회)
+                    if stock_code in self.last_prices:
+                        del self.last_prices[stock_code]
+                    self._last_exit_at[stock_code] = datetime.now()
+                    if stock_code in self._highest_price:
+                        del self._highest_price[stock_code]
                 return pnl
         return 0.0
+
+    def check_exit_signal(self, stock_code: str, current_price: float) -> Optional[Dict]:
+        """
+        포지션 청산/부분익절/보호 로직을 통합해서 판단.
+        Returns:
+            {"action":"sell","quantity":int,"reason":str} or None
+        """
+        if stock_code not in self.positions:
+            return None
+
+        pos = self.positions[stock_code]
+        buy_price = float(pos.get("buy_price") or 0)
+        qty = int(pos.get("quantity") or 0)
+        if buy_price <= 0 or qty <= 0:
+            return None
+
+        change_ratio = (float(current_price) - buy_price) / buy_price
+
+        # 손절
+        if self.stop_loss_ratio and change_ratio <= -float(self.stop_loss_ratio):
+            return {"action": "sell", "quantity": qty, "reason": "손절"}
+
+        # 부분 익절
+        try:
+            if (
+                self.partial_take_profit_ratio
+                and float(self.partial_take_profit_ratio) > 0
+                and not bool(pos.get("partial_taken", False))
+                and change_ratio >= float(self.partial_take_profit_ratio)
+            ):
+                frac = float(self.partial_take_profit_fraction or 0.5)
+                frac = max(0.0, min(1.0, frac))
+                sell_qty = int(max(1, int(qty * frac)))
+                if qty > 1:
+                    sell_qty = min(sell_qty, qty - 1)
+                else:
+                    sell_qty = qty
+                return {"action": "sell", "quantity": sell_qty, "reason": "부분익절"}
+        except Exception:
+            pass
+
+        # 익절(전량)
+        if self.take_profit_ratio and change_ratio >= float(self.take_profit_ratio):
+            return {"action": "sell", "quantity": qty, "reason": "익절"}
+
+        # 트레일링 스탑
+        try:
+            if self.trailing_stop_ratio and float(self.trailing_stop_ratio) > 0:
+                highest = float(self._highest_price.get(stock_code) or buy_price)
+                if highest > 0:
+                    gain = (highest - buy_price) / buy_price
+                    if gain >= float(self.trailing_activation_ratio or 0.0):
+                        if float(current_price) <= highest * (1.0 - float(self.trailing_stop_ratio)):
+                            return {"action": "sell", "quantity": qty, "reason": "트레일링스탑"}
+        except Exception:
+            pass
+
+        return None
     
     def update_price(self, stock_code: str, price: float):
         """가격 업데이트 (변동 추적용)"""
         self.last_prices[stock_code] = price
+        if stock_code in self.positions:
+            prev = self._highest_price.get(stock_code, 0.0)
+            if float(price) > float(prev or 0.0):
+                self._highest_price[stock_code] = float(price)
+
+    def is_in_reentry_cooldown(self, stock_code: str) -> bool:
+        if not self.reentry_cooldown_seconds or self.reentry_cooldown_seconds <= 0:
+            return False
+        last_exit = self._last_exit_at.get(stock_code)
+        if not isinstance(last_exit, datetime):
+            return False
+        return (datetime.now() - last_exit).total_seconds() < float(self.reentry_cooldown_seconds)
     
     def check_stop_loss_take_profit(self, stock_code: str, current_price: float) -> Optional[str]:
         """
@@ -149,11 +280,27 @@ class RiskManager:
         
         # 손절매
         if change_ratio <= -self.stop_loss_ratio:
+            self._last_exit_reason[stock_code] = "stop_loss"
             return "sell"
         
         # 익절매
         if change_ratio >= self.take_profit_ratio:
+            self._last_exit_reason[stock_code] = "take_profit"
             return "sell"
+
+        # 트레일링 스탑 (고점 대비 하락)
+        try:
+            if self.trailing_stop_ratio and self.trailing_stop_ratio > 0:
+                highest = float(self._highest_price.get(stock_code) or buy_price)
+                if highest <= 0:
+                    return None
+                gain = (highest - buy_price) / buy_price
+                if gain >= float(self.trailing_activation_ratio or 0.0):
+                    if float(current_price) <= highest * (1.0 - float(self.trailing_stop_ratio)):
+                        self._last_exit_reason[stock_code] = "trailing_stop"
+                        return "sell"
+        except Exception:
+            pass
         
         return None
 
@@ -195,6 +342,27 @@ class QuantStrategy:
             return None
         
         return sum(prices[-period:]) / period
+
+    def calculate_ma_offset(self, stock_code: str, period: int, offset: int = 0) -> Optional[float]:
+        """
+        이동평균 계산(오프셋 포함)
+        - offset=0: 최신 기준
+        - offset=1: 최신 1개를 제외한 기준
+        """
+        if stock_code not in self.price_history:
+            return None
+        prices = self.price_history[stock_code]
+        if offset < 0:
+            offset = 0
+        if len(prices) < period + offset:
+            return None
+        if offset == 0:
+            window = prices[-period:]
+        else:
+            window = prices[-(period + offset) : -offset]
+        if not window or len(window) < period:
+            return None
+        return sum(window) / period
     
     def get_signal(self, stock_code: str, current_price: float) -> Optional[str]:
         """
@@ -238,6 +406,30 @@ class QuantStrategy:
 # 안전한 매매 실행 함수
 # ============================================================================
 
+def _extract_order_response(df):
+    """order_cash 응답 DataFrame에서 핵심 필드만 추출."""
+    try:
+        if df is None or getattr(df, "empty", True):
+            return {"ok": False}
+        row = df.iloc[0].to_dict() if len(df.index) > 0 else {}
+        # 흔히 쓰이는 키 후보들(존재하는 것만 반환)
+        keys = [
+            "ODNO", "odno",  # 주문번호
+            "ORD_TMD", "ord_tmd",  # 주문시각
+            "KRX_FWDG_ORD_ORGNO", "krx_fwdg_ord_orgno",  # KRX 전달 주문 org
+            "ORD_GNO_BRNO", "ord_gno_brno",  # 주문점번호
+            "SLL_BUY_DVSN_CD", "sll_buy_dvsn_cd",
+            "MSG_CD", "msg_cd",
+            "MSG1", "msg1",
+            "RT_CD", "rt_cd",
+        ]
+        picked = {k: row.get(k) for k in keys if k in row}
+        # 키가 예상과 다르면 최소한의 힌트를 위해 컬럼 목록 제공(값은 제외)
+        return {"ok": True, "fields": picked, "columns": list(df.columns)}
+    except Exception:
+        return {"ok": False}
+
+
 def safe_execute_order(
     signal: str,
     stock_code: str,
@@ -245,8 +437,10 @@ def safe_execute_order(
     strategy: QuantStrategy,
     trenv,
     is_paper_trading: bool = True,  # 모의투자 여부
-    manual_approval: bool = True  # 수동 승인 필요 여부
-) -> bool:
+    manual_approval: bool = True,  # 수동 승인 필요 여부
+    return_details: bool = False,
+    quantity_override: Optional[int] = None,
+):
     """
     안전한 주문 실행
     
@@ -264,15 +458,35 @@ def safe_execute_order(
     # 환경 설정 확인
     env_dv = "demo" if is_paper_trading else "real"
     
+    details = {
+        "signal": signal,
+        "stock_code": stock_code,
+        "price": price,
+        "is_paper_trading": is_paper_trading,
+        "env_dv": "demo" if is_paper_trading else "real",
+    }
+
     if signal == "buy":
-        # 거래 수량 계산
-        quantity = risk_mgr.calculate_quantity(price)
+        # 거래 수량 계산 (override가 있으면 우선)
+        quantity = None
+        try:
+            if quantity_override is not None and int(quantity_override) > 0:
+                quantity = int(quantity_override)
+        except Exception:
+            quantity = None
+        if quantity is None:
+            quantity = risk_mgr.calculate_quantity(price)
+        details["quantity"] = int(quantity)
         
         # 거래 가능 여부 확인
         can_trade, reason = risk_mgr.can_trade(stock_code, price, quantity)
         
         if not can_trade:
             logging.warning(f"[매수 거부] {stock_code}: {reason}")
+            if return_details:
+                details["ok"] = False
+                details["reason"] = reason
+                return False, details
             return False
         
         # 수동 승인 필요 시
@@ -293,7 +507,7 @@ def safe_execute_order(
         # 주문 실행
         try:
             result = order_cash(
-                env_dv=env_dv,
+                env_dv=details["env_dv"],
                 ord_dv="buy",
                 cano=trenv.my_acct,
                 acnt_prdt_cd=trenv.my_prod,
@@ -303,27 +517,48 @@ def safe_execute_order(
                 ord_unpr="0",  # 시장가는 가격 0
                 excg_id_dvsn_cd="KRX"
             )
+            details["order_response"] = _extract_order_response(result)
             
             if not result.empty:
                 risk_mgr.update_position(stock_code, price, quantity, "buy")
                 logging.info(f"[매수 체결] {stock_code}: {price:,.0f}원, {quantity}주, 금액: {price*quantity:,.0f}원")
+                details["ok"] = True
+                if return_details:
+                    return True, details
                 return True
             else:
                 logging.error(f"[매수 실패] {stock_code}: 주문 실패")
+                details["ok"] = False
+                if return_details:
+                    return False, details
                 return False
                 
         except Exception as e:
             logging.error(f"[매수 오류] {stock_code}: {e}")
             import traceback
             traceback.print_exc()
+            details["ok"] = False
+            details["error"] = str(e)
+            if return_details:
+                return False, details
             return False
     
     elif signal == "sell":
         if stock_code not in risk_mgr.positions:
+            details["ok"] = False
+            details["reason"] = "no_position"
+            if return_details:
+                return False, details
             return False
         
         position = risk_mgr.positions[stock_code]
-        quantity = position["quantity"]
+        quantity = int(position.get("quantity") or 0)
+        try:
+            if quantity_override is not None and int(quantity_override) > 0:
+                quantity = min(quantity, int(quantity_override))
+        except Exception:
+            pass
+        details["quantity"] = int(quantity)
         
         # 수동 승인 필요 시
         if manual_approval:
@@ -345,7 +580,7 @@ def safe_execute_order(
         # 주문 실행
         try:
             result = order_cash(
-                env_dv=env_dv,
+                env_dv=details["env_dv"],
                 ord_dv="sell",
                 cano=trenv.my_acct,
                 acnt_prdt_cd=trenv.my_prod,
@@ -355,21 +590,37 @@ def safe_execute_order(
                 ord_unpr="0",  # 시장가는 가격 0
                 excg_id_dvsn_cd="KRX"
             )
+            details["order_response"] = _extract_order_response(result)
             
             if not result.empty:
                 pnl = risk_mgr.update_position(stock_code, price, quantity, "sell")
                 logging.info(f"[매도 체결] {stock_code}: {price:,.0f}원, {quantity}주, 손익: {pnl:+,.0f}원")
+                details["ok"] = True
+                details["pnl"] = pnl
+                if return_details:
+                    return True, details
                 return True
             else:
                 logging.error(f"[매도 실패] {stock_code}: 주문 실패")
+                details["ok"] = False
+                if return_details:
+                    return False, details
                 return False
                 
         except Exception as e:
             logging.error(f"[매도 오류] {stock_code}: {e}")
             import traceback
             traceback.print_exc()
+            details["ok"] = False
+            details["error"] = str(e)
+            if return_details:
+                return False, details
             return False
     
+    details["ok"] = False
+    details["reason"] = "unknown_signal"
+    if return_details:
+        return False, details
     return False
 
 
