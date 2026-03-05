@@ -160,6 +160,15 @@ class StockSelectionConfig(BaseModel):
     drawdown_filter_after_hhmm: str = "12:00"
     kospi_only: bool = False  # True: 코스피만(코스닥 제외)
 
+
+class OperationalConfig(BaseModel):
+    """운영 옵션: 자동 리밸런싱, 성과 기반 자동 추천"""
+    enable_auto_rebalance: bool = False
+    auto_rebalance_interval_minutes: int = 30
+    enable_performance_auto_recommend: bool = False
+    performance_recommend_interval_minutes: int = 5
+
+
 class StrategyConfig(BaseModel):
     short_ma_period: int
     long_ma_period: int

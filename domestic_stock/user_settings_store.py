@@ -16,6 +16,7 @@ class DynamoDBUserSettingsStore:
         - risk_config_json
         - strategy_config_json
         - stock_selection_config_json
+        - operational_config_json
         - updated_at (ISO8601)
         - schema_version (int)
     """
@@ -28,11 +29,17 @@ class DynamoDBUserSettingsStore:
         aws_secret_access_key: Optional[str] = None,
         aws_session_token: Optional[str] = None,
     ):
-        self.table_name = table_name or os.getenv(
-            "USER_SETTINGS_TABLE_NAME", "quant_trading_user_settings"
+        self.table_name = (
+            table_name
+            or os.getenv("USER_SETTINGS_TABLE_NAME")
+            or os.getenv("DYNAMODB_TABLE_NAME", "quant_trading_user_settings")
         )
-        self.region = region or os.getenv(
-            "AWS_DEFAULT_REGION", os.getenv("AWS_REGION", "ap-northeast-2")
+        # USER_SETTINGS_REGION 있으면 우선, 없으면 AWS_DEFAULT_REGION / AWS_REGION, 기본 ap-northeast-2
+        self.region = (
+            region
+            or os.getenv("USER_SETTINGS_REGION")
+            or os.getenv("AWS_DEFAULT_REGION")
+            or os.getenv("AWS_REGION", "ap-northeast-2")
         )
 
         self._enabled = False
@@ -133,17 +140,22 @@ class DynamoDBUserSettingsStore:
             "has_aws_session_token": bool(os.getenv("AWS_SESSION_TOKEN")),
         }
 
-    def load(self, username: str) -> Dict[str, Any]:
+    def load(self, username: str, consistent_read: bool = True) -> Dict[str, Any]:
+        """저장 직후 조회 시 최신 값이 보이도록 기본값은 Strongly Consistent Read."""
         if not self.enabled:
             return {}
         try:
-            res = self._table.get_item(Key={"username": username})
+            res = self._table.get_item(
+                Key={"username": username},
+                ConsistentRead=consistent_read,
+            )
             item = res.get("Item") or {}
             out: Dict[str, Any] = {}
             for key, field in (
                 ("risk_config", "risk_config_json"),
                 ("strategy_config", "strategy_config_json"),
                 ("stock_selection_config", "stock_selection_config_json"),
+                ("operational_config", "operational_config_json"),
             ):
                 raw = item.get(field)
                 if isinstance(raw, str) and raw.strip():
@@ -163,6 +175,7 @@ class DynamoDBUserSettingsStore:
         risk_config: Optional[Dict[str, Any]] = None,
         strategy_config: Optional[Dict[str, Any]] = None,
         stock_selection_config: Optional[Dict[str, Any]] = None,
+        operational_config: Optional[Dict[str, Any]] = None,
     ) -> bool:
         if not self.enabled:
             return False
@@ -178,6 +191,9 @@ class DynamoDBUserSettingsStore:
             if stock_selection_config is not None:
                 sets.append("stock_selection_config_json=:stocksel")
                 values[":stocksel"] = json.dumps(stock_selection_config, ensure_ascii=False)
+            if operational_config is not None:
+                sets.append("operational_config_json=:oper")
+                values[":oper"] = json.dumps(operational_config, ensure_ascii=False)
 
             now = datetime.now(timezone.utc).isoformat()
             sets.append("updated_at=:u")
@@ -193,6 +209,6 @@ class DynamoDBUserSettingsStore:
             )
             return True
         except Exception as e:
-            logger.warning(f"User settings save failed ({username}): {e}")
+            logger.warning(f"User settings save failed ({username}): {e}", exc_info=True)
             return False
 

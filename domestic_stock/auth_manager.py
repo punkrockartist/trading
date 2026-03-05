@@ -47,20 +47,21 @@ def _load_dotenv_file(dotenv_path: str) -> bool:
 
 
 def _maybe_load_dotenv():
-    """Best-effort: load .env from common config locations."""
+    """Best-effort: load .env from common config locations. 기존 동작 유지: config/.env 우선 후 루트 .env (덮어쓰지 않음)."""
     candidates = []
     explicit = os.getenv("ENV_FILE") or os.getenv("DOTENV_PATH")
     if explicit:
         candidates.append(explicit)
     _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     config_root = os.getenv("KIS_CONFIG_ROOT", os.path.join(_project_root, "config"))
+    # 코딩 변경 전과 동일: config/.env 먼저 (KIS 등 기존 설정 유지) → 그 다음 루트 .env (AWS 등 추가 변수)
     candidates.append(os.path.join(config_root, ".env"))
+    candidates.append(os.path.join(_project_root, ".env"))
     candidates.append("/app/config/.env")
 
     for p in candidates:
         if _load_dotenv_file(p):
             logger.info(f".env 로드: {p}")
-            break
 
 
 _maybe_load_dotenv()
@@ -245,8 +246,12 @@ try:
                 user = response['Item']
                 if not user.get('is_active', True):
                     return False
+                stored_hash = user.get('password_hash')
+                if not stored_hash:
+                    logger.warning(f"사용자 '{username}' 항목에 password_hash가 없습니다. 인증 테이블 스키마를 확인하세요.")
+                    return False
                 password_hash = self._hash_password(password)
-                return user['password_hash'] == password_hash
+                return stored_hash == password_hash
             except ClientError as e:
                 logger.error(f"DynamoDB 오류: {e}")
                 return False
@@ -358,25 +363,28 @@ class AuthManager:
 # 전역 인증 관리자 설정
 # DynamoDB 설정을 사용하려면 dynamodb_config.py를 수정하거나
 # 환경변수를 설정하세요
+import os as _os
+# 로그인 전용 테이블: AUTH_DYNAMODB_TABLE_NAME 있으면 사용, 없으면 quant_trading_users (password_hash 필드 있는 테이블)
+# DYNAMODB_TABLE_NAME은 설정 저장 등 다른 용도로 쓸 수 있어, 로그인은 별도 기본값 사용
+_auth_table = _os.getenv("AUTH_DYNAMODB_TABLE_NAME", "quant_trading_users")
+_auth_region = _os.getenv("AUTH_DYNAMODB_REGION") or _os.getenv("AWS_DEFAULT_REGION") or _os.getenv("AWS_REGION", "ap-northeast-2")
 try:
     from dynamodb_config import get_dynamodb_config
     config = get_dynamodb_config()
     auth_manager = AuthManager(
         use_dynamodb=config.get("use_dynamodb", False),
-        table_name=config.get("table_name", "quant_trading_users"),
-        region=config.get("region", "ap-northeast-2"),
+        table_name=_auth_table,
+        region=config.get("region", _auth_region) or _auth_region,
         aws_access_key_id=config.get("aws_access_key_id"),
         aws_secret_access_key=config.get("aws_secret_access_key"),
         aws_session_token=config.get("aws_session_token")
     )
 except ImportError:
-    # dynamodb_config.py가 없으면 기본값 사용
-    import os
     auth_manager = AuthManager(
-        use_dynamodb=os.getenv("USE_DYNAMODB", "False").lower() == "true",
-        table_name=os.getenv("DYNAMODB_TABLE_NAME", "quant_trading_users"),
-        region=os.getenv("AWS_DEFAULT_REGION", "ap-northeast-2"),
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-        aws_session_token=os.getenv("AWS_SESSION_TOKEN")
+        use_dynamodb=_os.getenv("USE_DYNAMODB", "False").lower() == "true",
+        table_name=_auth_table,
+        region=_auth_region,
+        aws_access_key_id=_os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=_os.getenv("AWS_SECRET_ACCESS_KEY"),
+        aws_session_token=_os.getenv("AWS_SESSION_TOKEN")
     )

@@ -627,6 +627,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                     <button type="button" class="subtab" id="subtab-risk" onclick="showSettingsSection('risk')">리스크</button>
                     <button type="button" class="subtab" id="subtab-strategy" onclick="showSettingsSection('strategy')">전략</button>
                     <button type="button" class="subtab" id="subtab-stocks" onclick="showSettingsSection('stocks')">종목선정</button>
+                    <button type="button" class="subtab" id="subtab-operational" onclick="showSettingsSection('operational')">운영</button>
                     <button type="button" class="subtab" id="subtab-help" onclick="showSettingsSection('help')">도움말</button>
                 </div>
             </div>
@@ -1219,6 +1220,35 @@ def get_dashboard_html_mobile(username: str) -> str:
                 </div>
             </div>
 
+            <div id="settings-section-operational" class="settings-section">
+                <div class="card">
+                    <h2>운영 옵션</h2>
+                    <div class="form-group">
+                        <label style="display:flex; align-items:center; gap:8px;">
+                            <input type="checkbox" id="enable_auto_rebalance">
+                            자동 리밸런싱 (종목 주기 재선정)
+                        </label>
+                        <div class="hint">시스템 구동 중 설정 간격마다 종목을 재선정합니다. 갱신된 목록은 다음 시스템 시작 시 적용됩니다.</div>
+                    </div>
+                    <div class="form-group">
+                        <label>리밸런싱 간격 (분):</label>
+                        <input type="number" id="auto_rebalance_interval_minutes" value="30" min="5" max="120" step="5">
+                    </div>
+                    <div class="form-group">
+                        <label style="display:flex; align-items:center; gap:8px;">
+                            <input type="checkbox" id="enable_performance_auto_recommend">
+                            성과 기반 자동 추천 표시
+                        </label>
+                        <div class="hint">설정 간격마다 성과 요약을 계산해 권장 문구를 로그에 브로드캐스트합니다. 설정은 자동 적용되지 않습니다.</div>
+                    </div>
+                    <div class="form-group">
+                        <label>추천 알림 간격 (분):</label>
+                        <input type="number" id="performance_recommend_interval_minutes" value="5" min="1" max="60" step="1">
+                    </div>
+                    <button class="btn" onclick="updateOperationalConfig()">운영 옵션 저장</button>
+                </div>
+            </div>
+
             <div id="settings-section-help" class="settings-section">
                 <div class="card">
                     <h2>설정 도움말</h2>
@@ -1543,7 +1573,7 @@ def get_dashboard_html_mobile(username: str) -> str:
         }});
 
         function showSettingsSection(name) {{
-            const sections = ['preset', 'risk', 'strategy', 'stocks', 'help'];
+            const sections = ['preset', 'risk', 'strategy', 'stocks', 'operational', 'help'];
             sections.forEach(s => {{
                 const sec = document.getElementById(`settings-section-${{s}}`);
                 const btn = document.getElementById(`subtab-${{s}}`);
@@ -1601,6 +1631,9 @@ def get_dashboard_html_mobile(username: str) -> str:
                     pendingSignals[s.signal_id] = s;
                 }});
                 renderPendingSignals();
+            }} else if (data.type === 'selected_stocks') {{
+                const d = data.data || {{}};
+                renderSelectedStocks(d.info || d.codes || []);
             }} else if (data.type === 'log') {{
                 addLog(data.message, data.level || 'info');
             }}
@@ -1751,6 +1784,22 @@ def get_dashboard_html_mobile(username: str) -> str:
             }}
             renderSelectedStocks(data.selected_stock_info || data.selected_stocks || []);
             renderBuySkipStats(data.buy_skip_stats || null);
+            if (data.enable_auto_rebalance != null) {{
+                const el = document.getElementById('enable_auto_rebalance');
+                if (el) el.checked = !!data.enable_auto_rebalance;
+            }}
+            if (data.auto_rebalance_interval_minutes != null) {{
+                const el = document.getElementById('auto_rebalance_interval_minutes');
+                if (el) el.value = data.auto_rebalance_interval_minutes;
+            }}
+            if (data.enable_performance_auto_recommend != null) {{
+                const el = document.getElementById('enable_performance_auto_recommend');
+                if (el) el.checked = !!data.enable_performance_auto_recommend;
+            }}
+            if (data.performance_recommend_interval_minutes != null) {{
+                const el = document.getElementById('performance_recommend_interval_minutes');
+                if (el) el.value = data.performance_recommend_interval_minutes;
+            }}
             updateSettingsSummaries();
         }}
 
@@ -2066,6 +2115,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                 const risk = s.risk_config || null;
                 const strat = s.strategy_config || null;
                 const stocksel = s.stock_selection_config || null;
+                const oper = s.operational_config || null;
 
                 if (risk) {{
                     if (risk.max_single_trade_amount != null) document.getElementById('max_trade_amount').value = risk.max_single_trade_amount;
@@ -2165,6 +2215,12 @@ def get_dashboard_html_mobile(username: str) -> str:
                     if (stocksel.exclude_drawdown != null) document.getElementById('exclude_drawdown').checked = !!stocksel.exclude_drawdown;
                     if (stocksel.max_drawdown_from_high_ratio != null) document.getElementById('max_drawdown_pct').value = (stocksel.max_drawdown_from_high_ratio * 100).toFixed(1);
                     if (stocksel.drawdown_filter_after_hhmm != null) document.getElementById('drawdown_filter_after_hhmm').value = stocksel.drawdown_filter_after_hhmm;
+                }}
+                if (oper) {{
+                    if (oper.enable_auto_rebalance != null) document.getElementById('enable_auto_rebalance').checked = !!oper.enable_auto_rebalance;
+                    if (oper.auto_rebalance_interval_minutes != null) document.getElementById('auto_rebalance_interval_minutes').value = oper.auto_rebalance_interval_minutes;
+                    if (oper.enable_performance_auto_recommend != null) document.getElementById('enable_performance_auto_recommend').checked = !!oper.enable_performance_auto_recommend;
+                    if (oper.performance_recommend_interval_minutes != null) document.getElementById('performance_recommend_interval_minutes').value = oper.performance_recommend_interval_minutes;
                 }}
                 updateSettingsSummaries();
             }} catch (e) {{
@@ -2602,6 +2658,30 @@ def get_dashboard_html_mobile(username: str) -> str:
                 }}
             }} catch (error) {{
                 addLog('프리셋 로드 오류: ' + error, 'error');
+            }}
+        }}
+
+        async function updateOperationalConfig() {{
+            try {{
+                const body = {{
+                    enable_auto_rebalance: !!document.getElementById('enable_auto_rebalance').checked,
+                    auto_rebalance_interval_minutes: parseInt(document.getElementById('auto_rebalance_interval_minutes').value) || 30,
+                    enable_performance_auto_recommend: !!document.getElementById('enable_performance_auto_recommend').checked,
+                    performance_recommend_interval_minutes: parseInt(document.getElementById('performance_recommend_interval_minutes').value) || 5
+                }};
+                const response = await fetch('/api/config/operational', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (localStorage.getItem('token') || '') }},
+                    body: JSON.stringify(body)
+                }});
+                const data = await response.json();
+                if (data.success) {{
+                    addLog('운영 옵션 저장됨', 'info');
+                }} else {{
+                    addLog('운영 옵션 저장 실패: ' + (data.message || '알 수 없음'), 'error');
+                }}
+            }} catch (error) {{
+                addLog('운영 옵션 저장 오류: ' + error, 'error');
             }}
         }}
 

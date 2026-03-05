@@ -20,7 +20,7 @@ from domestic_stock_functions_ws import ccnl_krx, asking_price_krx
 
 from quant_dashboard_mobile import (
     app, state, get_current_user,
-    RiskConfig, StockSelectionConfig, StrategyConfig, ManualOrder
+    RiskConfig, StockSelectionConfig, StrategyConfig, OperationalConfig, ManualOrder
 )
 from stock_selector import StockSelector
 from stock_selection_presets import get_preset, list_presets
@@ -365,6 +365,22 @@ def _check_balance_vs_positions_sync() -> Optional[str]:
         return f"잔고 비교 오류: {e}"
 
 
+def _run_auto_rebalance_sync() -> tuple:
+    """종목 재선정 실행(동기). 반환: (selected_codes 리스트, selected_info 리스트) 또는 ([], []) 실패 시."""
+    try:
+        sel = getattr(state, "stock_selector", None)
+        if not sel:
+            return ([], [])
+        selected = sel.select_stocks_by_fluctuation()
+        if not selected:
+            return ([], [])
+        info = getattr(sel, "last_selected_stock_info", None) or [{"code": c, "name": c} for c in selected]
+        return (selected, info)
+    except Exception as e:
+        logger.warning(f"자동 리밸런싱(종목 재선정) 오류: {e}")
+        return ([], [])
+
+
 async def _pending_order_reconciler_loop():
     """시스템 구동 중 pending 주문을 주기적으로 체결 확인하여 반영."""
     try:
@@ -375,12 +391,47 @@ async def _pending_order_reconciler_loop():
     max_per_run = int(getattr(state, "pending_order_reconcile_max_per_run", 5) or 5)
     max_per_run = max(1, min(20, max_per_run))
     last_balance_check_ts = time.time()
+    last_rebalance_ts = 0.0
+    last_recommend_ts = 0.0
     BALANCE_CHECK_INTERVAL_SEC = 60.0
 
     while True:
         try:
             if not getattr(state, "is_running", False):
                 break
+
+            now_ts = time.time()
+
+            # 자동 리밸런싱(종목 주기 재선정): 설정 시 N분마다 재선정, 목록 갱신(다음 시작 시 적용)
+            enable_rebal = bool(getattr(state, "enable_auto_rebalance", False))
+            rebal_min = int(getattr(state, "auto_rebalance_interval_minutes", 30) or 30)
+            rebal_min = max(5, min(120, rebal_min))
+            if enable_rebal and (now_ts - last_rebalance_ts) >= (rebal_min * 60.0):
+                last_rebalance_ts = now_ts
+                try:
+                    selected_codes, selected_info = await asyncio.to_thread(_run_auto_rebalance_sync)
+                    if selected_codes:
+                        state.selected_stocks = selected_codes
+                        state.selected_stock_info = selected_info
+                        await state.broadcast({"type": "log", "level": "info", "message": f"자동 리밸런싱: 종목 {len(selected_codes)}개 갱신됨. 변경 사항은 다음 시스템 시작 시 적용됩니다."})
+                        await state.broadcast({"type": "selected_stocks", "data": {"codes": selected_codes, "info": selected_info}})
+                except Exception as e:
+                    logger.warning(f"자동 리밸런싱 오류(무시): {e}")
+
+            # 성과 기반 자동 추천: 설정 시 N분마다 권장 문구를 로그로 브로드캐스트
+            enable_rec = bool(getattr(state, "enable_performance_auto_recommend", False))
+            rec_min = int(getattr(state, "performance_recommend_interval_minutes", 5) or 5)
+            rec_min = max(1, min(60, rec_min))
+            if enable_rec and (now_ts - last_recommend_ts) >= (rec_min * 60.0):
+                last_recommend_ts = now_ts
+                try:
+                    summary = _performance_summary_from_trades()
+                    recs = summary.get("recommendations") or []
+                    if recs:
+                        for r in recs:
+                            await state.broadcast({"type": "log", "level": r.get("level", "info"), "message": f"[성과 추천] {r.get('message', '')}"})
+                except Exception as e:
+                    logger.warning(f"성과 추천 오류(무시): {e}")
 
             events = await asyncio.to_thread(
                 _reconcile_pending_orders_sync,
@@ -518,6 +569,85 @@ def _throttled_skip_log(stock_code: str, reason: str, *, ttl_sec: int = 30):
         return
 
 
+def _apply_risk_config_dict_to_state(d: dict) -> None:
+    """DB에서 불러온 risk_config 딕셔너리를 state.risk_manager에 반영 (폼·DB·실행값 일치)."""
+    if not d or not getattr(state, "risk_manager", None):
+        return
+    rm = state.risk_manager
+    try:
+        if "max_single_trade_amount" in d:
+            rm.max_single_trade_amount = int(d["max_single_trade_amount"])
+        if "min_order_quantity" in d:
+            rm.min_order_quantity = max(1, int(d.get("min_order_quantity") or 1))
+        if "stop_loss_ratio" in d:
+            rm.stop_loss_ratio = float(d["stop_loss_ratio"])
+        if "take_profit_ratio" in d:
+            rm.take_profit_ratio = float(d["take_profit_ratio"])
+        if "daily_loss_limit" in d:
+            rm.daily_loss_limit = int(d["daily_loss_limit"])
+        if "daily_profit_limit" in d:
+            rm.daily_profit_limit = int(d.get("daily_profit_limit") or 0)
+        if "daily_total_loss_limit" in d:
+            rm.daily_total_loss_limit = int(d.get("daily_total_loss_limit") or 0)
+        if "daily_profit_limit_basis" in d:
+            rm.daily_profit_limit_basis = str(d.get("daily_profit_limit_basis") or "total")
+        if "daily_loss_limit_basis" in d:
+            rm.daily_loss_limit_basis = str(d.get("daily_loss_limit_basis") or "realized")
+        if "buy_order_style" in d:
+            rm.buy_order_style = str(d.get("buy_order_style") or "market")
+        if "sell_order_style" in d:
+            rm.sell_order_style = str(d.get("sell_order_style") or "market")
+        if "order_retry_count" in d:
+            rm.order_retry_count = int(d.get("order_retry_count") or 0)
+        if "order_retry_delay_ms" in d:
+            rm.order_retry_delay_ms = int(d.get("order_retry_delay_ms") or 300)
+        if "order_fallback_to_market" in d:
+            rm.order_fallback_to_market = bool(d.get("order_fallback_to_market", True))
+        if "enable_volatility_sizing" in d:
+            rm.enable_volatility_sizing = bool(d.get("enable_volatility_sizing", False))
+        if "volatility_lookback_ticks" in d:
+            rm.volatility_lookback_ticks = int(d.get("volatility_lookback_ticks") or 20)
+        if "volatility_stop_mult" in d:
+            rm.volatility_stop_mult = float(d.get("volatility_stop_mult") or 1.0)
+        if "max_loss_per_stock_krw" in d:
+            rm.max_loss_per_stock_krw = int(d.get("max_loss_per_stock_krw") or 0)
+        if "slippage_bps" in d:
+            rm.slippage_bps = max(0, min(500, int(d.get("slippage_bps") or 0)))
+        if "volatility_floor_ratio" in d:
+            rm.volatility_floor_ratio = max(0.0, min(0.05, float(d.get("volatility_floor_ratio") or 0.005)))
+        if "trailing_stop_ratio" in d:
+            rm.trailing_stop_ratio = float(d.get("trailing_stop_ratio") or 0.0)
+        if "trailing_activation_ratio" in d:
+            rm.trailing_activation_ratio = float(d.get("trailing_activation_ratio") or 0.0)
+        if "partial_take_profit_ratio" in d:
+            rm.partial_take_profit_ratio = float(d.get("partial_take_profit_ratio") or 0.0)
+        if "partial_take_profit_fraction" in d:
+            rm.partial_take_profit_fraction = float(d.get("partial_take_profit_fraction") or 0.5)
+        if "max_trades_per_day" in d:
+            rm.max_trades_per_day = int(d.get("max_trades_per_day") or 5)
+        if "max_position_size_ratio" in d:
+            rm.max_position_size_ratio = float(d.get("max_position_size_ratio") or 0.1)
+    except Exception as e:
+        logger.warning(f"저장된 리스크 설정 적용 중 오류(무시): {e}")
+
+
+def _apply_operational_config_dict_to_state(d: dict) -> None:
+    """DB에서 불러온 operational_config를 state에 반영."""
+    if not d:
+        return
+    try:
+        if "enable_auto_rebalance" in d:
+            state.enable_auto_rebalance = bool(d.get("enable_auto_rebalance", False))
+        if "auto_rebalance_interval_minutes" in d:
+            state.auto_rebalance_interval_minutes = max(5, min(120, int(d.get("auto_rebalance_interval_minutes") or 30)))
+        if "enable_performance_auto_recommend" in d:
+            state.enable_performance_auto_recommend = bool(d.get("enable_performance_auto_recommend", False))
+        if "performance_recommend_interval_minutes" in d:
+            state.performance_recommend_interval_minutes = max(1, min(60, int(d.get("performance_recommend_interval_minutes") or 5)))
+    except Exception as e:
+        logger.warning(f"저장된 운영 옵션 적용 중 오류(무시): {e}")
+
+
 def _get_user_settings_store():
     global _user_settings_store
     global _user_settings_store_init_error
@@ -540,18 +670,26 @@ def _get_user_settings_store():
 
 @app.get("/api/config/user-settings/store-status")
 async def get_user_settings_store_status(current_user: str = Depends(get_current_user)):
-    """DynamoDB 유저 설정 저장소 상태 진단용."""
+    """DynamoDB 유저 설정 저장소 상태 진단용. 비활성화 시 원인(init_error)과 설정 방법 안내 포함."""
     store = _get_user_settings_store()
-    if store and getattr(store, "enabled", False) and hasattr(store, "status"):
+    if store and hasattr(store, "status"):
         try:
-            return JSONResponse({"success": True, "store": store.status()})
+            st = store.status()
+            if not st.get("enabled"):
+                st["hint"] = (
+                    "설정 저장을 쓰려면: (1) .env에 AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY 설정 또는 aws configure 실행, "
+                    "(2) USER_SETTINGS_TABLE_NAME(또는 DYNAMODB_TABLE_NAME) 테이블이 해당 리전에 존재하는지 확인. "
+                    "테이블 없으면 AWS 콘솔에서 생성(파티션 키 username 문자열) 또는 USER_SETTINGS_AUTO_CREATE_TABLE=true 로 자동 생성."
+                )
+            return JSONResponse({"success": True, "store": st})
         except Exception as e:
-            return JSONResponse({"success": False, "message": str(e), "store": {"enabled": False}})
+            return JSONResponse({"success": False, "message": str(e), "store": {"enabled": False, "init_error": str(e)}})
     return JSONResponse({
         "success": True,
         "store": {
             "enabled": False,
-            "init_error": _user_settings_store_init_error,
+            "init_error": _user_settings_store_init_error or "저장소 초기화 실패",
+            "hint": ".env에 AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION(예: ap-northeast-2) 설정 후 서버 재시작.",
         }
     })
 
@@ -1745,6 +1883,10 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
             "range_lookback_ticks": getattr(state, "range_lookback_ticks", 0),
             "min_range_ratio": getattr(state, "min_range_ratio", 0.0),
             "buy_skip_stats": _get_buy_skip_stats_summary(top_n=5),
+            "enable_auto_rebalance": getattr(state, "enable_auto_rebalance", False),
+            "auto_rebalance_interval_minutes": int(getattr(state, "auto_rebalance_interval_minutes", 30) or 30),
+            "enable_performance_auto_recommend": getattr(state, "enable_performance_auto_recommend", False),
+            "performance_recommend_interval_minutes": int(getattr(state, "performance_recommend_interval_minutes", 5) or 5),
         })
     
     await _refresh_kis_account_balance(force=False, ttl_sec=60)
@@ -1773,7 +1915,10 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
         "range_lookback_ticks": getattr(state, "range_lookback_ticks", 0),
         "min_range_ratio": getattr(state, "min_range_ratio", 0.0),
         "buy_skip_stats": _get_buy_skip_stats_summary(top_n=5),
-        # 참고: account_balance는 현재 RiskManager 초기값이며, 실제 KIS 잔고 조회는 별도 endpoint 사용 권장
+        "enable_auto_rebalance": getattr(state, "enable_auto_rebalance", False),
+        "auto_rebalance_interval_minutes": int(getattr(state, "auto_rebalance_interval_minutes", 30) or 30),
+        "enable_performance_auto_recommend": getattr(state, "enable_performance_auto_recommend", False),
+        "performance_recommend_interval_minutes": int(getattr(state, "performance_recommend_interval_minutes", 5) or 5),
     })
 
 
@@ -1893,6 +2038,16 @@ async def start_system(current_user: str = Depends(get_current_user)):
                 if detail:
                     msg = f"{msg} (detail: {detail})"
                 return JSONResponse({"success": False, "message": msg})
+
+        # 시작 전 DB에 저장된 설정을 state에 반영 (리스크·운영 등이 DB와 일치하도록)
+        store = _get_user_settings_store()
+        if store and getattr(store, "enabled", False):
+            try:
+                saved = store.load(current_user) or {}
+                _apply_risk_config_dict_to_state(saved.get("risk_config"))
+                _apply_operational_config_dict_to_state(saved.get("operational_config"))
+            except Exception as e:
+                logger.warning(f"시작 시 저장 설정 적용 실패(무시): {e}")
 
         if not state.selected_stocks:
             state.selected_stocks = ["005930", "000660"]
@@ -2583,13 +2738,35 @@ async def update_stock_selection_config(config: StockSelectionConfig, current_us
         return JSONResponse({"success": False, "message": str(e)})
 
 
+@app.post("/api/config/operational")
+async def update_operational_config(config: OperationalConfig, current_user: str = Depends(get_current_user)):
+    """운영 옵션 저장: 자동 리밸런싱, 성과 기반 자동 추천"""
+    try:
+        state.enable_auto_rebalance = bool(config.enable_auto_rebalance)
+        state.auto_rebalance_interval_minutes = max(5, min(120, int(config.auto_rebalance_interval_minutes or 30)))
+        state.enable_performance_auto_recommend = bool(config.enable_performance_auto_recommend)
+        state.performance_recommend_interval_minutes = max(1, min(60, int(config.performance_recommend_interval_minutes or 5)))
+        store = _get_user_settings_store()
+        persisted = False
+        if store and getattr(store, "enabled", False):
+            persisted = bool(store.save(current_user, operational_config=config.model_dump()))
+        await state.broadcast({"type": "log", "message": "운영 옵션이 업데이트되었습니다.", "level": "info"})
+        return JSONResponse({"success": True, "persisted": persisted})
+    except Exception as e:
+        logger.error(f"운영 옵션 업데이트 오류: {e}")
+        return JSONResponse({"success": False, "message": str(e)})
+
+
 @app.get("/api/config/user-settings")
 async def get_user_settings(current_user: str = Depends(get_current_user)):
-    """로그인 사용자별 저장된 설정값 조회"""
+    """로그인 사용자별 저장된 설정값 조회. 조회한 값은 백엔드 state에도 반영해 DB·화면·실행값이 일치하도록 함."""
     store = _get_user_settings_store()
     if not store or not getattr(store, "enabled", False):
         return JSONResponse({"success": False, "message": "DynamoDB 설정 저장소를 사용할 수 없습니다."})
     settings = store.load(current_user) or {}
+    # DB에서 불러온 설정을 state에 반영 → 리스크 관리 등 화면값과 실제 적용값·DB가 같아짐
+    _apply_risk_config_dict_to_state(settings.get("risk_config"))
+    _apply_operational_config_dict_to_state(settings.get("operational_config"))
     return JSONResponse({"success": True, "settings": settings})
 
 @app.post("/api/stocks/select")
