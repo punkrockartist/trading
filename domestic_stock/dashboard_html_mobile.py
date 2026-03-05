@@ -604,6 +604,7 @@ def get_dashboard_html_mobile(username: str) -> str:
             <div class="tablist">
                 <button class="tab active" onclick="showTab('status')">상태</button>
                 <button class="tab" onclick="showTab('positions')">포지션</button>
+                <button class="tab" onclick="showTab('performance')">성과</button>
                 <button class="tab" onclick="showTab('settings')">설정</button>
                 <button class="tab" onclick="showTab('signals')">승인대기</button>
                 <button class="tab" onclick="showTab('trades')">거래내역</button>
@@ -693,6 +694,25 @@ def get_dashboard_html_mobile(username: str) -> str:
                 <div id="positions">
                     <p style="color: var(--muted); text-align: center; padding: 20px;">보유 종목이 없습니다.</p>
                 </div>
+            </div>
+        </div>
+
+        <!-- 성과 탭 -->
+        <div id="tab-performance" class="tab-content">
+            <div class="card">
+                <h2>일일·세션 성과</h2>
+                <div class="hint">당일 거래 기준. 새로고침 시 최신 집계 반영.</div>
+                <div id="performance_metrics" style="display:grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap:12px; margin:12px 0;">
+                    <p style="color: var(--muted); grid-column: 1/-1;">로딩 중...</p>
+                </div>
+                <button class="btn" onclick="loadPerformanceSummary()" style="margin-top:8px;">새로고침</button>
+            </div>
+            <div class="card">
+                <h2>권장 설정 (성과 기반)</h2>
+                <div id="performance_recommendations" style="font-size:14px; line-height:1.6;">
+                    <p style="color: var(--muted);">성과 요약 로딩 후 표시됩니다.</p>
+                </div>
+                <div class="hint">자동 적용되지 않습니다. 설정 탭에서 수동으로 조정하세요.</div>
             </div>
         </div>
 
@@ -803,6 +823,16 @@ def get_dashboard_html_mobile(username: str) -> str:
                         <div class="form-group">
                             <label>종목당 최대 손실액(원):</label>
                             <input type="number" id="max_loss_per_stock_krw" value="0" min="0" step="10000">
+                        </div>
+                        <div class="form-group">
+                            <label>슬리피지·체결지연 보정(bps):</label>
+                            <input type="number" id="slippage_bps" value="0" min="0" max="500" step="5" title="손절/익절 판단 시 매수가 불리하게 체결된 것으로 가정">
+                            <div class="hint">0=미적용. 10=0.1%, 50=0.5%. 보수적 손익 판단용.</div>
+                        </div>
+                        <div class="form-group">
+                            <label>변동성 하한(가격 대비 비율):</label>
+                            <input type="number" id="volatility_floor_ratio" value="0.005" min="0" max="0.05" step="0.001" title="틱 부족 시 최소 변동성(장 초반 사이징)">
+                            <div class="hint">예: 0.005=0.5%. 틱 부족 시 이 비율로 risk 계산.</div>
                         </div>
                         <details>
                             <summary>레거시(합산 손실 한도)</summary>
@@ -1118,6 +1148,13 @@ def get_dashboard_html_mobile(username: str) -> str:
                         <label>최소 거래대금 (원):</label>
                         <input type="number" id="min_trade_amount" value="0">
                     </div>
+                    <div class="form-group">
+                        <label style="display:flex; align-items:center; gap:8px;">
+                            <input type="checkbox" id="kospi_only">
+                            코스피만 (코스닥 제외)
+                        </label>
+                        <div class="hint">체크 시 등락률 순위에서 거래소(코스피) 종목만 선정합니다. 코스닥은 변동성·스프레드가 클 수 있어 제외할 때 유리합니다.</div>
+                    </div>
 
                     <details>
                         <summary>고급(장초/드로우다운)</summary>
@@ -1224,6 +1261,14 @@ def get_dashboard_html_mobile(username: str) -> str:
                             <div class="help-item">
                                 <strong>일일 손실 한도(원) (레거시) (<code>daily_total_loss_limit</code>)</strong>
                                 과거 호환용입니다. 신규 방식은 <code>daily_loss_limit</code> + <code>daily_loss_limit_basis=total</code> 사용을 권장합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>슬리피지·체결지연 보정(bps) (<code>slippage_bps</code>)</strong>
+                                손절/익절 판단 시 매수가 불리하게 체결된 것으로 가정하는 보수적 반영입니다. 10=0.1%, 50=0.5%. 체결 지연·슬리피지를 간단히 모델링할 때 사용합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>변동성 하한(가격 대비 비율) (<code>volatility_floor_ratio</code>)</strong>
+                                틱이 부족한 장 초반 등에서 변동성 기반 사이징이 과소 수량이 되지 않도록 최소 변동성을 둡니다. 예: 0.005=0.5%.
                             </div>
                             <div class="help-item">
                                 <strong>부분 익절 트리거/비율</strong>
@@ -1421,6 +1466,42 @@ def get_dashboard_html_mobile(username: str) -> str:
             document.getElementById(`tab-${{tabName}}`).classList.add('active');
             const sub = document.getElementById('settingsSubbar');
             if (sub) sub.style.display = (tabName === 'settings') ? 'block' : 'none';
+            if (tabName === 'performance') loadPerformanceSummary();
+        }}
+
+        async function loadPerformanceSummary() {{
+            const metricsEl = document.getElementById('performance_metrics');
+            const recEl = document.getElementById('performance_recommendations');
+            if (!metricsEl || !recEl) return;
+            try {{
+                const r = await fetch('/api/performance/summary', {{ headers: {{ 'Authorization': 'Bearer ' + (localStorage.getItem('token') || '') }} }});
+                const data = await r.json();
+                if (!data.success || !data.summary) {{
+                    metricsEl.innerHTML = '<p style="color:var(--muted);">집계할 거래가 없거나 오류가 발생했습니다.</p>';
+                    recEl.innerHTML = '<p style="color:var(--muted);">-</p>';
+                    return;
+                }}
+                const s = data.summary;
+                metricsEl.innerHTML = `
+                    <div class="metric"><span class="metric-label">일일 실현손익</span><span class="metric-value">${{(s.total_pnl >= 0 ? '+' : '')}}${{Number(s.total_pnl).toLocaleString()}}원</span></div>
+                    <div class="metric"><span class="metric-label">거래 횟수</span><span class="metric-value">${{s.trade_count}}회</span></div>
+                    <div class="metric"><span class="metric-label">승률</span><span class="metric-value">${{s.win_rate_pct}}%</span></div>
+                    <div class="metric"><span class="metric-label">승/패</span><span class="metric-value">${{s.wins}} / ${{s.losses}}</span></div>
+                    <div class="metric"><span class="metric-label">평균 수익</span><span class="metric-value">${{Number(s.avg_win).toLocaleString()}}원</span></div>
+                    <div class="metric"><span class="metric-label">평균 손실</span><span class="metric-value">${{Number(s.avg_loss).toLocaleString()}}원</span></div>
+                    <div class="metric"><span class="metric-label">세션 최대낙폭</span><span class="metric-value">${{Number(s.session_max_drawdown).toLocaleString()}}원 (${{s.session_max_drawdown_pct}}%)</span></div>
+                `;
+                if (s.recommendations && s.recommendations.length) {{
+                    recEl.innerHTML = s.recommendations.map(rec => `
+                        <p style="margin:6px 0; padding:8px; border-left:4px solid ${{rec.level === 'warning' ? '#e67e22' : rec.level === 'success' ? '#27ae60' : '#3498db'}};">${{rec.message}}</p>
+                    `).join('');
+                }} else {{
+                    recEl.innerHTML = '<p style="color:var(--muted);">현재 성과 기준 권장 사항이 없습니다.</p>';
+                }}
+            }} catch (e) {{
+                metricsEl.innerHTML = '<p style="color:var(--error);">로드 실패: ' + (e.message || '') + '</p>';
+                recEl.innerHTML = '<p style="color:var(--muted);">-</p>';
+            }}
         }}
 
         function toggleUserMenu() {{
@@ -2005,6 +2086,8 @@ def get_dashboard_html_mobile(username: str) -> str:
                     if (risk.volatility_lookback_ticks != null) document.getElementById('volatility_lookback_ticks').value = risk.volatility_lookback_ticks;
                     if (risk.volatility_stop_mult != null) document.getElementById('volatility_stop_mult').value = risk.volatility_stop_mult;
                     if (risk.max_loss_per_stock_krw != null) document.getElementById('max_loss_per_stock_krw').value = risk.max_loss_per_stock_krw;
+                    if (risk.slippage_bps != null) document.getElementById('slippage_bps').value = risk.slippage_bps;
+                    if (risk.volatility_floor_ratio != null) document.getElementById('volatility_floor_ratio').value = risk.volatility_floor_ratio;
                     if (risk.trailing_stop_ratio != null) document.getElementById('trailing_stop_pct').value = (risk.trailing_stop_ratio * 100).toFixed(1);
                     if (risk.trailing_activation_ratio != null) document.getElementById('trailing_activation_pct').value = (risk.trailing_activation_ratio * 100).toFixed(1);
                     if (risk.partial_take_profit_ratio != null) document.getElementById('partial_tp_pct').value = (risk.partial_take_profit_ratio * 100).toFixed(1);
@@ -2078,6 +2161,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                     if (stocksel.early_strict_minutes != null) document.getElementById('early_strict_minutes').value = stocksel.early_strict_minutes;
                     if (stocksel.early_min_volume != null) document.getElementById('early_min_volume').value = stocksel.early_min_volume;
                     if (stocksel.early_min_trade_amount != null) document.getElementById('early_min_trade_amount').value = stocksel.early_min_trade_amount;
+                    if (stocksel.kospi_only != null) document.getElementById('kospi_only').checked = !!stocksel.kospi_only;
                     if (stocksel.exclude_drawdown != null) document.getElementById('exclude_drawdown').checked = !!stocksel.exclude_drawdown;
                     if (stocksel.max_drawdown_from_high_ratio != null) document.getElementById('max_drawdown_pct').value = (stocksel.max_drawdown_from_high_ratio * 100).toFixed(1);
                     if (stocksel.drawdown_filter_after_hhmm != null) document.getElementById('drawdown_filter_after_hhmm').value = stocksel.drawdown_filter_after_hhmm;
@@ -2109,6 +2193,8 @@ def get_dashboard_html_mobile(username: str) -> str:
                     volatility_lookback_ticks: parseInt(document.getElementById('volatility_lookback_ticks')?.value) || 20,
                     volatility_stop_mult: parseFloat(document.getElementById('volatility_stop_mult')?.value) || 1.0,
                     max_loss_per_stock_krw: parseInt(document.getElementById('max_loss_per_stock_krw')?.value) || 0,
+                    slippage_bps: parseInt(document.getElementById('slippage_bps')?.value) || 0,
+                    volatility_floor_ratio: parseFloat(document.getElementById('volatility_floor_ratio')?.value) || 0.005,
                     max_trades_per_day: 5,
                     max_position_size_ratio: 0.1,
                     trailing_stop_ratio: (parseFloat(document.getElementById('trailing_stop_pct').value) || 0) / 100,
@@ -2460,6 +2546,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                     early_strict_minutes: parseInt(document.getElementById('early_strict_minutes').value) || 30,
                     early_min_volume: parseInt(document.getElementById('early_min_volume').value) || 0,
                     early_min_trade_amount: parseInt(document.getElementById('early_min_trade_amount').value) || 0,
+                    kospi_only: !!document.getElementById('kospi_only').checked,
                     exclude_drawdown: !!document.getElementById('exclude_drawdown').checked,
                     max_drawdown_from_high_ratio: (parseFloat(document.getElementById('max_drawdown_pct').value) || 0) / 100,
                     drawdown_filter_after_hhmm: (document.getElementById('drawdown_filter_after_hhmm').value || '12:00').trim(),
@@ -2507,6 +2594,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                     if (preset.early_strict_minutes != null) document.getElementById('early_strict_minutes').value = preset.early_strict_minutes;
                     if (preset.early_min_volume != null) document.getElementById('early_min_volume').value = preset.early_min_volume;
                     if (preset.early_min_trade_amount != null) document.getElementById('early_min_trade_amount').value = preset.early_min_trade_amount;
+                    if (preset.kospi_only != null) document.getElementById('kospi_only').checked = !!preset.kospi_only;
                     if (preset.exclude_drawdown != null) document.getElementById('exclude_drawdown').checked = !!preset.exclude_drawdown;
                     if (preset.max_drawdown_from_high_ratio != null) document.getElementById('max_drawdown_pct').value = (preset.max_drawdown_from_high_ratio * 100).toFixed(1);
                     if (preset.drawdown_filter_after_hhmm != null) document.getElementById('drawdown_filter_after_hhmm').value = preset.drawdown_filter_after_hhmm;

@@ -110,6 +110,7 @@ PRESET_SCALP_MORNING = {
     "exclude_drawdown": True,
     "max_drawdown_from_high_ratio": 0.02,  # 2%
     "drawdown_filter_after_hhmm": "10:30",
+    "kospi_only": True,  # 코스닥 제외, 코스피만(변동성·스프레드 완화)
 }
 
 # ============================================================================

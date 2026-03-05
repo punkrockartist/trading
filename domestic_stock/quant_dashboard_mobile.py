@@ -121,6 +121,10 @@ class RiskConfig(BaseModel):
     volatility_lookback_ticks: int = 20
     volatility_stop_mult: float = 1.0
     max_loss_per_stock_krw: int = 0  # 0이면 사용 안 함
+    # 슬리피지·체결지연 보수 반영(bps). 손절/익절 판단 시 매수가 불리하게 체결된 것으로 가정
+    slippage_bps: int = 0
+    # 변동성 틱 부족 시 하한(가격 대비 비율, 예: 0.005=0.5%). 장 초반 사이징 완화
+    volatility_floor_ratio: float = 0.005
     max_trades_per_day: int
     max_position_size_ratio: float
     trailing_stop_ratio: float = 0.0
@@ -154,6 +158,7 @@ class StockSelectionConfig(BaseModel):
     exclude_drawdown: bool = False
     max_drawdown_from_high_ratio: float = 0.02
     drawdown_filter_after_hhmm: str = "12:00"
+    kospi_only: bool = False  # True: 코스피만(코스닥 제외)
 
 class StrategyConfig(BaseModel):
     short_ma_period: int

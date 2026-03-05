@@ -47,6 +47,7 @@ class StockSelector:
         exclude_drawdown: Optional[bool] = None,
         max_drawdown_from_high_ratio: Optional[float] = None,
         drawdown_filter_after_hhmm: Optional[str] = None,
+        kospi_only: bool = False,  # True: 코스피만(거래소), False: 전체(코스피+코스닥)
     ):
         """
         Args:
@@ -98,6 +99,8 @@ class StockSelector:
             self.exclude_drawdown = bool(exclude_drawdown)
         self.max_drawdown_from_high_ratio = float(max_drawdown_from_high_ratio) if max_drawdown_from_high_ratio is not None else float(os.getenv("STOCK_SELECTION_MAX_DRAWDOWN_FROM_HIGH_RATIO", "0.02") or "0.02")
         self.drawdown_filter_after_hhmm = (drawdown_filter_after_hhmm or os.getenv("STOCK_SELECTION_DRAWDOWN_FILTER_AFTER_HHMM", "12:00")).strip()
+        # fid_input_iscd: 0000=전체, 0001=거래소(코스피), 1001=코스닥, 2001=코스피200
+        self.kospi_only = bool(kospi_only) if kospi_only is not None else (str(os.getenv("STOCK_SELECTION_KOSPI_ONLY", "false")).strip().lower() in ("1", "true", "t", "yes", "y", "on"))
         self.last_selected_stock_info: List[Dict[str, str]] = []
         self.last_error_message: str = ""
         self.last_debug: Dict[str, int] = {}
@@ -302,11 +305,13 @@ class StockSelector:
                     # 먼저 _url_fetch로 에러코드/메시지를 확보하고, OK면 output으로 DF 구성
                     api_url = "/uapi/domestic-stock/v1/ranking/fluctuation"
                     tr_id = "FHPST01700000"
+                    # fid_input_iscd: 0000=전체, 0001=거래소(코스피만), 1001=코스닥, 2001=코스피200
+                    fid_input_iscd = "0001" if getattr(self, "kospi_only", False) else "0000"
                     params = {
                         "fid_rsfl_rate2": str(max_change_pct),
                         "fid_cond_mrkt_div_code": "J",
                         "fid_cond_scr_div_code": "20170",
-                        "fid_input_iscd": "0000",
+                        "fid_input_iscd": fid_input_iscd,
                         # KIS는 1자리 코드(예: "0")를 요구하는 경우가 많음
                         "fid_rank_sort_cls_code": "0",
                         "fid_input_cnt_1": str(self.max_stocks * 3),

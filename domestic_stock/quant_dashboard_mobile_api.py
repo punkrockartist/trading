@@ -40,6 +40,403 @@ _signal_skip_log_lock = threading.Lock()
 _skip_stats_lock = threading.Lock()
 
 
+def _to_int(v, default: int = 0) -> int:
+    try:
+        if v is None:
+            return default
+        s = str(v).strip().replace(",", "")
+        if s == "":
+            return default
+        return int(float(s))
+    except Exception:
+        return default
+
+
+def _to_float(v, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return default
+        s = str(v).strip().replace(",", "")
+        if s == "":
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+
+def _pick_first(row: dict, keys: list):
+    for k in keys:
+        if k in row and row.get(k) not in (None, "", " "):
+            return row.get(k)
+    return None
+
+
+def _extract_exec_from_ccld_df(df, fallback_qty: int, fallback_px: float) -> dict:
+    """체결조회 output1에서 체결수량/가격을 최대한 안전하게 추정."""
+    try:
+        if df is None or getattr(df, "empty", True):
+            return {"qty": int(fallback_qty or 0), "px": float(fallback_px or 0.0), "fields": {}}
+        row = {}
+        try:
+            row = df.iloc[0].to_dict()
+        except Exception:
+            row = {}
+
+        qty_raw = _pick_first(row, [
+            "CCLD_QTY", "ccld_qty",
+            "TOT_CCLD_QTY", "tot_ccld_qty",
+            "CCLD_QTY_TOT", "ccld_qty_tot",
+            "ORD_QTY", "ord_qty",
+        ])
+        px_raw = _pick_first(row, [
+            "CCLD_UNPR", "ccld_unpr",
+            "CCLD_PRC", "ccld_prc",
+            "AVG_PRC", "avg_prc",
+            "AVG_UNPR", "avg_unpr",
+            "ORD_UNPR", "ord_unpr",
+        ])
+        qty = _to_int(qty_raw, int(fallback_qty or 0))
+        px = _to_float(px_raw, float(fallback_px or 0.0))
+        if qty <= 0:
+            qty = int(fallback_qty or 0)
+        if px <= 0:
+            px = float(fallback_px or 0.0)
+        return {"qty": int(qty), "px": float(px), "fields": row, "columns": list(df.columns)}
+    except Exception:
+        return {"qty": int(fallback_qty or 0), "px": float(fallback_px or 0.0), "fields": {}}
+
+
+def _reconcile_pending_orders_sync(max_per_run: int = 5, min_check_interval_sec: float = 2.0) -> List[dict]:
+    """
+    pending 주문을 조회해 체결되었으면 포지션/거래내역 반영 이벤트를 생성.
+    - 실제 I/O(inquire_daily_ccld) 포함: asyncio.to_thread로 호출되어야 함
+    """
+    events: List[dict] = []
+    try:
+        if not getattr(state, "is_running", False):
+            return events
+        if not getattr(state, "risk_manager", None) or not getattr(state, "trenv", None):
+            return events
+
+        rm = state.risk_manager
+        trenv = state.trenv
+        lock = getattr(rm, "_lock", None)
+
+        pending = getattr(rm, "_pending_orders", None)
+        if not isinstance(pending, dict) or not pending:
+            return events
+
+        if lock:
+            with lock:
+                if hasattr(rm, "_prune_pending_orders"):
+                    rm._prune_pending_orders()
+                keys_snapshot = sorted(list(pending.keys()))
+        else:
+            try:
+                if hasattr(rm, "_prune_pending_orders"):
+                    rm._prune_pending_orders()
+            except Exception:
+                pass
+            keys_snapshot = sorted(list(pending.keys()))
+
+        if not keys_snapshot:
+            return events
+
+        from domestic_stock_functions import inquire_daily_ccld
+
+        tz = timezone(timedelta(hours=9))
+        today = datetime.now(tz).strftime("%Y%m%d")
+        cano = getattr(trenv, "my_acct", "") or ""
+        acnt_prdt_cd = getattr(trenv, "my_prod", "") or ""
+        if not cano or not acnt_prdt_cd:
+            return events
+
+        now_ts = time.time()
+        checked = 0
+
+        for key in keys_snapshot:
+            if checked >= int(max_per_run or 0):
+                break
+            if lock:
+                with lock:
+                    item = dict(pending.get(key) or {})
+            else:
+                item = dict(pending.get(key) or {})
+            if not item:
+                continue
+            stock_code = str(item.get("stock_code") or "").strip().zfill(6)
+            side = str(item.get("side") or "").strip().lower()
+            env_dv = str(item.get("env_dv") or ("demo" if getattr(state, "is_paper_trading", True) else "real"))
+            qty_fallback = _to_int(item.get("quantity"), 0)
+            px_fallback = _to_float(item.get("price"), 0.0)
+            odno_orig_empty = not str(item.get("odno") or "").strip()
+            odno = str(item.get("odno") or "").strip()
+            if not stock_code or side not in ("buy", "sell"):
+                continue
+
+            try:
+                last_chk = float(item.get("last_check_ts") or 0.0)
+            except Exception:
+                last_chk = 0.0
+            if last_chk and (now_ts - last_chk) < float(min_check_interval_sec):
+                continue
+
+            try:
+                item["last_check_ts"] = now_ts
+                item["checks"] = int(item.get("checks") or 0) + 1
+                if lock:
+                    with lock:
+                        pending[key] = item
+                else:
+                    pending[key] = item
+            except Exception:
+                pass
+
+            sll_buy = "02" if side == "buy" else "01"
+
+            # ODNO가 없으면 우선 미체결 조회에서 ODNO를 확보 시도 (가능하면)
+            if not odno:
+                try:
+                    df_unf, _ = inquire_daily_ccld(
+                        env_dv=env_dv,
+                        pd_dv="inner",
+                        cano=cano,
+                        acnt_prdt_cd=acnt_prdt_cd,
+                        inqr_strt_dt=today,
+                        inqr_end_dt=today,
+                        sll_buy_dvsn_cd=sll_buy,
+                        ccld_dvsn="02",
+                        inqr_dvsn="00",
+                        inqr_dvsn_3="00",
+                        pdno=stock_code,
+                        odno="",
+                    )
+                    if df_unf is not None and getattr(df_unf, "empty", True) is False:
+                        try:
+                            row = df_unf.iloc[0].to_dict()
+                            odno2 = str(row.get("ODNO") or row.get("odno") or "").strip()
+                            if odno2:
+                                odno = odno2
+                                item["odno"] = odno2
+                                if lock:
+                                    with lock:
+                                        pending[key] = item
+                                else:
+                                    pending[key] = item
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            # 체결 조회(ODNO 있으면 정확도↑)
+            try:
+                df_filled, _ = inquire_daily_ccld(
+                    env_dv=env_dv,
+                    pd_dv="inner",
+                    cano=cano,
+                    acnt_prdt_cd=acnt_prdt_cd,
+                    inqr_strt_dt=today,
+                    inqr_end_dt=today,
+                    sll_buy_dvsn_cd=sll_buy,
+                    ccld_dvsn="01",
+                    inqr_dvsn="00",
+                    inqr_dvsn_3="00",
+                    pdno=stock_code,
+                    odno=odno,
+                )
+            except Exception:
+                df_filled = None
+
+            if df_filled is None or getattr(df_filled, "empty", True):
+                checked += 1
+                continue
+
+            exec_info = _extract_exec_from_ccld_df(df_filled, fallback_qty=qty_fallback, fallback_px=px_fallback)
+            exec_qty = int(exec_info.get("qty") or 0)
+            exec_px = float(exec_info.get("px") or 0.0)
+
+            if exec_qty <= 0 or exec_px <= 0:
+                checked += 1
+                continue
+
+            # ODNO 없이 접수된 pending: 동일 종목 다건 혼동 방지 — 수량·가격 일치 검증
+            if odno_orig_empty:
+                if exec_qty != qty_fallback:
+                    checked += 1
+                    continue
+                if px_fallback > 0 and abs(exec_px - px_fallback) / px_fallback > 0.05:
+                    checked += 1
+                    continue
+
+            # 포지션 반영
+            pnl = None
+            try:
+                if side == "buy":
+                    if stock_code in getattr(rm, "positions", {}):
+                        # 이미 반영된 케이스면 pending만 제거
+                        pass
+                    else:
+                        rm.update_position(stock_code, exec_px, exec_qty, "buy")
+                else:
+                    if stock_code in getattr(rm, "positions", {}):
+                        pnl = rm.update_position(stock_code, exec_px, exec_qty, "sell")
+                    else:
+                        # 포지션이 없으면 반영 불가: pending만 제거하지 않고 유지(운영자가 확인)
+                        checked += 1
+                        continue
+            except Exception:
+                checked += 1
+                continue
+
+            # pending clear
+            try:
+                if hasattr(rm, "clear_pending_order"):
+                    rm.clear_pending_order(stock_code, side=side)
+                else:
+                    pending.pop(key, None)
+            except Exception:
+                pending.pop(key, None)
+
+            events.append({
+                "kind": "pending_filled",
+                "stock_code": stock_code,
+                "side": side,
+                "qty": exec_qty,
+                "px": exec_px,
+                "pnl": pnl,
+                "env_dv": env_dv,
+                "odno": odno,
+            })
+            checked += 1
+
+        return events
+    except Exception:
+        return events
+
+
+def _check_balance_vs_positions_sync() -> Optional[str]:
+    """잔고 조회와 risk_manager.positions 비교, 불일치 시 경고 문구 반환. asyncio.to_thread로 호출."""
+    try:
+        if not getattr(state, "is_running", False):
+            return None
+        rm = getattr(state, "risk_manager", None)
+        trenv = getattr(state, "trenv", None)
+        if not rm or not trenv:
+            return None
+        from domestic_stock_functions import inquire_balance
+        env_dv = "demo" if getattr(state, "is_paper_trading", True) else "real"
+        cano = getattr(trenv, "my_acct", "") or ""
+        acnt_prdt_cd = getattr(trenv, "my_prod", "") or ""
+        if not cano or not acnt_prdt_cd:
+            return None
+        df1, _ = inquire_balance(
+            env_dv=env_dv,
+            cano=cano,
+            acnt_prdt_cd=acnt_prdt_cd,
+            afhr_flpr_yn="N",
+            inqr_dvsn="01",
+            unpr_dvsn="01",
+            fund_sttl_icld_yn="N",
+            fncg_amt_auto_rdpt_yn="N",
+            prcs_dvsn="00",
+        )
+        if df1 is None or getattr(df1, "empty", True):
+            pos_codes = set(getattr(rm, "positions", {}).keys())
+            if pos_codes:
+                return f"포지션 vs 잔고 불일치 가능: 잔고 조회 0건, 시스템 포지션 {len(pos_codes)}건"
+            return None
+        codes_from_balance = set()
+        for _, row in df1.iterrows():
+            code = str(row.get("PDNO") or row.get("pdno") or row.get("MKSC_SHRN_ISCD") or "").strip().zfill(6)
+            if code:
+                qty = _to_int(row.get("HOLD_QTY") or row.get("hold_qty") or row.get("ORD_PSBL_QTY"), 0)
+                if qty > 0:
+                    codes_from_balance.add(code)
+        pos_codes = set(getattr(rm, "positions", {}).keys())
+        only_balance = codes_from_balance - pos_codes
+        only_pos = pos_codes - codes_from_balance
+        if only_balance or only_pos:
+            return (
+                f"포지션 vs 잔고 불일치: 잔고만 있음 {sorted(only_balance)[:5]}{'…' if len(only_balance) > 5 else ''} "
+                f"/ 포지션만 있음 {sorted(only_pos)[:5]}{'…' if len(only_pos) > 5 else ''}"
+            )
+        return None
+    except Exception as e:
+        return f"잔고 비교 오류: {e}"
+
+
+async def _pending_order_reconciler_loop():
+    """시스템 구동 중 pending 주문을 주기적으로 체결 확인하여 반영."""
+    try:
+        interval = float(getattr(state, "pending_order_reconcile_interval_sec", 3.0) or 3.0)
+    except Exception:
+        interval = 3.0
+    interval = max(1.0, min(10.0, interval))
+    max_per_run = int(getattr(state, "pending_order_reconcile_max_per_run", 5) or 5)
+    max_per_run = max(1, min(20, max_per_run))
+    last_balance_check_ts = time.time()
+    BALANCE_CHECK_INTERVAL_SEC = 60.0
+
+    while True:
+        try:
+            if not getattr(state, "is_running", False):
+                break
+
+            events = await asyncio.to_thread(
+                _reconcile_pending_orders_sync,
+                max_per_run,
+                2.0,
+            )
+            if events:
+                for ev in events:
+                    try:
+                        side = str(ev.get("side") or "").lower()
+                        code = str(ev.get("stock_code") or "").strip().zfill(6)
+                        qty = int(ev.get("qty") or 0)
+                        px = float(ev.get("px") or 0.0)
+                        odno = str(ev.get("odno") or "").strip()
+                        env_dv = str(ev.get("env_dv") or "-")
+                        pnl = ev.get("pnl")
+
+                        await state.broadcast({
+                            "type": "log",
+                            "level": "info",
+                            "message": f"주문 체결 확인 | {side.upper()} {code} qty={qty} px={px:,.0f} env={env_dv} odno={odno or '-'}",
+                        })
+
+                        trade_info = {
+                            "stock_code": code,
+                            "order_type": side,
+                            "quantity": qty,
+                            "price": px,
+                            "pnl": pnl,
+                        }
+                        state.add_trade(trade_info)
+                        await state.broadcast({"type": "trade", "data": trade_info})
+                        await state.broadcast({"type": "position", "data": _build_positions_message()})
+                        await send_status_update()
+                    except Exception:
+                        continue
+
+            # 포지션 vs 잔고 불일치 주기 점검(60초 간격)
+            now_ts = time.time()
+            if now_ts - last_balance_check_ts >= BALANCE_CHECK_INTERVAL_SEC:
+                last_balance_check_ts = now_ts
+                try:
+                    msg = await asyncio.to_thread(_check_balance_vs_positions_sync)
+                    if msg:
+                        await state.broadcast({"type": "log", "level": "warning", "message": msg})
+                except Exception:
+                    pass
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"pending 주문 reconcile 오류(무시): {e}")
+
+        await asyncio.sleep(interval)
+
+
 def _record_buy_skip(stock_code: str, reason_key: str):
     """BUY 스킵 통계 누적(스레드 안전)."""
     try:
@@ -166,7 +563,9 @@ def _format_order_log(details: dict) -> str:
         qty = details.get("quantity", "-")
         price = details.get("price", "-")
         env_dv = details.get("env_dv", "-")
-        ok = details.get("ok", False)
+        ok = bool(details.get("ok", False))
+        filled = bool(details.get("filled", False))
+        status = str(details.get("status", "") or "").strip().lower()
 
         resp = details.get("order_response") or {}
         fields = resp.get("fields") or {}
@@ -176,7 +575,14 @@ def _format_order_log(details: dict) -> str:
         msg_cd = fields.get("MSG_CD") or fields.get("msg_cd") or ""
         rt_cd = fields.get("RT_CD") or fields.get("rt_cd") or ""
 
-        base = f"주문 {'성공' if ok else '실패'} | {signal} {stock_code} qty={qty} px={price} env={env_dv}"
+        if status == "accepted_pending" and ok and not filled:
+            verdict = "접수(대기)"
+        elif filled and ok:
+            verdict = "체결"
+        else:
+            verdict = "실패"
+
+        base = f"주문 {verdict} | {signal} {stock_code} qty={qty} px={price} env={env_dv}"
         tail = f" | odno={odno} t={ord_tmd}"
         if rt_cd or msg_cd or msg:
             tail += f" | rt_cd={rt_cd} msg_cd={msg_cd} msg={msg}"
@@ -512,7 +918,13 @@ def _handle_signal(stock_code: str, signal: str, price: float, reason: str, sugg
     if not result:
         _run_async_broadcast({"type": "log", "message": _format_order_log(details), "level": "error"})
         return
-    _run_async_broadcast({"type": "log", "message": _format_order_log(details), "level": "info"})
+
+    filled = bool(details.get("filled", False))
+    level = "info" if filled else "warning"
+    _run_async_broadcast({"type": "log", "message": _format_order_log(details), "level": level})
+    if not filled:
+        # 주문 접수는 되었으나 체결 미확정/미체결 상태면, 포지션/거래내역 반영은 보류
+        return
     # 부분매도(부분익절 등) 체결 시: 잔여 수량을 함께 로깅
     try:
         if signal == "sell" and state.risk_manager and stock_code in getattr(state.risk_manager, "positions", {}):
@@ -614,7 +1026,7 @@ def _start_trading_engine_thread():
                 except Exception:
                     pass
 
-                # 일일 이익 한도 도달 시: 기준(실현/합산)에 따라 신규매수 차단 + (합산일 때) 오늘 1회 전량 매도 신호 생성
+                # 일일 이익 한도 도달 시: 5초 디바운스 후 전량 매도/신규매수 차단 (flicker 방지)
                 try:
                     rm = getattr(state, "risk_manager", None)
                     if rm and getattr(rm, "positions", None):
@@ -628,37 +1040,45 @@ def _start_trading_engine_thread():
                                 total_if_liq = float(getattr(rm, "get_total_pnl", lambda: realized)() or realized)
                                 basis = str(getattr(rm, "daily_profit_limit_basis", "total") or "total").strip().lower()
                                 cur_pnl = total_if_liq if basis == "total" else realized
+                                now_ts = time.time()
                                 if cur_pnl >= float(limit):
-                                    state._profit_limit_done_day = today_key
-                                    try:
-                                        rm.halt_new_buys_day = today_key
-                                        rm.halt_new_buys_reason = f"일일 이익 한도({limit:,}원) 도달"
-                                    except Exception:
-                                        pass
-                                    if basis == "total":
-                                        _run_async_broadcast({
-                                            "type": "log",
-                                            "level": "warning",
-                                            "message": f"일일 이익 한도 도달(total): {cur_pnl:,.0f}원 >= {limit:,.0f}원 (전량 매도 신호 생성)",
-                                        })
-                                        for code, pos in list(rm.positions.items()):
-                                            qty = int(pos.get("quantity", 0) or 0)
-                                            if qty <= 0:
-                                                continue
-                                            px = float(pos.get("current_price") or rm.last_prices.get(code) or pos.get("buy_price") or 0)
-                                            if px <= 0:
-                                                continue
-                                            _handle_signal(code, "sell", px, f"일일 이익 한도({limit:,}원) 도달", suggested_qty_override=qty)
-                                    else:
-                                        _run_async_broadcast({
-                                            "type": "log",
-                                            "level": "warning",
-                                            "message": f"일일 이익 한도 도달(realized): {cur_pnl:,.0f}원 >= {limit:,.0f}원 (신규매수 차단)",
-                                        })
+                                    triggered_at = getattr(state, "_profit_limit_triggered_at", 0.0) or 0.0
+                                    if triggered_at == 0.0:
+                                        state._profit_limit_triggered_at = now_ts
+                                    elif (now_ts - triggered_at) >= 5.0:
+                                        state._profit_limit_done_day = today_key
+                                        state._profit_limit_triggered_at = 0.0
+                                        try:
+                                            rm.halt_new_buys_day = today_key
+                                            rm.halt_new_buys_reason = f"일일 이익 한도({limit:,}원) 도달"
+                                        except Exception:
+                                            pass
+                                        if basis == "total":
+                                            _run_async_broadcast({
+                                                "type": "log",
+                                                "level": "warning",
+                                                "message": f"일일 이익 한도 도달(total): {cur_pnl:,.0f}원 >= {limit:,.0f}원 (전량 매도 신호 생성)",
+                                            })
+                                            for code, pos in list(rm.positions.items()):
+                                                qty = int(pos.get("quantity", 0) or 0)
+                                                if qty <= 0:
+                                                    continue
+                                                px = float(pos.get("current_price") or rm.last_prices.get(code) or pos.get("buy_price") or 0)
+                                                if px <= 0:
+                                                    continue
+                                                _handle_signal(code, "sell", px, f"일일 이익 한도({limit:,}원) 도달", suggested_qty_override=qty)
+                                        else:
+                                            _run_async_broadcast({
+                                                "type": "log",
+                                                "level": "warning",
+                                                "message": f"일일 이익 한도 도달(realized): {cur_pnl:,.0f}원 >= {limit:,.0f}원 (신규매수 차단)",
+                                            })
+                                else:
+                                    state._profit_limit_triggered_at = 0.0
                 except Exception:
                     pass
 
-                # 일일 손실 한도(total basis) 도달 시: 합산 손익이 -한도 이하이면 오늘 1회 전량 매도 + 신규매수 차단
+                # 일일 손실 한도(total basis) 도달 시: 5초 디바운스 후 전량 매도 + 신규매수 차단
                 try:
                     rm = getattr(state, "risk_manager", None)
                     if rm and getattr(rm, "positions", None):
@@ -671,36 +1091,43 @@ def _start_trading_engine_thread():
                             if getattr(state, "_loss_limit_total_done_day", "") != today_key:
                                 realized = float(getattr(rm, "daily_pnl", 0.0) or 0.0)
                                 total_if_liq = float(getattr(rm, "get_total_pnl", lambda: realized)() or realized)
+                                now_ts = time.time()
                                 if total_if_liq <= -float(limit):
-                                    state._loss_limit_total_done_day = today_key
-                                    try:
-                                        rm.halt_new_buys_day = today_key
-                                        rm.halt_new_buys_reason = f"일일 손실 한도(total)({limit:,}원) 도달"
-                                    except Exception:
-                                        pass
-                                    _run_async_broadcast({
-                                        "type": "log",
-                                        "level": "error",
-                                        "message": f"일일 손실 한도(total) 도달: {total_if_liq:,.0f}원 <= -{limit:,.0f}원 (전량 매도 신호 생성)",
-                                    })
-                                    for code, pos in list(rm.positions.items()):
-                                        qty = int(pos.get("quantity", 0) or 0)
-                                        if qty <= 0:
-                                            continue
-                                        px = float(pos.get("current_price") or rm.last_prices.get(code) or pos.get("buy_price") or 0)
-                                        if px <= 0:
-                                            continue
-                                        _handle_signal(code, "sell", px, f"일일 손실 한도(total)({limit:,}원) 도달", suggested_qty_override=qty)
+                                    triggered_at = getattr(state, "_loss_limit_total_triggered_at", 0.0) or 0.0
+                                    if triggered_at == 0.0:
+                                        state._loss_limit_total_triggered_at = now_ts
+                                    elif (now_ts - triggered_at) >= 5.0:
+                                        state._loss_limit_total_done_day = today_key
+                                        state._loss_limit_total_triggered_at = 0.0
+                                        try:
+                                            rm.halt_new_buys_day = today_key
+                                            rm.halt_new_buys_reason = f"일일 손실 한도(total)({limit:,}원) 도달"
+                                        except Exception:
+                                            pass
+                                        _run_async_broadcast({
+                                            "type": "log",
+                                            "level": "error",
+                                            "message": f"일일 손실 한도(total) 도달: {total_if_liq:,.0f}원 <= -{limit:,.0f}원 (전량 매도 신호 생성)",
+                                        })
+                                        for code, pos in list(rm.positions.items()):
+                                            qty = int(pos.get("quantity", 0) or 0)
+                                            if qty <= 0:
+                                                continue
+                                            px = float(pos.get("current_price") or rm.last_prices.get(code) or pos.get("buy_price") or 0)
+                                            if px <= 0:
+                                                continue
+                                            _handle_signal(code, "sell", px, f"일일 손실 한도(total)({limit:,}원) 도달", suggested_qty_override=qty)
+                                else:
+                                    state._loss_limit_total_triggered_at = 0.0
                 except Exception:
                     pass
 
-                # (레거시/추가) 일일 손실 한도(합산 전용 필드) 도달 시: 오늘 1회 전량 매도 + 신규매수 차단
+                # (레거시) 일일 손실 한도(합산 전용 필드) 도달 시: 5초 디바운스 후 전량 매도 + 신규매수 차단
                 try:
                     rm = getattr(state, "risk_manager", None)
                     if rm and getattr(rm, "positions", None):
                         limit = int(getattr(rm, "daily_total_loss_limit", 0) or 0)
                         basis = str(getattr(rm, "daily_loss_limit_basis", "realized") or "realized").strip().lower()
-                        # 신규 total-basis를 쓰는 경우에는 레거시 트리거는 비활성(중복 방지)
                         if basis == "total":
                             limit = 0
                         if limit and limit > 0:
@@ -710,26 +1137,34 @@ def _start_trading_engine_thread():
                             if getattr(state, "_total_loss_limit_done_day", "") != today_key:
                                 realized = float(getattr(rm, "daily_pnl", 0.0) or 0.0)
                                 total_if_liq = float(getattr(rm, "get_total_pnl", lambda: realized)() or realized)
+                                now_ts = time.time()
                                 if total_if_liq <= -float(limit):
-                                    state._total_loss_limit_done_day = today_key
-                                    try:
-                                        rm.halt_new_buys_day = today_key
-                                        rm.halt_new_buys_reason = f"일일 손실 한도(합산)({limit:,}원) 도달"
-                                    except Exception:
-                                        pass
-                                    _run_async_broadcast({
-                                        "type": "log",
-                                        "level": "error",
-                                        "message": f"일일 손실 한도(합산) 도달: {total_if_liq:,.0f}원 <= -{limit:,.0f}원 (전량 매도 신호 생성)",
-                                    })
-                                    for code, pos in list(rm.positions.items()):
-                                        qty = int(pos.get("quantity", 0) or 0)
-                                        if qty <= 0:
-                                            continue
-                                        px = float(pos.get("current_price") or rm.last_prices.get(code) or pos.get("buy_price") or 0)
-                                        if px <= 0:
-                                            continue
-                                        _handle_signal(code, "sell", px, f"일일 손실 한도(합산)({limit:,}원) 도달", suggested_qty_override=qty)
+                                    triggered_at = getattr(state, "_total_loss_limit_triggered_at", 0.0) or 0.0
+                                    if triggered_at == 0.0:
+                                        state._total_loss_limit_triggered_at = now_ts
+                                    elif (now_ts - triggered_at) >= 5.0:
+                                        state._total_loss_limit_done_day = today_key
+                                        state._total_loss_limit_triggered_at = 0.0
+                                        try:
+                                            rm.halt_new_buys_day = today_key
+                                            rm.halt_new_buys_reason = f"일일 손실 한도(합산)({limit:,}원) 도달"
+                                        except Exception:
+                                            pass
+                                        _run_async_broadcast({
+                                            "type": "log",
+                                            "level": "error",
+                                            "message": f"일일 손실 한도(합산) 도달: {total_if_liq:,.0f}원 <= -{limit:,.0f}원 (전량 매도 신호 생성)",
+                                        })
+                                        for code, pos in list(rm.positions.items()):
+                                            qty = int(pos.get("quantity", 0) or 0)
+                                            if qty <= 0:
+                                                continue
+                                            px = float(pos.get("current_price") or rm.last_prices.get(code) or pos.get("buy_price") or 0)
+                                            if px <= 0:
+                                                continue
+                                            _handle_signal(code, "sell", px, f"일일 손실 한도(합산)({limit:,}원) 도달", suggested_qty_override=qty)
+                                else:
+                                    state._total_loss_limit_triggered_at = 0.0
                 except Exception:
                     pass
 
@@ -1187,6 +1622,15 @@ def _start_trading_engine_thread():
                         if signal_type:
                             # 신규 매수 시간대 제한 (KST 기준). 매도는 항상 허용.
                             if signal_type == "buy":
+                                # 잔고보다 현재가가 큰 종목은 매수 불가 -> 신호 감지에서 제외
+                                try:
+                                    balance = float(getattr(state.risk_manager, "account_balance", 0) or 0)
+                                    if balance > 0 and current_price > balance:
+                                        _record_buy_skip(stock_code, "balance")
+                                        _throttled_skip_log(stock_code, f"잔고({balance:,.0f}원) 미만 현재가({current_price:,.0f}원) 제외", ttl_sec=10)
+                                        continue
+                                except Exception:
+                                    pass
                                 try:
                                     tz = timezone(timedelta(hours=9))
                                     now_t = datetime.now(tz).time()
@@ -1457,6 +1901,16 @@ async def start_system(current_user: str = Depends(get_current_user)):
 
         state.is_running = True
         _start_trading_engine_thread()
+        # pending 주문 체결 확인 루프 시작(중복 방지)
+        try:
+            t = getattr(state, "pending_order_reconciler_task", None)
+            if t is None or getattr(t, "done", lambda: True)():
+                state.pending_order_reconciler_task = asyncio.create_task(_pending_order_reconciler_loop())
+        except Exception:
+            try:
+                state.pending_order_reconciler_task = asyncio.create_task(_pending_order_reconciler_loop())
+            except Exception:
+                pass
         await send_status_update()
 
         return JSONResponse({"success": True, "message": f"시스템 시작 (감시 종목: {', '.join(state.selected_stocks)})"})
@@ -1522,8 +1976,22 @@ async def stop_system(
     """시스템 중지"""
     try:
         state.is_running = False
+        # pending 주문 reconcile 루프 중지
+        try:
+            t = getattr(state, "pending_order_reconciler_task", None)
+            if t is not None and hasattr(t, "cancel"):
+                t.cancel()
+            state.pending_order_reconciler_task = None
+        except Exception:
+            pass
         with pending_signals_lock:
             state.pending_signals = {}
+        # pending 주문도 초기화(재시작 시 매수/매도 막힘 방지)
+        try:
+            if getattr(state, "risk_manager", None) and hasattr(state.risk_manager, "_pending_orders"):
+                state.risk_manager._pending_orders = {}
+        except Exception:
+            pass
 
         if liquidate and state.risk_manager and state.strategy and state.trenv:
             positions_snapshot = list(state.risk_manager.positions.items())
@@ -1603,6 +2071,122 @@ async def get_trades(limit: int = 50, current_user: str = Depends(get_current_us
     return JSONResponse(state.trade_history[-limit:])
 
 
+def _performance_summary_from_trades() -> dict:
+    """trade_history 기반 일일·세션 성과 및 권장 설정 추천."""
+    tz = timezone(timedelta(hours=9))
+    today_str = datetime.now(tz).strftime("%Y-%m-%d")
+    history = getattr(state, "trade_history", []) or []
+    today_trades = []
+    for t in history:
+        ts = t.get("timestamp") or ""
+        if isinstance(ts, str) and ts.startswith(today_str):
+            today_trades.append(t)
+        elif isinstance(ts, str) and "T" in ts:
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone(timedelta(hours=9)))
+                if dt.strftime("%Y-%m-%d") == today_str:
+                    today_trades.append(t)
+            except Exception:
+                pass
+
+    total_pnl = 0.0
+    wins = 0
+    losses = 0
+    pnls = []
+    for t in today_trades:
+        pnl = t.get("pnl")
+        if pnl is not None:
+            try:
+                v = float(pnl)
+                total_pnl += v
+                pnls.append(v)
+                if v > 0:
+                    wins += 1
+                elif v < 0:
+                    losses += 1
+            except Exception:
+                pass
+    trade_count = len(pnls)
+    win_rate = (wins / trade_count * 100.0) if trade_count else 0.0
+    avg_win = (sum(p for p in pnls if p > 0) / wins) if wins else 0.0
+    avg_loss = (sum(p for p in pnls if p < 0) / losses) if losses else 0.0
+
+    # 세션 최대 낙폭: 시간순 누적 PnL에서 peak 대비 하락
+    cumulative = 0.0
+    peak = 0.0
+    max_drawdown = 0.0
+    for t in sorted(today_trades, key=lambda x: x.get("timestamp") or ""):
+        pnl = t.get("pnl")
+        if pnl is not None:
+            try:
+                cumulative += float(pnl)
+                if cumulative > peak:
+                    peak = cumulative
+                dd = peak - cumulative
+                if dd > max_drawdown:
+                    max_drawdown = dd
+            except Exception:
+                pass
+    balance_ref = float(getattr(state.risk_manager, "account_balance", 0) or 0) or 100000.0
+    max_drawdown_pct = (max_drawdown / balance_ref * 100.0) if balance_ref else 0.0
+
+    # 성과 기반 권장 설정
+    recommendations = []
+    if trade_count >= 3 and win_rate < 35.0:
+        recommendations.append({
+            "level": "warning",
+            "message": "오늘 승률이 낮습니다. 손절 비율 강화 또는 진입 조건(보강/필터) 강화를 권장합니다.",
+        })
+    if trade_count >= 1 and max_drawdown_pct > 3.0:
+        recommendations.append({
+            "level": "warning",
+            "message": f"세션 최대 낙폭이 {max_drawdown_pct:.1f}%입니다. 일일 손실 한도·포지션 크기를 확인하세요.",
+        })
+    consecutive = 0
+    for p in reversed(pnls):
+        if p < 0:
+            consecutive += 1
+        else:
+            break
+    if consecutive >= 3:
+        recommendations.append({
+            "level": "info",
+            "message": "연속 손실이 발생했습니다. 재진입 쿨다운 확대 또는 변동성 사이징 검토를 권장합니다.",
+        })
+    if trade_count >= 5 and win_rate >= 60.0 and max_drawdown_pct < 1.0:
+        recommendations.append({
+            "level": "success",
+            "message": "오늘 성과가 안정적입니다. 현재 설정 유지 또는 보수적 완화만 검토하세요.",
+        })
+
+    return {
+        "date": today_str,
+        "trade_count": trade_count,
+        "wins": wins,
+        "losses": losses,
+        "total_pnl": round(total_pnl, 0),
+        "win_rate_pct": round(win_rate, 1),
+        "avg_win": round(avg_win, 0),
+        "avg_loss": round(avg_loss, 0),
+        "session_max_drawdown": round(max_drawdown, 0),
+        "session_max_drawdown_pct": round(max_drawdown_pct, 2),
+        "recommendations": recommendations,
+    }
+
+
+@app.get("/api/performance/summary")
+async def get_performance_summary(current_user: str = Depends(get_current_user)):
+    """일일·세션 성과 요약 및 성과 기반 권장 설정."""
+    try:
+        summary = _performance_summary_from_trades()
+        return JSONResponse({"success": True, "summary": summary})
+    except Exception as e:
+        logger.exception(e)
+        return JSONResponse({"success": False, "message": str(e)})
+
+
 @app.get("/api/signals/pending")
 async def get_pending_signals(current_user: str = Depends(get_current_user)):
     """승인 대기 신호 목록 조회"""
@@ -1649,10 +2233,11 @@ async def approve_signal(signal_id: str, current_user: str = Depends(get_current
         return_details=True,
         quantity_override=int(signal_data.get("suggested_qty") or 0) or None,
     )
-    await state.broadcast({"type": "log", "message": _format_order_log(details), "level": "info" if result else "error"})
+    filled = bool(details.get("filled", False))
+    await state.broadcast({"type": "log", "message": _format_order_log(details), "level": "info" if (result and filled) else ("warning" if result else "error")})
     # 부분매도(부분익절 등) 체결 시: 잔여 수량을 함께 로깅
     try:
-        if result and signal_data.get("signal") == "sell" and state.risk_manager:
+        if result and filled and signal_data.get("signal") == "sell" and state.risk_manager:
             code = str(signal_data.get("stock_code") or "").strip().zfill(6)
             if code and code in getattr(state.risk_manager, "positions", {}):
                 remain = int(state.risk_manager.positions[code].get("quantity") or 0)
@@ -1672,7 +2257,10 @@ async def approve_signal(signal_id: str, current_user: str = Depends(get_current
 
     with pending_signals_lock:
         if signal_id in state.pending_signals:
-            state.pending_signals[signal_id]["status"] = "approved" if result else "failed"
+            if not result:
+                state.pending_signals[signal_id]["status"] = "failed"
+            else:
+                state.pending_signals[signal_id]["status"] = "approved" if filled else "approved_pending"
             resolved = state.pending_signals[signal_id]
             state.pending_signals.pop(signal_id, None)
         else:
@@ -1766,11 +2354,17 @@ async def update_risk_config(config: RiskConfig, current_user: str = Depends(get
             state.risk_manager.volatility_lookback_ticks = int(getattr(config, "volatility_lookback_ticks", 20) or 20)
             state.risk_manager.volatility_stop_mult = float(getattr(config, "volatility_stop_mult", 1.0) or 1.0)
             state.risk_manager.max_loss_per_stock_krw = int(getattr(config, "max_loss_per_stock_krw", 0) or 0)
+            state.risk_manager.slippage_bps = int(getattr(config, "slippage_bps", 0) or 0)
+            state.risk_manager.slippage_bps = max(0, min(500, state.risk_manager.slippage_bps))
+            state.risk_manager.volatility_floor_ratio = float(getattr(config, "volatility_floor_ratio", 0.005) or 0.005)
+            state.risk_manager.volatility_floor_ratio = max(0.0, min(0.05, state.risk_manager.volatility_floor_ratio))
         except Exception:
             state.risk_manager.enable_volatility_sizing = False
             state.risk_manager.volatility_lookback_ticks = 20
             state.risk_manager.volatility_stop_mult = 1.0
             state.risk_manager.max_loss_per_stock_krw = 0
+            state.risk_manager.slippage_bps = 0
+            state.risk_manager.volatility_floor_ratio = 0.005
         state.risk_manager.max_trades_per_day = config.max_trades_per_day
         state.risk_manager.max_position_size_ratio = config.max_position_size_ratio
         state.risk_manager.trailing_stop_ratio = getattr(config, "trailing_stop_ratio", 0.0) or 0.0
@@ -1967,6 +2561,7 @@ async def update_stock_selection_config(config: StockSelectionConfig, current_us
             exclude_drawdown=bool(getattr(config, "exclude_drawdown", False)),
             max_drawdown_from_high_ratio=float(getattr(config, "max_drawdown_from_high_ratio", 0.02) or 0.02),
             drawdown_filter_after_hhmm=getattr(config, "drawdown_filter_after_hhmm", "12:00"),
+            kospi_only=bool(getattr(config, "kospi_only", False)),
         )
 
         store = _get_user_settings_store()
@@ -2096,10 +2691,11 @@ async def execute_manual_order(order: ManualOrder, current_user: str = Depends(g
             return_details=True,
             quantity_override=int(order.quantity or 0) or None,
         )
-        await state.broadcast({"type": "log", "message": _format_order_log(details), "level": "info" if result else "error"})
+        filled = bool(details.get("filled", False))
+        await state.broadcast({"type": "log", "message": _format_order_log(details), "level": "info" if (result and filled) else ("warning" if result else "error")})
         # 수동 매도에서도 부분매도 체결 시 잔여 수량 표시
         try:
-            if result and str(order.order_type).lower() == "sell" and state.risk_manager:
+            if result and filled and str(order.order_type).lower() == "sell" and state.risk_manager:
                 code = str(order.stock_code or "").strip().zfill(6)
                 if code and code in getattr(state.risk_manager, "positions", {}):
                     remain = int(state.risk_manager.positions[code].get("quantity") or 0)
@@ -2117,7 +2713,7 @@ async def execute_manual_order(order: ManualOrder, current_user: str = Depends(g
         except Exception:
             pass
         
-        if result:
+        if result and filled:
             qty = order.quantity
             try:
                 qty = int(details.get("quantity") or qty)
@@ -2135,8 +2731,9 @@ async def execute_manual_order(order: ManualOrder, current_user: str = Depends(g
             await send_status_update()
             
             return JSONResponse({"success": True, "message": "주문이 실행되었습니다.", "order_details": details})
-        else:
-            return JSONResponse({"success": False, "message": "주문 실행에 실패했습니다.", "order_details": details})
+        if result and not filled:
+            return JSONResponse({"success": True, "message": "주문이 접수되었지만 체결 대기/미체결 상태입니다. (포지션 반영 보류)", "order_details": details})
+        return JSONResponse({"success": False, "message": "주문 실행에 실패했습니다.", "order_details": details})
     except Exception as e:
         logger.error(f"수동 주문 오류: {e}")
         return JSONResponse({"success": False, "message": str(e)})
@@ -2180,6 +2777,7 @@ def initialize_trading_system(
             exclude_drawdown=False,
             max_drawdown_from_high_ratio=0.02,
             drawdown_filter_after_hhmm="12:00",
+            kospi_only=False,
         )
         
         state.risk_manager = risk_manager

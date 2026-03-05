@@ -13,6 +13,7 @@
 
 import sys
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 import time
 from typing import Dict, Optional, Tuple
@@ -78,6 +79,10 @@ class RiskManager:
         self.volatility_lookback_ticks = 20
         self.volatility_stop_mult = 1.0
         self.max_loss_per_stock_krw = 0
+        # 장 초반 등 틱 부족 시 변동성 하한(가격 대비 비율, 예: 0.005=0.5%). 0이면 미적용
+        self.volatility_floor_ratio = 0.005
+        # 슬리피지·체결지연 보수적 반영(bps). 매수 시 불리한 방향으로 가정해 손익 판단 시 사용
+        self.slippage_bps = 0
         
         # 거래 제한
         self.max_trades_per_day = 5  # 하루 최대 거래 횟수 (매수+매도 = 1회)
@@ -89,12 +94,18 @@ class RiskManager:
         self.positions: Dict[str, Dict] = {}  # {종목코드: {매수가, 수량, 시간}}
         self.last_prices: Dict[str, float] = {}  # 가격 변동 추적용
         self._price_history: Dict[str, list] = {}  # 변동성 계산용(최근 N틱 가격)
+        # 주문 접수는 됐지만 체결이 확정되지 않은 상태(중복 주문 방지용)
+        # key: "{stock_code}:{side}" where side in {"buy","sell"}
+        self._pending_orders: Dict[str, Dict] = {}
+        self.pending_order_ttl_seconds = 120
         # 재진입 쿨다운
         self.reentry_cooldown_seconds = 0
         self._last_exit_at: Dict[str, datetime] = {}
         self._last_exit_reason: Dict[str, str] = {}
         # 포지션별 고점 추적 (트레일링 스탑)
         self._highest_price: Dict[str, float] = {}
+        # 동시성: 엔진 스레드 vs reconcile 루프에서 positions/_pending_orders 보호
+        self._lock = threading.Lock()
         
     def can_trade(self, stock_code: str, price: float, quantity: int) -> Tuple[bool, str]:
         """
@@ -156,6 +167,14 @@ class RiskManager:
         if stock_code in self.positions:
             return False, "이미 보유 중인 종목"
 
+        # 5-0. pending 주문이 있으면 중복 주문 방지(특히 지정가/응답 애매 케이스)
+        try:
+            self._prune_pending_orders()
+            if self.has_pending_order(stock_code=stock_code, side="buy"):
+                return False, "체결 대기 중인 매수 주문이 있습니다"
+        except Exception:
+            pass
+
         # 5-1. 재진입 쿨다운(직전 매도 직후 재매수 방지)
         if self.reentry_cooldown_seconds and self.reentry_cooldown_seconds > 0:
             last_exit = self._last_exit_at.get(stock_code)
@@ -185,6 +204,72 @@ class RiskManager:
             pass
         
         return True, "OK"
+
+    def _pending_key(self, stock_code: str, side: str) -> str:
+        return f"{str(stock_code).strip().zfill(6)}:{str(side).strip().lower()}"
+
+    def _prune_pending_orders(self) -> None:
+        """호출 시 _lock을 선점한 상태에서 호출해야 함."""
+        try:
+            ttl = int(getattr(self, "pending_order_ttl_seconds", 120) or 120)
+        except Exception:
+            ttl = 120
+        ttl = max(5, min(3600, ttl))
+        now = time.time()
+        for k, v in list(self._pending_orders.items()):
+            try:
+                ts = float((v or {}).get("ts") or 0)
+            except Exception:
+                ts = 0
+            if not ts or (now - ts) > ttl:
+                self._pending_orders.pop(k, None)
+
+    def has_pending_order(self, stock_code: str, side: Optional[str] = None) -> bool:
+        with self._lock:
+            self._prune_pending_orders()
+            code = str(stock_code).strip().zfill(6)
+            if side:
+                return self._pending_key(code, side) in self._pending_orders
+            prefix = f"{code}:"
+            return any(k.startswith(prefix) for k in list(self._pending_orders.keys()))
+
+    def set_pending_order(
+        self,
+        stock_code: str,
+        side: str,
+        quantity: int,
+        price: float,
+        env_dv: str,
+        odno: str = "",
+        reason: str = "",
+    ) -> None:
+        with self._lock:
+            self._prune_pending_orders()
+            k = self._pending_key(stock_code, side)
+            self._pending_orders[k] = {
+                "ts": time.time(),
+                "last_check_ts": 0.0,
+                "checks": 0,
+                "stock_code": str(stock_code).strip().zfill(6),
+                "side": str(side).strip().lower(),
+                "quantity": int(quantity or 0),
+                "price": float(price or 0),
+                "env_dv": str(env_dv or ""),
+                "odno": str(odno or "").strip(),
+                "reason": str(reason or ""),
+            }
+
+    def clear_pending_order(self, stock_code: str, side: Optional[str] = None) -> None:
+        with self._lock:
+            self._prune_pending_orders()
+            code = str(stock_code).strip().zfill(6)
+            if side:
+                self._pending_orders.pop(self._pending_key(code, side), None)
+                return
+            prefix = f"{code}:"
+            for k in list(self._pending_orders.keys()):
+                if k.startswith(prefix):
+                    self._pending_orders.pop(k, None)
     
     def calculate_quantity(self, price: float) -> int:
         """
@@ -235,8 +320,28 @@ class RiskManager:
             mult = max(0.1, min(10.0, mult))
 
             hist = self._price_history.get(stock_code) or []
+            stop_by_ratio = float(getattr(self, "stop_loss_ratio", 0.0) or 0.0) * float(price)
+            floor_ratio = float(getattr(self, "volatility_floor_ratio", 0.0) or 0.0)
+            floor_ratio = max(0.0, min(0.05, floor_ratio))
+            vol_floor = float(price) * floor_ratio if floor_ratio > 0 else 0.0
+
             if len(hist) < lookback + 1:
-                return int(fallback_quantity)
+                # 틱 부족 시 변동성 플로어로 사이징(장 초반 보수적 과소 수량 완화)
+                if vol_floor <= 0:
+                    return int(fallback_quantity)
+                risk_per_share = max(stop_by_ratio, vol_floor)
+                if risk_per_share <= 0:
+                    return int(fallback_quantity)
+                qty_risk = int(max_loss / risk_per_share)
+                if qty_risk <= 0:
+                    return int(fallback_quantity)
+                max_trade_amount = min(
+                    float(getattr(self, "max_single_trade_amount", 0) or 0),
+                    float(getattr(self, "account_balance", 0) or 0) * float(getattr(self, "max_position_size_ratio", 0) or 0),
+                )
+                qty_amount = int(max_trade_amount / price) if max_trade_amount > 0 else qty_risk
+                min_q = max(1, int(self.min_order_quantity or 1))
+                return max(min_q, min(qty_risk, qty_amount))
 
             diffs = []
             start = max(1, len(hist) - (lookback + 1))
@@ -246,10 +351,22 @@ class RiskManager:
                 except Exception:
                     continue
             if not diffs:
+                if vol_floor > 0:
+                    risk_per_share = max(stop_by_ratio, vol_floor)
+                    qty_risk = int(max_loss / risk_per_share)
+                    if qty_risk > 0:
+                        max_trade_amount = min(
+                            float(getattr(self, "max_single_trade_amount", 0) or 0),
+                            float(getattr(self, "account_balance", 0) or 0) * float(getattr(self, "max_position_size_ratio", 0) or 0),
+                        )
+                        qty_amount = int(max_trade_amount / price) if max_trade_amount > 0 else qty_risk
+                        min_q = max(1, int(self.min_order_quantity or 1))
+                        return max(min_q, min(qty_risk, qty_amount))
                 return int(fallback_quantity)
             avg_abs = float(sum(diffs) / float(len(diffs)))
-            stop_by_ratio = float(getattr(self, "stop_loss_ratio", 0.0) or 0.0) * float(price)
             risk_per_share = max(stop_by_ratio, mult * avg_abs)
+            if vol_floor > 0:
+                risk_per_share = max(risk_per_share, vol_floor)
             if risk_per_share <= 0:
                 return int(fallback_quantity)
 
@@ -276,7 +393,11 @@ class RiskManager:
             return int(fallback_quantity)
     
     def update_position(self, stock_code: str, price: float, quantity: int, action: str):
-        """포지션 업데이트"""
+        """포지션 업데이트 (lock으로 동시성 보호)"""
+        with self._lock:
+            return self._update_position_impl(stock_code, price, quantity, action)
+
+    def _update_position_impl(self, stock_code: str, price: float, quantity: int, action: str):
         if action == "buy":
             self.positions[stock_code] = {
                 "buy_price": price,
@@ -385,7 +506,14 @@ class RiskManager:
         if buy_price <= 0 or qty <= 0:
             return None
 
-        change_ratio = (float(current_price) - buy_price) / buy_price
+        # 슬리피지 보수 반영: 매수 시 불리하게 체결된 것으로 가정한 기준가
+        try:
+            bps = float(getattr(self, "slippage_bps", 0) or 0)
+            bps = max(0.0, min(500.0, bps))
+            effective_buy = buy_price * (1.0 + bps / 10000.0)
+        except Exception:
+            effective_buy = buy_price
+        change_ratio = (float(current_price) - effective_buy) / effective_buy if effective_buy > 0 else 0.0
 
         # 손절
         if self.stop_loss_ratio and change_ratio <= -float(self.stop_loss_ratio):
@@ -446,8 +574,16 @@ class RiskManager:
         if stock_code not in self.positions:
             return None
         
-        buy_price = self.positions[stock_code]["buy_price"]
-        change_ratio = (current_price - buy_price) / buy_price
+        buy_price = float(self.positions[stock_code].get("buy_price") or 0)
+        if buy_price <= 0:
+            return None
+        try:
+            bps = float(getattr(self, "slippage_bps", 0) or 0)
+            bps = max(0.0, min(500.0, bps))
+            effective_buy = buy_price * (1.0 + bps / 10000.0)
+        except Exception:
+            effective_buy = buy_price
+        change_ratio = (current_price - effective_buy) / effective_buy if effective_buy > 0 else 0.0
         
         # 손절매
         if change_ratio <= -self.stop_loss_ratio:
@@ -581,7 +717,7 @@ def _extract_order_response(df):
     """order_cash 응답 DataFrame에서 핵심 필드만 추출."""
     try:
         if df is None or getattr(df, "empty", True):
-            return {"ok": False}
+            return {"ok": False, "accepted": False, "confidence": "none"}
         row = df.iloc[0].to_dict() if len(df.index) > 0 else {}
         # 흔히 쓰이는 키 후보들(존재하는 것만 반환)
         keys = [
@@ -595,10 +731,127 @@ def _extract_order_response(df):
             "RT_CD", "rt_cd",
         ]
         picked = {k: row.get(k) for k in keys if k in row}
+        odno = picked.get("ODNO") or picked.get("odno") or ""
+        rt_cd = picked.get("RT_CD") or picked.get("rt_cd") or ""
+        msg_cd = picked.get("MSG_CD") or picked.get("msg_cd") or ""
+        msg = picked.get("MSG1") or picked.get("msg1") or ""
+
+        accepted = False
+        confidence = "weak"
+        try:
+            if str(odno).strip():
+                accepted = True
+                confidence = "strong"
+            else:
+                # ODNO가 없더라도 RT_CD=0은 성공으로 내려오는 경우가 있어 보수적으로 인정
+                if str(rt_cd).strip() in {"0", "00"}:
+                    accepted = True
+                    confidence = "medium"
+        except Exception:
+            accepted = False
+            confidence = "weak"
+
         # 키가 예상과 다르면 최소한의 힌트를 위해 컬럼 목록 제공(값은 제외)
-        return {"ok": True, "fields": picked, "columns": list(df.columns)}
+        return {
+            "ok": True,
+            "accepted": bool(accepted),
+            "confidence": confidence,
+            "fields": picked,
+            "columns": list(df.columns),
+            "summary": {
+                "odno": str(odno).strip() if odno is not None else "",
+                "rt_cd": str(rt_cd).strip() if rt_cd is not None else "",
+                "msg_cd": str(msg_cd).strip() if msg_cd is not None else "",
+                "msg": str(msg).strip() if msg is not None else "",
+            },
+        }
     except Exception:
-        return {"ok": False}
+        return {"ok": False, "accepted": False, "confidence": "none"}
+
+
+def _check_unfilled_order_acceptance(env_dv: str, trenv, ord_dv: str, stock_code: str, odno: str = "") -> dict:
+    """
+    order_cash 응답이 애매할 때, 미체결 내역 조회로 주문 '접수' 여부를 보조 확인.
+    - 주의: "미체결 내역에 있다"는 것은 체결이 아니라 주문 접수/미체결 상태일 수 있습니다.
+    """
+    try:
+        from domestic_stock_functions import inquire_daily_ccld
+
+        cano = getattr(trenv, "my_acct", "") or ""
+        acnt_prdt_cd = getattr(trenv, "my_prod", "") or ""
+        if not cano or not acnt_prdt_cd:
+            return {"ok": False, "found": False, "reason": "missing_account"}
+
+        tz = timezone(timedelta(hours=9))
+        today = datetime.now(tz).strftime("%Y%m%d")
+        sll_buy = "02" if str(ord_dv).lower() == "buy" else "01"
+
+        df1, _ = inquire_daily_ccld(
+            env_dv=env_dv,
+            pd_dv="inner",
+            cano=cano,
+            acnt_prdt_cd=acnt_prdt_cd,
+            inqr_strt_dt=today,
+            inqr_end_dt=today,
+            sll_buy_dvsn_cd=sll_buy,
+            ccld_dvsn="02",  # 미체결
+            inqr_dvsn="00",
+            inqr_dvsn_3="00",
+            pdno=str(stock_code).strip().zfill(6),
+            odno=str(odno or "").strip(),
+        )
+        if df1 is None or getattr(df1, "empty", True):
+            return {"ok": True, "found": False, "rows": 0}
+
+        odno = ""
+        try:
+            if "ODNO" in df1.columns:
+                odno = str(df1.iloc[0].get("ODNO") or "").strip()
+            elif "odno" in df1.columns:
+                odno = str(df1.iloc[0].get("odno") or "").strip()
+        except Exception:
+            odno = ""
+
+        return {"ok": True, "found": True, "rows": int(len(df1.index)), "odno": odno, "columns": list(df1.columns)}
+    except Exception as e:
+        return {"ok": False, "found": False, "reason": str(e)}
+
+
+def _check_filled_order(env_dv: str, trenv, ord_dv: str, stock_code: str, odno: str = "") -> dict:
+    """일별주문체결조회에서 '체결'(ccld_dvsn=01) 여부 확인."""
+    try:
+        from domestic_stock_functions import inquire_daily_ccld
+
+        cano = getattr(trenv, "my_acct", "") or ""
+        acnt_prdt_cd = getattr(trenv, "my_prod", "") or ""
+        if not cano or not acnt_prdt_cd:
+            return {"ok": False, "found": False, "reason": "missing_account"}
+
+        tz = timezone(timedelta(hours=9))
+        today = datetime.now(tz).strftime("%Y%m%d")
+        sll_buy = "02" if str(ord_dv).lower() == "buy" else "01"
+
+        df1, _ = inquire_daily_ccld(
+            env_dv=env_dv,
+            pd_dv="inner",
+            cano=cano,
+            acnt_prdt_cd=acnt_prdt_cd,
+            inqr_strt_dt=today,
+            inqr_end_dt=today,
+            sll_buy_dvsn_cd=sll_buy,
+            ccld_dvsn="01",  # 체결
+            inqr_dvsn="00",
+            inqr_dvsn_3="00",
+            pdno=str(stock_code).strip().zfill(6),
+            odno=str(odno or "").strip(),
+        )
+        if df1 is None or getattr(df1, "empty", True):
+            return {"ok": True, "found": False, "rows": 0}
+
+        # 체결조회는 ODNO가 없을 수도 있으니 rows만으로도 '있음' 판정
+        return {"ok": True, "found": True, "rows": int(len(df1.index)), "columns": list(df1.columns)}
+    except Exception as e:
+        return {"ok": False, "found": False, "reason": str(e)}
 
 
 def safe_execute_order(
@@ -704,9 +957,47 @@ def safe_execute_order(
                     excg_id_dvsn_cd="KRX",
                 )
                 last_result = result
-                attempts.append({"try": i + 1, "order_style": style_used, "ord_dvsn": ord_dvsn, "empty": bool(result.empty)})
-                if not result.empty:
+                resp = _extract_order_response(result)
+                accepted = bool(resp.get("accepted", False))
+                confidence = str(resp.get("confidence", "none") or "none")
+                odno_try = ""
+                try:
+                    odno_try = str((resp.get("summary") or {}).get("odno") or "").strip()
+                except Exception:
+                    odno_try = ""
+                attempts.append({
+                    "try": i + 1,
+                    "order_style": style_used,
+                    "ord_dvsn": ord_dvsn,
+                    "empty": bool(getattr(result, "empty", True)),
+                    "accepted": accepted,
+                    "confidence": confidence,
+                    "odno": odno_try,
+                })
+                if accepted:
                     break
+
+                # 응답이 애매하면(ODNO 없음/empty 등) 미체결 내역으로 접수 여부 확인 후 중복 재시도 방지
+                try:
+                    odno = ""
+                    try:
+                        odno = (resp.get("summary") or {}).get("odno") or ""
+                    except Exception:
+                        odno = ""
+                    rt_cd = ""
+                    try:
+                        rt_cd = (resp.get("summary") or {}).get("rt_cd") or ""
+                    except Exception:
+                        rt_cd = ""
+                    ambiguous = bool(getattr(result, "empty", True)) or (not str(odno).strip() and not str(rt_cd).strip())
+                    if ambiguous:
+                        chk = _check_unfilled_order_acceptance(details["env_dv"], trenv, "buy", stock_code, odno=str(odno or "").strip())
+                        details["unfilled_check"] = chk
+                        if chk and chk.get("ok") and chk.get("found"):
+                            attempts[-1]["accepted_via_unfilled"] = True
+                            break
+                except Exception:
+                    pass
                 # 최우선 지정가가 비면 시장가로 폴백
                 if style_used == "best_limit" and fallback_to_mkt:
                     last_style_used = "market"
@@ -717,16 +1008,77 @@ def safe_execute_order(
             details["order_response"] = _extract_order_response(last_result)
             details["order_style_used"] = attempts[-1]["order_style"] if attempts else style
 
-            if not last_result.empty:
-                risk_mgr.update_position(stock_code, price, quantity, "buy")
-                logging.info(f"[매수 체결] {stock_code}: {price:,.0f}원, {quantity}주, 금액: {price*quantity:,.0f}원")
+            final_accepted = False
+            try:
+                if attempts:
+                    final_accepted = bool(attempts[-1].get("accepted") or attempts[-1].get("accepted_via_unfilled"))
+            except Exception:
+                final_accepted = False
+
+            if final_accepted:
+                details["accepted"] = True
+                odno_final = ""
+                try:
+                    odno_final = str((details["order_response"].get("summary") or {}).get("odno") or "").strip()
+                except Exception:
+                    odno_final = ""
+
+                filled = False
+                try:
+                    chk_filled = _check_filled_order(details["env_dv"], trenv, "buy", stock_code, odno=odno_final)
+                    chk_unfilled = _check_unfilled_order_acceptance(details["env_dv"], trenv, "buy", stock_code, odno=odno_final)
+                    details["filled_check"] = chk_filled
+                    details["unfilled_check"] = chk_unfilled
+                    if chk_filled and chk_filled.get("ok") and chk_filled.get("found"):
+                        filled = True
+                    elif chk_unfilled and chk_unfilled.get("ok") and chk_unfilled.get("found"):
+                        filled = False
+                    else:
+                        filled = False
+                        details["fill_unknown"] = True
+                except Exception:
+                    filled = False
+                    details["fill_unknown"] = True
+
+                details["filled"] = bool(filled)
+                if filled:
+                    try:
+                        risk_mgr.clear_pending_order(stock_code, side="buy")
+                    except Exception:
+                        pass
+                    risk_mgr.update_position(stock_code, price, quantity, "buy")
+                    logging.info(f"[매수 체결] {stock_code}: {price:,.0f}원, {quantity}주, 금액: {price*quantity:,.0f}원")
+                    details["ok"] = True
+                    details["status"] = "filled"
+                    if return_details:
+                        return True, details
+                    return True
+
+                # 접수는 됐으나 체결 미확정/미체결 → pending 기록(중복 주문 방지)
+                try:
+                    risk_mgr.set_pending_order(
+                        stock_code=stock_code,
+                        side="buy",
+                        quantity=quantity,
+                        price=price,
+                        env_dv=details["env_dv"],
+                        odno=odno_final,
+                        reason="accepted_pending",
+                    )
+                except Exception:
+                    pass
+                logging.warning(f"[매수 접수/대기] {stock_code}: odno={odno_final or '-'} qty={quantity} px={price:,.0f}")
                 details["ok"] = True
+                details["status"] = "accepted_pending"
                 if return_details:
                     return True, details
                 return True
             else:
                 logging.error(f"[매수 실패] {stock_code}: 주문 실패")
                 details["ok"] = False
+                details["accepted"] = False
+                details["filled"] = False
+                details["status"] = "rejected"
                 if return_details:
                     return False, details
                 return False
@@ -737,11 +1089,27 @@ def safe_execute_order(
             traceback.print_exc()
             details["ok"] = False
             details["error"] = str(e)
+            details["accepted"] = False
+            details["filled"] = False
+            details["status"] = "error"
             if return_details:
                 return False, details
             return False
     
     elif signal == "sell":
+        # 이미 매도 주문이 체결 대기 중이면 중복 매도 방지
+        try:
+            if getattr(risk_mgr, "has_pending_order", None) and risk_mgr.has_pending_order(stock_code=stock_code, side="sell"):
+                details["ok"] = False
+                details["reason"] = "pending_sell_order"
+                details["accepted"] = False
+                details["filled"] = False
+                details["status"] = "rejected"
+                if return_details:
+                    return False, details
+                return False
+        except Exception:
+            pass
         if stock_code not in risk_mgr.positions:
             details["ok"] = False
             details["reason"] = "no_position"
@@ -803,9 +1171,47 @@ def safe_execute_order(
                     excg_id_dvsn_cd="KRX",
                 )
                 last_result = result
-                attempts.append({"try": i + 1, "order_style": style_used, "ord_dvsn": ord_dvsn, "empty": bool(result.empty)})
-                if not result.empty:
+                resp = _extract_order_response(result)
+                accepted = bool(resp.get("accepted", False))
+                confidence = str(resp.get("confidence", "none") or "none")
+                odno_try = ""
+                try:
+                    odno_try = str((resp.get("summary") or {}).get("odno") or "").strip()
+                except Exception:
+                    odno_try = ""
+                attempts.append({
+                    "try": i + 1,
+                    "order_style": style_used,
+                    "ord_dvsn": ord_dvsn,
+                    "empty": bool(getattr(result, "empty", True)),
+                    "accepted": accepted,
+                    "confidence": confidence,
+                    "odno": odno_try,
+                })
+                if accepted:
                     break
+
+                # 응답이 애매하면(ODNO 없음/empty 등) 미체결 내역으로 접수 여부 확인 후 중복 재시도 방지
+                try:
+                    odno = ""
+                    try:
+                        odno = (resp.get("summary") or {}).get("odno") or ""
+                    except Exception:
+                        odno = ""
+                    rt_cd = ""
+                    try:
+                        rt_cd = (resp.get("summary") or {}).get("rt_cd") or ""
+                    except Exception:
+                        rt_cd = ""
+                    ambiguous = bool(getattr(result, "empty", True)) or (not str(odno).strip() and not str(rt_cd).strip())
+                    if ambiguous:
+                        chk = _check_unfilled_order_acceptance(details["env_dv"], trenv, "sell", stock_code, odno=str(odno or "").strip())
+                        details["unfilled_check"] = chk
+                        if chk and chk.get("ok") and chk.get("found"):
+                            attempts[-1]["accepted_via_unfilled"] = True
+                            break
+                except Exception:
+                    pass
                 if style_used == "best_limit" and fallback_to_mkt:
                     last_style_used = "market"
                 if i < retries and delay_ms > 0:
@@ -815,17 +1221,77 @@ def safe_execute_order(
             details["order_response"] = _extract_order_response(last_result)
             details["order_style_used"] = attempts[-1]["order_style"] if attempts else style
 
-            if not last_result.empty:
-                pnl = risk_mgr.update_position(stock_code, price, quantity, "sell")
-                logging.info(f"[매도 체결] {stock_code}: {price:,.0f}원, {quantity}주, 손익: {pnl:+,.0f}원")
+            final_accepted = False
+            try:
+                if attempts:
+                    final_accepted = bool(attempts[-1].get("accepted") or attempts[-1].get("accepted_via_unfilled"))
+            except Exception:
+                final_accepted = False
+
+            if final_accepted:
+                details["accepted"] = True
+                odno_final = ""
+                try:
+                    odno_final = str((details["order_response"].get("summary") or {}).get("odno") or "").strip()
+                except Exception:
+                    odno_final = ""
+
+                filled = False
+                try:
+                    chk_filled = _check_filled_order(details["env_dv"], trenv, "sell", stock_code, odno=odno_final)
+                    chk_unfilled = _check_unfilled_order_acceptance(details["env_dv"], trenv, "sell", stock_code, odno=odno_final)
+                    details["filled_check"] = chk_filled
+                    details["unfilled_check"] = chk_unfilled
+                    if chk_filled and chk_filled.get("ok") and chk_filled.get("found"):
+                        filled = True
+                    elif chk_unfilled and chk_unfilled.get("ok") and chk_unfilled.get("found"):
+                        filled = False
+                    else:
+                        filled = False
+                        details["fill_unknown"] = True
+                except Exception:
+                    filled = False
+                    details["fill_unknown"] = True
+
+                details["filled"] = bool(filled)
+                if filled:
+                    try:
+                        risk_mgr.clear_pending_order(stock_code, side="sell")
+                    except Exception:
+                        pass
+                    pnl = risk_mgr.update_position(stock_code, price, quantity, "sell")
+                    logging.info(f"[매도 체결] {stock_code}: {price:,.0f}원, {quantity}주, 손익: {pnl:+,.0f}원")
+                    details["ok"] = True
+                    details["pnl"] = pnl
+                    details["status"] = "filled"
+                    if return_details:
+                        return True, details
+                    return True
+
+                try:
+                    risk_mgr.set_pending_order(
+                        stock_code=stock_code,
+                        side="sell",
+                        quantity=quantity,
+                        price=price,
+                        env_dv=details["env_dv"],
+                        odno=odno_final,
+                        reason="accepted_pending",
+                    )
+                except Exception:
+                    pass
+                logging.warning(f"[매도 접수/대기] {stock_code}: odno={odno_final or '-'} qty={quantity} px={price:,.0f}")
                 details["ok"] = True
-                details["pnl"] = pnl
+                details["status"] = "accepted_pending"
                 if return_details:
                     return True, details
                 return True
             else:
                 logging.error(f"[매도 실패] {stock_code}: 주문 실패")
                 details["ok"] = False
+                details["accepted"] = False
+                details["filled"] = False
+                details["status"] = "rejected"
                 if return_details:
                     return False, details
                 return False
@@ -836,6 +1302,9 @@ def safe_execute_order(
             traceback.print_exc()
             details["ok"] = False
             details["error"] = str(e)
+            details["accepted"] = False
+            details["filled"] = False
+            details["status"] = "error"
             if return_details:
                 return False, details
             return False
