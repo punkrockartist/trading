@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 import sys
@@ -10210,7 +10211,33 @@ def order_cash(
         return current_data
     else:
         res.printError(url=api_url)
-        return pd.DataFrame()
+        # 실패 시에도 에러 사유(rt_cd, msg_cd, msg1)를 담은 DataFrame 반환 → 상위에서 로그에 표시
+        try:
+            body = res.getBody()
+            rt_cd = getattr(body, "rt_cd", None) or ""
+            msg_cd = res.getErrorCode() or ""
+            msg1 = res.getErrorMessage() or ""
+            if hasattr(body, "_fields") and body._fields:
+                for f in body._fields:
+                    v = getattr(body, f, None)
+                    if v is not None and str(v).strip():
+                        if f.upper() == "RT_CD":
+                            rt_cd = str(v).strip()
+                        elif f.upper() in ("MSG_CD", "msg_cd"):
+                            msg_cd = str(v).strip()
+                        elif f.upper() in ("MSG1", "msg1"):
+                            msg1 = str(v).strip()
+            if msg1 and str(msg1).strip().startswith("{"):
+                try:
+                    j = json.loads(msg1)
+                    msg1 = str(j.get("msg1") or j.get("message") or msg1)[:200]
+                    msg_cd = msg_cd or str(j.get("msg_cd") or "")
+                    rt_cd = rt_cd or str(j.get("rt_cd") or "")
+                except Exception:
+                    msg1 = str(msg1)[:200]
+            return pd.DataFrame([{"rt_cd": rt_cd, "msg_cd": msg_cd, "msg1": msg1}])
+        except Exception:
+            return pd.DataFrame()
 
 
 ##############################################################################################

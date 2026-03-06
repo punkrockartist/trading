@@ -141,6 +141,13 @@ def get_dashboard_html_mobile(username: str) -> str:
             transition: all 0.2s;
             -webkit-tap-highlight-color: transparent;
         }}
+        .btn-inline {{
+            width: auto;
+            margin: 0;
+            padding: 10px 14px;
+            font-size: 13px;
+            white-space: nowrap;
+        }}
         .btn:active {{
             transform: scale(0.98);
             background: var(--primary-active);
@@ -248,6 +255,20 @@ def get_dashboard_html_mobile(username: str) -> str:
             grid-template-columns: 1fr 1fr;
             gap: 10px;
             margin-top: 10px;
+        }}
+        .card-header-row {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--border);
+        }}
+        .card-header-row h2 {{
+            margin: 0;
+            padding: 0;
+            border: none;
         }}
         input, select {{
             width: 100%;
@@ -536,6 +557,12 @@ def get_dashboard_html_mobile(username: str) -> str:
         .settings-section.active {{
             display: block;
         }}
+        .performance-section {{
+            display: none;
+        }}
+        .performance-section.active {{
+            display: block;
+        }}
         details {{
             border: 1px solid var(--border);
             border-radius: var(--radius);
@@ -632,6 +659,14 @@ def get_dashboard_html_mobile(username: str) -> str:
                 </div>
             </div>
         </div>
+        <div class="topbar-sub" id="performanceSubbar">
+            <div class="topbar-sub-inner">
+                <div class="subtabs">
+                    <button type="button" class="subtab active" id="perf-subtab-summary" onclick="showPerformanceSection('summary')">요약·권장</button>
+                    <button type="button" class="subtab" id="perf-subtab-daily" onclick="showPerformanceSection('daily')">일별 성과</button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <div class="container">
@@ -639,7 +674,22 @@ def get_dashboard_html_mobile(username: str) -> str:
         <!-- 상태 탭 -->
         <div id="tab-status" class="tab-content active">
             <div class="card">
-                <h2>시스템 상태</h2>
+                <div class="card-header-row">
+                    <h2>시스템 상태</h2>
+                    <div style="display:flex; align-items:center; gap:10px;">
+                        <label style="display:flex; align-items:center; gap:6px; font-size:12px;">
+                            <input type="checkbox" id="auto_refresh_enabled">
+                            <span>자동 새로고침</span>
+                            <select id="auto_refresh_interval" style="width:auto; padding:4px 6px; font-size:12px;">
+                                <option value="5000" selected>5초</option>
+                                <option value="10000">10초</option>
+                                <option value="30000">30초</option>
+                                <option value="60000">1분</option>
+                            </select>
+                        </label>
+                        <button class="btn btn-inline" onclick="refreshData()">새로고침</button>
+                    </div>
+                </div>
                 <div class="metric">
                     <div class="env-selector">
                         <span class="metric-label">투자 환경:</span>
@@ -672,7 +722,6 @@ def get_dashboard_html_mobile(username: str) -> str:
                     <button class="btn" onclick="startSystem()">시작</button>
                     <button class="btn btn-danger" onclick="openStopModal()">중지</button>
                 </div>
-                <button class="btn" onclick="refreshData()" style="margin-top: 10px;">새로고침</button>
             </div>
             <div class="card">
                 <h2>선정 종목 리스트</h2>
@@ -700,20 +749,73 @@ def get_dashboard_html_mobile(username: str) -> str:
 
         <!-- 성과 탭 -->
         <div id="tab-performance" class="tab-content">
-            <div class="card">
-                <h2>일일·세션 성과</h2>
-                <div class="hint">당일 거래 기준. 새로고침 시 최신 집계 반영.</div>
-                <div id="performance_metrics" style="display:grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap:12px; margin:12px 0;">
-                    <p style="color: var(--muted); grid-column: 1/-1;">로딩 중...</p>
+            <div id="performance-section-summary" class="performance-section active">
+                <div class="card">
+                    <div class="card-header-row">
+                        <h2>일일·세션 성과</h2>
+                        <button class="btn btn-inline" onclick="loadPerformanceSummary()">새로고침</button>
+                    </div>
+                    <div class="hint">당일 거래 기준. 새로고침 시 최신 집계 반영.</div>
+                    <div id="performance_metrics" style="display:grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap:12px; margin:12px 0;">
+                        <p style="color: var(--muted); grid-column: 1/-1;">로딩 중...</p>
+                    </div>
                 </div>
-                <button class="btn" onclick="loadPerformanceSummary()" style="margin-top:8px;">새로고침</button>
+                <div class="card">
+                    <h2>권장 설정 (성과 기반)</h2>
+                    <div id="performance_recommendations" style="font-size:14px; line-height:1.6;">
+                        <p style="color: var(--muted);">성과 요약 로딩 후 표시됩니다.</p>
+                    </div>
+                    <div class="hint">자동 적용되지 않습니다. 설정 탭에서 수동으로 조정하세요.</div>
+                </div>
             </div>
-            <div class="card">
-                <h2>권장 설정 (성과 기반)</h2>
-                <div id="performance_recommendations" style="font-size:14px; line-height:1.6;">
-                    <p style="color: var(--muted);">성과 요약 로딩 후 표시됩니다.</p>
+            <div id="performance-section-daily" class="performance-section">
+                <div class="card">
+                    <h2>일별 성과 (저장된 데이터)</h2>
+                    <div class="hint">중지 시 저장된 일별 데이터를 from ~ to 구간으로 조회합니다.</div>
+                    <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; margin-bottom:12px;">
+                        <div class="form-group" style="margin:0; min-width:170px;">
+                            <label>시작일</label>
+                            <input type="date" id="perf_date_from" style="width:100%;">
+                        </div>
+                        <div class="form-group" style="margin:0; min-width:170px;">
+                            <label>종료일</label>
+                            <input type="date" id="perf_date_to" style="width:100%;">
+                        </div>
+                        <button type="button" class="btn btn-inline" onclick="loadPerformanceDaily()">일별 성과 조회</button>
+                    </div>
+                    <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px;">
+                        <div style="font-size:12px; color:var(--muted);">
+                            페이지 크기:
+                            <select id="perf_page_size" onchange="onChangePerformancePageSize()" style="width:auto; padding:6px 8px; font-size:12px;">
+                                <option value="10">10개씩 보기</option>
+                                <option value="30" selected>30개씩 보기</option>
+                                <option value="60">60개씩 보기</option>
+                                <option value="90">90개씩 보기</option>
+                            </select>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:6px; font-size:12px;">
+                            <button type="button" class="btn btn-inline" onclick="changePerformancePage(-1)">이전</button>
+                            <span id="performance_page_info">- / -</span>
+                            <button type="button" class="btn btn-inline" onclick="changePerformancePage(1)">다음</button>
+                        </div>
+                    </div>
+                    <div id="performance_daily_grid_wrap" style="overflow-x:auto;">
+                        <p id="performance_daily_status" style="color: var(--muted);">날짜를 선택하고 조회를 눌러주세요.</p>
+                        <table id="performance_daily_table" class="perf-daily-table" style="display:none; width:100%; margin-top:8px;">
+                            <thead>
+                                <tr>
+                                    <th>일자</th>
+                                    <th>시작자산</th>
+                                    <th>종료자산</th>
+                                    <th>손익</th>
+                                    <th>수익률%</th>
+                                    <th>거래횟수</th>
+                                </tr>
+                            </thead>
+                            <tbody id="performance_daily_tbody"></tbody>
+                        </table>
+                    </div>
                 </div>
-                <div class="hint">자동 적용되지 않습니다. 설정 탭에서 수동으로 조정하세요.</div>
             </div>
         </div>
 
@@ -860,6 +962,11 @@ def get_dashboard_html_mobile(username: str) -> str:
                         <div class="form-group">
                             <label>트레일링 활성화 최소 수익(%):</label>
                             <input type="number" id="trailing_activation_pct" value="0" step="0.1" min="0" max="50">
+                        </div>
+                        <div class="form-group">
+                            <label>주문 허용 최소 가격 변동(%):</label>
+                            <input type="number" id="min_price_change_ratio_pct" value="1" step="0.1" min="0" max="10" title="신호 가격이 직전 대비 이만큼 변동해야 주문 실행. 0이면 검사 없음">
+                            <span class="hint">0이면 변동 없어도 주문 허용</span>
                         </div>
                     </details>
 
@@ -1488,15 +1595,148 @@ def get_dashboard_html_mobile(username: str) -> str:
         let ws = null;
         let reconnectInterval = null;
         let pendingSignals = {{}};
+        let autoRefreshTimer = null;
+        let performanceDailyRows = [];
+        let performanceDailyCurrentPage = 1;
+        let performanceDailyPageSize = 30;
 
         function showTab(tabName) {{
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
             event.target.classList.add('active');
             document.getElementById(`tab-${{tabName}}`).classList.add('active');
-            const sub = document.getElementById('settingsSubbar');
-            if (sub) sub.style.display = (tabName === 'settings') ? 'block' : 'none';
-            if (tabName === 'performance') loadPerformanceSummary();
+            const settingsSub = document.getElementById('settingsSubbar');
+            const perfSub = document.getElementById('performanceSubbar');
+            if (settingsSub) settingsSub.style.display = (tabName === 'settings') ? 'block' : 'none';
+            if (perfSub) perfSub.style.display = (tabName === 'performance') ? 'block' : 'none';
+            if (tabName === 'performance') {{
+                showPerformanceSection('summary');
+                loadPerformanceSummary();
+                setDefaultPerformanceDailyRange();
+            }}
+        }}
+
+        function setDefaultPerformanceDailyRange() {{
+            const fromEl = document.getElementById('perf_date_from');
+            const toEl = document.getElementById('perf_date_to');
+            if (!fromEl || !toEl || fromEl.value) return;
+            const now = new Date();
+            const to = now;
+            const from = new Date(now);
+            from.setDate(from.getDate() - 30);
+            const fmt = d => d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+            toEl.value = fmt(to);
+            fromEl.value = fmt(from);
+        }}
+
+        async function loadPerformanceDaily() {{
+            const fromEl = document.getElementById('perf_date_from');
+            const toEl = document.getElementById('perf_date_to');
+            const statusEl = document.getElementById('performance_daily_status');
+            const tableEl = document.getElementById('performance_daily_table');
+            if (!fromEl || !toEl || !statusEl || !tableEl) return;
+            const date_from = (fromEl.value || '').trim().replace(/[-/]/g, '').slice(0, 8);
+            const date_to = (toEl.value || '').trim().replace(/[-/]/g, '').slice(0, 8);
+            if (date_from.length !== 8 || date_to.length !== 8) {{
+                statusEl.textContent = '시작일·종료일을 선택해 주세요.';
+                tableEl.style.display = 'none';
+                performanceDailyRows = [];
+                const pageInfoEl = document.getElementById('performance_page_info');
+                if (pageInfoEl) pageInfoEl.textContent = '- / -';
+                return;
+            }}
+            statusEl.textContent = '조회 중...';
+            tableEl.style.display = 'none';
+            try {{
+                const r = await fetch(`/api/performance/daily?date_from=${{encodeURIComponent(date_from)}}&date_to=${{encodeURIComponent(date_to)}}`, {{ credentials: 'include', headers: {{ 'Authorization': 'Bearer ' + (localStorage.getItem('token') || '') }} }});
+                const data = await r.json();
+                if (!data.success) {{
+                    statusEl.textContent = data.message || '조회 실패';
+                    performanceDailyRows = [];
+                    return;
+                }}
+                const rows = data.rows || [];
+                if (rows.length === 0) {{
+                    statusEl.textContent = '해당 구간에 저장된 일별 성과가 없습니다.';
+                    performanceDailyRows = [];
+                    const pageInfoEl = document.getElementById('performance_page_info');
+                    if (pageInfoEl) pageInfoEl.textContent = '0 / 0';
+                    return;
+                }}
+                performanceDailyRows = rows;
+                performanceDailyCurrentPage = 1;
+                const sizeSel = document.getElementById('perf_page_size');
+                if (sizeSel) {{
+                    const v = parseInt(sizeSel.value, 10);
+                    if (!isNaN(v) && v > 0) performanceDailyPageSize = v;
+                }}
+                renderPerformanceDailyPage();
+            }} catch (e) {{
+                statusEl.textContent = '로드 실패: ' + (e.message || '');
+                performanceDailyRows = [];
+            }}
+        }}
+
+        function renderPerformanceDailyPage() {{
+            const statusEl = document.getElementById('performance_daily_status');
+            const tableEl = document.getElementById('performance_daily_table');
+            const tbodyEl = document.getElementById('performance_daily_tbody');
+            const pageInfoEl = document.getElementById('performance_page_info');
+            if (!statusEl || !tableEl || !tbodyEl) return;
+            const total = performanceDailyRows.length || 0;
+            if (!total) {{
+                tableEl.style.display = 'none';
+                if (pageInfoEl) pageInfoEl.textContent = '0 / 0';
+                return;
+            }}
+            const size = performanceDailyPageSize && performanceDailyPageSize > 0 ? performanceDailyPageSize : 30;
+            const totalPages = Math.max(1, Math.ceil(total / size));
+            if (performanceDailyCurrentPage < 1) performanceDailyCurrentPage = 1;
+            if (performanceDailyCurrentPage > totalPages) performanceDailyCurrentPage = totalPages;
+            const start = (performanceDailyCurrentPage - 1) * size;
+            const pageRows = performanceDailyRows.slice(start, start + size);
+            const fmtDate = s => s && s.length >= 8 ? s.slice(0,4)+'-'+s.slice(4,6)+'-'+s.slice(6,8) : s;
+            const fmtNum = n => (n != null && !isNaN(n)) ? Number(n).toLocaleString() : '-';
+            tbodyEl.innerHTML = pageRows.map(row => {{
+                const pnl = row.pnl != null ? row.pnl : (row.equity_end != null && row.equity_start != null ? row.equity_end - row.equity_start : null);
+                const pct = row.return_pct != null ? row.return_pct : (row.equity_start && row.equity_start !== 0 && pnl != null ? (pnl / row.equity_start * 100) : null);
+                const pnlCl = (pnl != null && pnl < 0) ? 'negative' : (pnl != null && pnl > 0) ? 'positive' : '';
+                return `<tr>
+                    <td>${{fmtDate(row.date)}}</td>
+                    <td>${{fmtNum(row.equity_start)}}</td>
+                    <td>${{fmtNum(row.equity_end)}}</td>
+                    <td class="metric-value ${{pnlCl}}">${{pnl != null ? (pnl >= 0 ? '+' : '') + fmtNum(pnl) : '-'}}</td>
+                    <td class="metric-value ${{pnlCl}}">${{pct != null ? (pct >= 0 ? '+' : '') + Number(pct).toFixed(2) + '%' : '-'}}</td>
+                    <td>${{row.trade_count != null ? fmtNum(row.trade_count) : '-'}}</td>
+                </tr>`;
+            }}).join('');
+            tableEl.style.display = 'table';
+            statusEl.textContent = `총 ${{total.toLocaleString()}}건, ${{performanceDailyCurrentPage}} / ${{totalPages}} 페이지`;
+            if (pageInfoEl) pageInfoEl.textContent = `${{performanceDailyCurrentPage}} / ${{totalPages}}`;
+        }}
+
+        function changePerformancePage(delta) {{
+            const total = performanceDailyRows.length || 0;
+            if (!total) return;
+            const size = performanceDailyPageSize && performanceDailyPageSize > 0 ? performanceDailyPageSize : 30;
+            const totalPages = Math.max(1, Math.ceil(total / size));
+            let next = performanceDailyCurrentPage + delta;
+            if (next < 1) next = 1;
+            if (next > totalPages) next = totalPages;
+            if (next === performanceDailyCurrentPage) return;
+            performanceDailyCurrentPage = next;
+            renderPerformanceDailyPage();
+        }}
+
+        function onChangePerformancePageSize() {{
+            const sizeSel = document.getElementById('perf_page_size');
+            if (!sizeSel) return;
+            const v = parseInt(sizeSel.value, 10);
+            if (!isNaN(v) && v > 0) {{
+                performanceDailyPageSize = v;
+                performanceDailyCurrentPage = 1;
+                renderPerformanceDailyPage();
+            }}
         }}
 
         async function loadPerformanceSummary() {{
@@ -1581,6 +1821,16 @@ def get_dashboard_html_mobile(username: str) -> str:
                 if (btn) btn.classList.toggle('active', s === name);
             }});
             updateSettingsSummaries();
+        }}
+
+        function showPerformanceSection(name) {{
+            const sections = ['summary', 'daily'];
+            sections.forEach(s => {{
+                const sec = document.getElementById(`performance-section-${{s}}`);
+                const btn = document.getElementById(`perf-subtab-${{s}}`);
+                if (sec) sec.classList.toggle('active', s === name);
+                if (btn) btn.classList.toggle('active', s === name);
+            }});
         }}
 
         function connectWebSocket() {{
@@ -2106,9 +2356,10 @@ def get_dashboard_html_mobile(username: str) -> str:
 
         async function loadUserSettings() {{
             try {{
-                const response = await fetch('/api/config/user-settings');
+                const response = await fetch('/api/config/user-settings', {{ credentials: 'include' }});
                 const data = await response.json();
                 if (!data.success) {{
+                    if (response.status === 401) addLog('설정 로드: 로그인이 필요합니다.', 'warning');
                     return;
                 }}
                 const s = data.settings || {{}};
@@ -2118,7 +2369,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                 const oper = s.operational_config || null;
 
                 if (risk) {{
-                    if (risk.max_single_trade_amount != null) document.getElementById('max_trade_amount').value = risk.max_single_trade_amount;
+                    if (risk.max_single_trade_amount != null && risk.max_single_trade_amount !== undefined) document.getElementById('max_trade_amount').value = String(risk.max_single_trade_amount);
                     if (risk.min_order_quantity != null) document.getElementById('min_order_quantity').value = risk.min_order_quantity;
                     if (risk.stop_loss_ratio != null) document.getElementById('stop_loss').value = (risk.stop_loss_ratio * 100).toFixed(1);
                     if (risk.take_profit_ratio != null) document.getElementById('take_profit').value = (risk.take_profit_ratio * 100).toFixed(1);
@@ -2142,6 +2393,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                     if (risk.trailing_activation_ratio != null) document.getElementById('trailing_activation_pct').value = (risk.trailing_activation_ratio * 100).toFixed(1);
                     if (risk.partial_take_profit_ratio != null) document.getElementById('partial_tp_pct').value = (risk.partial_take_profit_ratio * 100).toFixed(1);
                     if (risk.partial_take_profit_fraction != null) document.getElementById('partial_tp_fraction_pct').value = (risk.partial_take_profit_fraction * 100).toFixed(0);
+                    if (risk.min_price_change_ratio != null) document.getElementById('min_price_change_ratio_pct').value = (risk.min_price_change_ratio * 100).toFixed(1);
                 }}
                 if (strat) {{
                     if (strat.short_ma_period != null) document.getElementById('short_ma_period').value = strat.short_ma_period;
@@ -2257,6 +2509,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                     trailing_activation_ratio: (parseFloat(document.getElementById('trailing_activation_pct').value) || 0) / 100,
                     partial_take_profit_ratio: (parseFloat(document.getElementById('partial_tp_pct').value) || 0) / 100,
                     partial_take_profit_fraction: (parseFloat(document.getElementById('partial_tp_fraction_pct').value) || 0) / 100,
+                    min_price_change_ratio: (function(){{ var el = document.getElementById('min_price_change_ratio_pct'); if (!el) return 0.01; var v = parseFloat(el.value); return Number.isNaN(v) ? 0.01 : v / 100; }})(),
                 }};
                 const response = await fetch('/api/config/risk', {{
                     method: 'POST',
@@ -2627,6 +2880,27 @@ def get_dashboard_html_mobile(username: str) -> str:
             }}
         }}
 
+        function applyAutoRefreshSettings(initial = false) {{
+            const enabledEl = document.getElementById('auto_refresh_enabled');
+            const intervalEl = document.getElementById('auto_refresh_interval');
+            if (!enabledEl || !intervalEl) return;
+            if (autoRefreshTimer) {{
+                clearInterval(autoRefreshTimer);
+                autoRefreshTimer = null;
+            }}
+            if (!enabledEl.checked) return;
+            const ms = parseInt(intervalEl.value, 10) || 0;
+            if (ms <= 0) return;
+            autoRefreshTimer = setInterval(refreshData, ms);
+            if (!initial) {{
+                refreshData();
+            }}
+        }}
+
+        function onChangeAutoRefresh() {{
+            applyAutoRefreshSettings(false);
+        }}
+
         async function loadPreset() {{
             const presetName = document.getElementById('preset_select').value;
             if (!presetName) return;
@@ -2723,6 +2997,8 @@ def get_dashboard_html_mobile(username: str) -> str:
         connectWebSocket();
         const _sub = document.getElementById('settingsSubbar');
         if (_sub) _sub.style.display = 'none';
+        const _perfSub = document.getElementById('performanceSubbar');
+        if (_perfSub) _perfSub.style.display = 'none';
         (async () => {{
             await loadUserSettings();
             updateSettingsSummaries();

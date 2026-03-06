@@ -35,6 +35,7 @@ DEFAULT_STOCK_INFO = [
 
 _user_settings_store = None
 _user_settings_store_init_error: Optional[str] = None
+_user_result_store = None
 _signal_skip_log_last_at: Dict[str, float] = {}
 _signal_skip_log_lock = threading.Lock()
 _skip_stats_lock = threading.Lock()
@@ -619,6 +620,8 @@ def _apply_risk_config_dict_to_state(d: dict) -> None:
             rm.trailing_stop_ratio = float(d.get("trailing_stop_ratio") or 0.0)
         if "trailing_activation_ratio" in d:
             rm.trailing_activation_ratio = float(d.get("trailing_activation_ratio") or 0.0)
+        if "min_price_change_ratio" in d:
+            rm.min_price_change_ratio = max(0.0, min(0.10, float(d.get("min_price_change_ratio") or 0.01)))
         if "partial_take_profit_ratio" in d:
             rm.partial_take_profit_ratio = float(d.get("partial_take_profit_ratio") or 0.0)
         if "partial_take_profit_fraction" in d:
@@ -668,6 +671,19 @@ def _get_user_settings_store():
     return _user_settings_store
 
 
+def _get_user_result_store():
+    global _user_result_store
+    if _user_result_store is not None:
+        return _user_result_store
+    try:
+        from user_result_store import DynamoDBUserResultStore
+        _user_result_store = DynamoDBUserResultStore()
+    except Exception as e:
+        logger.warning(f"User result store init failed: {e}")
+        _user_result_store = None
+    return _user_result_store
+
+
 @app.get("/api/config/user-settings/store-status")
 async def get_user_settings_store_status(current_user: str = Depends(get_current_user)):
     """DynamoDB 유저 설정 저장소 상태 진단용. 비활성화 시 원인(init_error)과 설정 방법 안내 포함."""
@@ -707,11 +723,12 @@ def _format_order_log(details: dict) -> str:
 
         resp = details.get("order_response") or {}
         fields = resp.get("fields") or {}
-        odno = fields.get("ODNO") or fields.get("odno") or "-"
+        summary = resp.get("summary") or {}
+        odno = fields.get("ODNO") or fields.get("odno") or summary.get("odno") or "-"
         ord_tmd = fields.get("ORD_TMD") or fields.get("ord_tmd") or "-"
-        msg = fields.get("MSG1") or fields.get("msg1") or fields.get("message") or ""
-        msg_cd = fields.get("MSG_CD") or fields.get("msg_cd") or ""
-        rt_cd = fields.get("RT_CD") or fields.get("rt_cd") or ""
+        msg = fields.get("MSG1") or fields.get("msg1") or summary.get("msg") or fields.get("message") or ""
+        msg_cd = fields.get("MSG_CD") or fields.get("msg_cd") or summary.get("msg_cd") or ""
+        rt_cd = fields.get("RT_CD") or fields.get("rt_cd") or summary.get("rt_cd") or ""
 
         if status == "accepted_pending" and ok and not filled:
             verdict = "접수(대기)"
@@ -724,6 +741,9 @@ def _format_order_log(details: dict) -> str:
         tail = f" | odno={odno} t={ord_tmd}"
         if rt_cd or msg_cd or msg:
             tail += f" | rt_cd={rt_cd} msg_cd={msg_cd} msg={msg}"
+        if not ok and (details.get("error") or details.get("reason")):
+            err = details.get("error") or details.get("reason")
+            tail += f" | reason={err}"
         return base + tail
     except Exception:
         return f"주문 결과(details 파싱 실패): {details}"
@@ -2055,6 +2075,10 @@ async def start_system(current_user: str = Depends(get_current_user)):
             state.selected_stock_info = DEFAULT_STOCK_INFO.copy()
 
         state.is_running = True
+        try:
+            state.session_start_balance = float(_get_display_account_balance() or getattr(state.risk_manager, "account_balance", 0) or 0)
+        except Exception:
+            state.session_start_balance = float(getattr(state.risk_manager, "account_balance", 0) or 0)
         _start_trading_engine_thread()
         # pending 주문 체결 확인 루프 시작(중복 방지)
         try:
@@ -2195,6 +2219,20 @@ async def stop_system(
                     await state.broadcast({"type": "trade", "data": trade_info})
 
             await state.broadcast({"type": "log", "message": "청산 완료", "level": "info"})
+
+        # 일별 성과 저장 (quant_trading_user_result): 당일 기존 row 있으면 통합, 없으면 신규
+        try:
+            store = _get_user_result_store()
+            if store and store.enabled and state.risk_manager:
+                tz = timezone(timedelta(hours=9))
+                today = datetime.now(tz).strftime("%Y%m%d")
+                equity_end = float(_get_display_account_balance() or getattr(state.risk_manager, "account_balance", 0) or 0)
+                trade_count = int(getattr(state.risk_manager, "daily_trades", 0) or 0)
+                equity_start = getattr(state, "session_start_balance", None)
+                if store.save_daily_result(current_user, today, equity_end, trade_count, equity_start=equity_start):
+                    await state.broadcast({"type": "log", "message": f"일별 성과 저장됨: {today}", "level": "info"})
+        except Exception as e:
+            logger.warning(f"일별 성과 저장 실패(무시): {e}")
 
         await send_status_update()
         await state.broadcast({"type": "signal_snapshot", "data": []})
@@ -2337,6 +2375,31 @@ async def get_performance_summary(current_user: str = Depends(get_current_user))
     try:
         summary = _performance_summary_from_trades()
         return JSONResponse({"success": True, "summary": summary})
+    except Exception as e:
+        logger.exception(e)
+        return JSONResponse({"success": False, "message": str(e)})
+
+
+@app.get("/api/performance/daily")
+async def get_performance_daily(
+    date_from: str = Query(..., description="시작일 YYYYMMDD"),
+    date_to: str = Query(..., description="종료일 YYYYMMDD"),
+    current_user: str = Depends(get_current_user),
+):
+    """일별 성과 조회 (quant_trading_user_result). from~to 구간."""
+    try:
+        store = _get_user_result_store()
+        if not store or not store.enabled:
+            return JSONResponse({
+                "success": False,
+                "message": "성과 저장소를 사용할 수 없습니다. (DynamoDB quant_trading_user_result 테이블·자격 확인)",
+            })
+        if len(date_from) != 8 or len(date_to) != 8 or not date_from.isdigit() or not date_to.isdigit():
+            return JSONResponse({"success": False, "message": "date_from, date_to는 YYYYMMDD 8자리여야 합니다."})
+        if date_from > date_to:
+            date_from, date_to = date_to, date_from
+        rows = store.query_range(current_user, date_from, date_to)
+        return JSONResponse({"success": True, "rows": rows})
     except Exception as e:
         logger.exception(e)
         return JSONResponse({"success": False, "message": str(e)})
@@ -2526,6 +2589,7 @@ async def update_risk_config(config: RiskConfig, current_user: str = Depends(get
         state.risk_manager.trailing_activation_ratio = getattr(config, "trailing_activation_ratio", 0.0) or 0.0
         state.risk_manager.partial_take_profit_ratio = getattr(config, "partial_take_profit_ratio", 0.0) or 0.0
         state.risk_manager.partial_take_profit_fraction = getattr(config, "partial_take_profit_fraction", 0.5) or 0.5
+        state.risk_manager.min_price_change_ratio = max(0.0, min(0.10, float(getattr(config, "min_price_change_ratio", 0.01) or 0.01)))
 
         store = _get_user_settings_store()
         persisted = False
@@ -2767,7 +2831,7 @@ async def get_user_settings(current_user: str = Depends(get_current_user)):
     # DB에서 불러온 설정을 state에 반영 → 리스크 관리 등 화면값과 실제 적용값·DB가 같아짐
     _apply_risk_config_dict_to_state(settings.get("risk_config"))
     _apply_operational_config_dict_to_state(settings.get("operational_config"))
-    return JSONResponse({"success": True, "settings": settings})
+    return JSONResponse({"success": True, "settings": settings, "loaded_for_username": current_user})
 
 @app.post("/api/stocks/select")
 async def select_stocks(current_user: str = Depends(get_current_user)):

@@ -131,6 +131,8 @@ class RiskConfig(BaseModel):
     trailing_activation_ratio: float = 0.0
     partial_take_profit_ratio: float = 0.0
     partial_take_profit_fraction: float = 0.5
+    # 매수 허용 최소 가격 변동(0~10%). 신호 가격이 last_prices 대비 이 비율만큼 변동해야 주문 실행. 0이면 검사 없음
+    min_price_change_ratio: float = 0.01
 
 class StockSelectionConfig(BaseModel):
     min_price_change_ratio: float

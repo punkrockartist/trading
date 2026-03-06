@@ -202,7 +202,7 @@ def _getResultObject(json_data):
 
 # Token 발급, 유효기간 1일, 6시간 이내 발급시 기존 token값 유지, 발급시 알림톡 무조건 발송
 # 모의투자인 경우  svr='vps', 투자계좌(01)이 아닌경우 product='XX' 변경하세요 (계좌번호 뒤 2자리)
-def auth(svr="prod", product=_cfg["my_prod"], url=None):
+def auth(svr="prod", product=_cfg["my_prod"], url=None, force_refresh=False):
     p = {
         "grant_type": "client_credentials",
     }
@@ -219,8 +219,8 @@ def auth(svr="prod", product=_cfg["my_prod"], url=None):
     p["appkey"] = _cfg[ak1]
     p["appsecret"] = _cfg[ak2]
 
-    # 기존 발급된 토큰이 있는지 확인
-    saved_token = read_token()  # 기존 발급 토큰 확인
+    # 기존 발급된 토큰이 있는지 확인 (force_refresh면 무시하고 무조건 재발급)
+    saved_token = None if force_refresh else read_token()  # 기존 발급 토큰 확인
     # print("saved_token: ", saved_token)
     if saved_token is None:  # 기존 발급 토큰 확인이 안되면 발급처리
         url = f"{_cfg[svr]}/oauth2/tokenP"
@@ -461,8 +461,32 @@ def _url_fetch(
             ar.printAll()
         return ar
     else:
-        print("Error Code : " + str(res.status_code) + " | " + res.text)
-        return APIRespError(res.status_code, res.text)
+        # 토큰 만료(EGW00123) 시 1회 한해 토큰 재발급 후 재시도
+        is_token_expired = res.status_code == 500 and "EGW00123" in (res.text or "")
+        if is_token_expired:
+            try:
+                svr = "vps" if _isPaper else "prod"
+                auth(svr=svr, product=_cfg["my_prod"], force_refresh=True)
+                headers = _getBaseHeader()
+                headers["tr_id"] = tr_id
+                headers["custtype"] = "P"
+                headers["tr_cont"] = tr_cont
+                if appendHeaders:
+                    for x in appendHeaders.keys():
+                        headers[x] = appendHeaders.get(x)
+                if postFlag:
+                    res = requests.post(url, headers=headers, data=json.dumps(params))
+                else:
+                    res = requests.get(url, headers=headers, params=params)
+                if res.status_code == 200:
+                    ar = APIResp(res)
+                    if _DEBUG:
+                        ar.printAll()
+                    return ar
+            except Exception:
+                pass
+        print("Error Code : " + str(res.status_code) + " | " + (res.text or ""))
+        return APIRespError(res.status_code, res.text or "")
 
 
 # auth()

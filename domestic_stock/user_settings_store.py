@@ -7,6 +7,31 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 
+def _ensure_dotenv_loaded():
+    """설정 저장소에서 사용할 env를 위해 .env 로드 (저장소 초기화 시점에 호출). 기존 값은 덮어쓰지 않음."""
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for path in (os.path.join(root, "config", ".env"), os.path.join(root, ".env")):
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for raw in f:
+                        line = raw.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        if line.startswith("export "):
+                            line = line[len("export ") :].strip()
+                        k, v = line.split("=", 1)
+                        k, v = k.strip(), v.strip().strip('"').strip("'")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 class DynamoDBUserSettingsStore:
     """
     사용자별 설정 저장소 (DynamoDB)
@@ -29,18 +54,20 @@ class DynamoDBUserSettingsStore:
         aws_secret_access_key: Optional[str] = None,
         aws_session_token: Optional[str] = None,
     ):
-        self.table_name = (
+        _ensure_dotenv_loaded()
+        raw_table = (
             table_name
             or os.getenv("USER_SETTINGS_TABLE_NAME")
             or os.getenv("DYNAMODB_TABLE_NAME", "quant_trading_user_settings")
         )
-        # USER_SETTINGS_REGION 있으면 우선, 없으면 AWS_DEFAULT_REGION / AWS_REGION, 기본 ap-northeast-2
-        self.region = (
+        self.table_name = str(raw_table or "quant_trading_user_settings").strip()
+        raw_region = (
             region
             or os.getenv("USER_SETTINGS_REGION")
             or os.getenv("AWS_DEFAULT_REGION")
             or os.getenv("AWS_REGION", "ap-northeast-2")
         )
+        self.region = str(raw_region or "ap-northeast-2").strip()
 
         self._enabled = False
         self._table = None
