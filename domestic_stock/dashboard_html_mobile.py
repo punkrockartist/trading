@@ -144,7 +144,7 @@ def get_dashboard_html_mobile(username: str) -> str:
         .btn-inline {{
             width: auto;
             margin: 0;
-            padding: 10px 14px;
+            padding: 6px 10px;
             font-size: 13px;
             white-space: nowrap;
         }}
@@ -772,16 +772,16 @@ def get_dashboard_html_mobile(username: str) -> str:
                 <div class="card">
                     <h2>일별 성과 (저장된 데이터)</h2>
                     <div class="hint">중지 시 저장된 일별 데이터를 from ~ to 구간으로 조회합니다.</div>
-                    <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; margin-bottom:12px;">
-                        <div class="form-group" style="margin:0; min-width:170px;">
-                            <label>시작일</label>
-                            <input type="date" id="perf_date_from" style="width:100%;">
+                    <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:12px;">
+                        <div class="form-group" style="margin:0; min-width:auto;">
+                            <label style="font-size:12px;">시작일</label>
+                            <input type="date" id="perf_date_from" style="width:16ch; padding:6px 8px; font-size:13px;">
                         </div>
-                        <div class="form-group" style="margin:0; min-width:170px;">
-                            <label>종료일</label>
-                            <input type="date" id="perf_date_to" style="width:100%;">
+                        <div class="form-group" style="margin:0; min-width:auto;">
+                            <label style="font-size:12px;">종료일</label>
+                            <input type="date" id="perf_date_to" style="width:16ch; padding:6px 8px; font-size:13px;">
                         </div>
-                        <button type="button" class="btn btn-inline" onclick="loadPerformanceDaily()">일별 성과 조회</button>
+                        <button type="button" class="btn btn-inline" onclick="loadPerformanceDaily()">조회</button>
                     </div>
                     <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px;">
                         <div style="font-size:12px; color:var(--muted);">
@@ -794,13 +794,12 @@ def get_dashboard_html_mobile(username: str) -> str:
                             </select>
                         </div>
                         <div style="display:flex; align-items:center; gap:6px; font-size:12px;">
-                            <button type="button" class="btn btn-inline" onclick="changePerformancePage(-1)">이전</button>
+                            <button type="button" class="btn btn-inline" style="padding:4px 8px; font-size:12px;" onclick="changePerformancePage(-1)">이전</button>
                             <span id="performance_page_info">- / -</span>
-                            <button type="button" class="btn btn-inline" onclick="changePerformancePage(1)">다음</button>
+                            <button type="button" class="btn btn-inline" style="padding:4px 8px; font-size:12px;" onclick="changePerformancePage(1)">다음</button>
                         </div>
                     </div>
                     <div id="performance_daily_grid_wrap" style="overflow-x:auto;">
-                        <p id="performance_daily_status" style="color: var(--muted);">날짜를 선택하고 조회를 눌러주세요.</p>
                         <table id="performance_daily_table" class="perf-daily-table" style="display:none; width:100%; margin-top:8px;">
                             <thead>
                                 <tr>
