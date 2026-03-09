@@ -1,0 +1,26 @@
+# 서버 배포용: 이 파일을 ~/kis-api/ 에 복사해서 사용
+# .env는 config/.env 또는 이 파일과 같은 디렉터리의 .env 사용
+version: '3.8'
+
+services:
+  quant-trading:
+    image: akito56/quant-trading-dashboard:latest
+    container_name: quant-trading-dashboard
+    env_file: config/.env
+    ports:
+      - "8000:8000"
+    environment:
+      - KIS_TOKEN_ROOT=/app/data/token
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app:/app/domestic_stock
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - quant-trading-network
+
+networks:
+  quant-trading-network:
+    driver: bridge

@@ -2,13 +2,19 @@ version: '3.8'
 
 services:
   quant-trading:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    # Docker Hub에서 받아서 실행 (기본)
+    image: akito56/quant-trading-dashboard:latest
+    # 로컬에서 빌드해서 쓰려면 아래 주석 해제하고 위 image 줄 주석 처리
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
     container_name: quant-trading-dashboard
+    env_file: .env
     ports:
       - "8000:8000"
     environment:
+      # 토큰 저장 경로 (config를 :ro로 마운트해도 여기에 쓰기 가능)
+      - KIS_TOKEN_ROOT=/app/data/token
       # DynamoDB 설정 (환경변수로 오버라이드 가능)
       - USE_DYNAMODB=${USE_DYNAMODB:-true}
       - DYNAMODB_TABLE_NAME=${DYNAMODB_TABLE_NAME:-quant_trading_users}
@@ -25,9 +31,8 @@ services:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app:/app/domestic_stock
     volumes:
-      # 설정 파일 마운트 (선택)
       - ./config:/app/config:ro
-      # 로그 파일 마운트 (선택)
+      - ./data:/app/data
       - ./logs:/app/logs
     restart: unless-stopped
     networks:

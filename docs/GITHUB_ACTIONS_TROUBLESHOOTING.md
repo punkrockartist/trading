@@ -18,6 +18,23 @@ Actions가 전부 실패할 때 흔한 원인 두 가지입니다.
 3. 토큰 생성: [Docker Hub → Account Settings → Security → New Access Token](https://hub.docker.com/settings/security)
 4. 값이 없으면 두 시크릿 모두 추가한 뒤 워크플로 다시 실행
 
+**그래도 "Username and password required"가 나올 때:**
+
+- **포크에서 실행 중인지 확인**  
+  포크(fork)한 저장소에서 Actions를 돌리면, **원본 저장소의 시크릿은 전달되지 않습니다.**  
+  포크가 아니라 **본인 계정의 원본 저장소**에서 실행하거나, 포크라면 그 포크 저장소 Settings에서 시크릿을 따로 등록해야 합니다.
+
+- **토큰 복사 시 공백/줄바꿈**  
+  토큰을 붙여넣을 때 **앞뒤 공백**이나 **중간 줄바꿈**이 들어가면 로그인이 실패합니다.  
+  메모장에 붙여넣고 공백·줄바꿈을 모두 지운 뒤, 한 줄만 복사해서 시크릿에 넣어보세요.
+
+- **토큰 재발급**  
+  위를 해도 안 되면 Docker Hub에서 **새 Access Token**을 만들고, 그 값으로 `DOCKERHUB_TOKEN`을 **삭제 후 다시 생성**해서 넣은 뒤 Re-run 해보세요.
+
+- **시크릿 이름 철자**  
+  `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` (전부 대문자, HUB는 한 단어).  
+  `DOCKER_HUB_*` 처럼 언더스코어가 들어가면 안 됩니다.
+
 ---
 
 ## 2. Docker 빌드 실패 (COPY config/ 실패)
