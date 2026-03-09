@@ -4,6 +4,7 @@
 - PK: username (S)
 - SK: date (S, YYYYMMDD)
 - 속성: equity_start, equity_end, pnl, return_pct, trade_count, updated_at
+- 선택: wins, losses, gross_profit, gross_loss (기간 Win rate / Profit factor 집계용)
 """
 
 import json
@@ -110,13 +111,14 @@ class DynamoDBUserResultStore:
             if not item:
                 return None
             out = dict(item)
-            for k in ("equity_start", "equity_end", "pnl", "return_pct", "trade_count"):
-                if k in out and hasattr(out[k], "__float__"):
+            for k in ("equity_start", "equity_end", "pnl", "return_pct", "gross_profit", "gross_loss"):
+                if k in out:
                     try:
                         out[k] = float(out[k])
                     except Exception:
                         pass
-                if k == "trade_count" and k in out:
+            for k in ("trade_count", "wins", "losses"):
+                if k in out:
                     try:
                         out[k] = int(out[k])
                     except Exception:
@@ -133,10 +135,14 @@ class DynamoDBUserResultStore:
         equity_end: float,
         trade_count: int,
         equity_start: Optional[float] = None,
+        wins: Optional[int] = None,
+        losses: Optional[int] = None,
+        gross_profit: Optional[float] = None,
+        gross_loss: Optional[float] = None,
     ) -> bool:
         """
-        일별 성과 저장. 기존 row가 있으면 통합(equity_start 유지, equity_end·pnl·trade_count 갱신).
-        date=YYYYMMDD.
+        일별 성과 저장. 기존 row가 있으면 통합(equity_start 유지, equity_end·pnl·trade_count·wins·losses·gross 누적).
+        date=YYYYMMDD. wins/losses/gross_profit/gross_loss는 백테스트·기간 통계용.
         """
         if not self.enabled:
             return False
@@ -144,28 +150,42 @@ class DynamoDBUserResultStore:
             existing = self.get(username, date)
             if existing is not None:
                 start = float(existing.get("equity_start") or 0)
-                # 당일 여러 번 중지 시 거래 횟수 누적
                 trade_count = int(existing.get("trade_count") or 0) + int(trade_count)
+                wins = int(existing.get("wins") or 0) + (int(wins) if wins is not None else 0)
+                losses = int(existing.get("losses") or 0) + (int(losses) if losses is not None else 0)
+                gross_profit = float(existing.get("gross_profit") or 0) + (float(gross_profit) if gross_profit is not None else 0)
+                gross_loss = float(existing.get("gross_loss") or 0) + (float(gross_loss) if gross_loss is not None else 0)
             else:
                 start = float(equity_start if equity_start is not None else equity_end)
                 trade_count = int(trade_count)
+                wins = int(wins) if wins is not None else None
+                losses = int(losses) if losses is not None else None
+                gross_profit = float(gross_profit) if gross_profit is not None else None
+                gross_loss = float(gross_loss) if gross_loss is not None else None
 
             pnl = equity_end - start
             return_pct = (pnl / start * 100.0) if start and start != 0 else 0.0
             now = datetime.now(timezone.utc).isoformat()
 
-            self._table.put_item(
-                Item={
-                    "username": username,
-                    "date": date,
-                    "equity_start": round(start, 2),
-                    "equity_end": round(equity_end, 2),
-                    "pnl": round(pnl, 2),
-                    "return_pct": round(return_pct, 4),
-                    "trade_count": trade_count,
-                    "updated_at": now,
-                }
-            )
+            item = {
+                "username": username,
+                "date": date,
+                "equity_start": round(start, 2),
+                "equity_end": round(equity_end, 2),
+                "pnl": round(pnl, 2),
+                "return_pct": round(return_pct, 4),
+                "trade_count": trade_count,
+                "updated_at": now,
+            }
+            if wins is not None:
+                item["wins"] = wins
+            if losses is not None:
+                item["losses"] = losses
+            if gross_profit is not None:
+                item["gross_profit"] = round(gross_profit, 2)
+            if gross_loss is not None:
+                item["gross_loss"] = round(gross_loss, 2)
+            self._table.put_item(Item=item)
             return True
         except Exception as e:
             logger.warning(f"User result save failed ({username}/{date}): {e}", exc_info=True)
@@ -199,17 +219,18 @@ class DynamoDBUserResultStore:
             out = []
             for item in items:
                 row = dict(item)
-                for k in ("equity_start", "equity_end", "pnl", "return_pct"):
+                for k in ("equity_start", "equity_end", "pnl", "return_pct", "gross_profit", "gross_loss"):
                     if k in row:
                         try:
                             row[k] = float(row[k])
                         except Exception:
                             pass
-                if "trade_count" in row:
-                    try:
-                        row["trade_count"] = int(row["trade_count"])
-                    except Exception:
-                        pass
+                for k in ("trade_count", "wins", "losses"):
+                    if k in row:
+                        try:
+                            row[k] = int(row[k])
+                        except Exception:
+                            pass
                 out.append(row)
             return out
         except Exception as e:

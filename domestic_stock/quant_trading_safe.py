@@ -9,6 +9,17 @@
 5. 수동 승인 시스템 (옵션)
 6. 상세 로깅
 7. 서킷브레이커
+
+예외 발생 시 동작 (예측 가능성):
+- API 지연/장애: order_cash 호출에서 예외 발생 시 safe_execute_order가 catch하여
+  details["ok"]=False, details["error"]=메시지, details["status"]="error" 반환.
+  재시도는 order_retry_count+1회 수행 후 실패 시 위와 같이 반환.
+- 부분 체결: 주문 접수 후 체결은 pending으로 두고, reconcile 루프가 체결 조회 시
+  exec_qty/exec_px를 반영. update_position은 부분 매도 시 남은 수량만 유지하여
+  부분 체결을 정상 처리.
+- 주문 취소 실패: 현재 주문 취소 API 미호출. 미체결 주문은 pending TTL 후 prune.
+- 세션 끊김: KIS 토큰 만료 등으로 API 실패 시 위 API 예외와 동일 처리. WebSocket
+  대시보드 끊김은 클라이언트만 연결 해제, 엔진은 계속 구동.
 """
 
 import sys
@@ -47,6 +58,11 @@ class RiskManager:
         # 손절매/익절매 설정
         self.stop_loss_ratio = 0.02  # 2% 손실 시 매도
         self.take_profit_ratio = 0.05  # 5% 수익 시 매도
+        # ATR(또는 틱 변동성) 배수 손절/익절: True면 변동성 기반 거리 사용
+        self.use_atr_for_stop_take = False
+        self.atr_stop_mult = 1.5  # 손절 = 매수가 - atr_stop_mult * ATR
+        self.atr_take_mult = 2.0  # 익절 = 매수가 + atr_take_mult * ATR
+        self.atr_lookback_ticks = 20  # ATR 대용 틱 변동성 lookback
         # 트레일링 스탑 (0이면 사용 안 함)
         self.trailing_stop_ratio = 0.0
         self.trailing_activation_ratio = 0.0  # 수익이 이 비율 이상일 때부터 trailing 적용
@@ -66,12 +82,25 @@ class RiskManager:
         # 일일 손익 한도 기준(실현/합산)
         self.daily_profit_limit_basis = "total"  # realized | total
         self.daily_loss_limit_basis = "realized"  # realized | total
+        # 일일 한도 기준일: True=캘린더일(자정 리셋), False=세션(서버 기동 후)
+        self.daily_loss_limit_calendar = True
+        self.daily_profit_limit_calendar = True
+        # 월간 손실 한도(원). 0이면 미적용. 캘린더 월 기준
+        self.monthly_loss_limit = 0
+        # 누적 손실 한도(원). 0이면 미적용. 세션/저장된 기준일 이후 누적
+        self.cumulative_loss_limit = 0
+        self._monthly_pnl_reset_ym = ""  # YYYYMM
+        self._monthly_pnl = 0.0  # 해당 월 실현손익
+        self._cumulative_pnl_since = 0.0  # 누적 실현손익(리셋 없음)
+        self._daily_limit_date = ""  # 일일 한도 기준일(YYYYMMDD, 캘린더 리셋용)
 
         # 주문 실행 방식/재시도
         self.buy_order_style = "market"  # market | best_limit
         self.sell_order_style = "market"  # market | best_limit
         self.order_retry_count = 0
         self.order_retry_delay_ms = 300
+        self.order_retry_exponential_backoff = True  # 네트워크 오류 시 지수 백오프
+        self.order_retry_base_delay_ms = 1000  # 백오프 기준 지연(ms)
         self.order_fallback_to_market = True
 
         # 변동성 기반 포지션 사이징/종목당 최대 손실액
@@ -86,8 +115,18 @@ class RiskManager:
         
         # 거래 제한
         self.max_trades_per_day = 5  # 하루 최대 거래 횟수 (매수+매도 = 1회)
+        self.max_positions_count = 0  # 동시 보유 종목 수 상한. 0이면 제한 없음
         self.min_price_change_ratio = 0.01  # 최소 1% 변동 시만 거래
-        
+        # 진입 변동성 상한: 틱 변동성(가격 대비)이 이 비율 초과면 매수 스킵. 0이면 미적용
+        self.max_intraday_vol_pct = 0.0
+        # ATR(분봉) 필터: ATR/현재가*100 > atr_ratio_max_pct 이면 매수 스킵. 0이면 미적용
+        self.atr_filter_enabled = False
+        self.atr_period = 14
+        self.atr_ratio_max_pct = 0.0
+        # SAP(세션 평균가) 이탈 필터: |현재가-SAP|/SAP*100 > sap_deviation_max_pct 이면 스킵
+        self.sap_deviation_filter_enabled = False
+        self.sap_deviation_max_pct = 3.0
+
         # 현재 상태 추적
         self.daily_trades = 0  # 거래 횟수 (매수+매도 = 1회)
         self.daily_pnl = 0.0
@@ -114,10 +153,30 @@ class RiskManager:
         Returns:
             (가능여부, 이유)
         """
-        # 0. 오늘 신규 매수 중지 상태면 차단
         try:
             tz = timezone(timedelta(hours=9))
-            today_key = datetime.now(tz).strftime("%Y%m%d")
+            now_dt = datetime.now(tz)
+            today_key = now_dt.strftime("%Y%m%d")
+            ym_key = now_dt.strftime("%Y%m")
+        except Exception:
+            today_key = ""
+            ym_key = ""
+
+        # 0. 캘린더일 기준 일일 리셋
+        if today_key:
+            calendar_loss = bool(getattr(self, "daily_loss_limit_calendar", True))
+            calendar_profit = bool(getattr(self, "daily_profit_limit_calendar", True))
+            limit_date = str(getattr(self, "_daily_limit_date", "") or "")
+            if (calendar_loss or calendar_profit) and limit_date != today_key:
+                self._daily_limit_date = today_key
+                self.daily_trades = 0
+                self.daily_pnl = 0.0
+            if ym_key and getattr(self, "_monthly_pnl_reset_ym", "") != ym_key:
+                self._monthly_pnl_reset_ym = ym_key
+                self._monthly_pnl = 0.0
+
+        # 0-1. 오늘 신규 매수 중지 상태면 차단
+        try:
             if self.halt_new_buys_day and str(self.halt_new_buys_day) != today_key:
                 self.halt_new_buys_day = ""
                 self.halt_new_buys_reason = ""
@@ -152,6 +211,25 @@ class RiskManager:
             return False, "일일 손실 한도 도달"
         if profit_limit > 0 and float(profit_pnl) >= float(profit_limit):
             return False, "일일 이익 한도(목표) 달성"
+
+        # 2-1. 월간 손실 한도
+        try:
+            monthly_limit = int(getattr(self, "monthly_loss_limit", 0) or 0)
+            if monthly_limit > 0:
+                monthly_pnl = float(getattr(self, "_monthly_pnl", 0.0) or 0.0)
+                if monthly_pnl <= -float(monthly_limit):
+                    return False, "월간 손실 한도 도달"
+        except Exception:
+            pass
+        # 2-2. 누적 손실 한도
+        try:
+            cum_limit = int(getattr(self, "cumulative_loss_limit", 0) or 0)
+            if cum_limit > 0:
+                cum_pnl = float(getattr(self, "_cumulative_pnl_since", 0.0) or 0.0)
+                if cum_pnl <= -float(cum_limit):
+                    return False, "누적 손실 한도 도달"
+        except Exception:
+            pass
         
         # 3. 거래 금액 체크
         trade_amount = price * quantity
@@ -162,6 +240,11 @@ class RiskManager:
         max_position_value = self.account_balance * self.max_position_size_ratio
         if trade_amount > max_position_value:
             return False, f"포지션 크기 초과 (최대: {max_position_value:,.0f}원, 계좌의 {self.max_position_size_ratio*100}%)"
+        
+        # 4-1. 동시 보유 종목 수 상한 (0이면 미적용)
+        max_pos = int(getattr(self, "max_positions_count", 0) or 0)
+        if max_pos > 0 and len(self.positions) >= max_pos:
+            return False, f"동시 보유 종목 수 상한 도달 (최대 {max_pos}종목)"
         
         # 5. 기존 포지션 체크 (중복 매수 방지)
         if stock_code in self.positions:
@@ -273,25 +356,30 @@ class RiskManager:
     
     def calculate_quantity(self, price: float) -> int:
         """
-        거래 수량 계산 (계좌 잔고의 일정 비율)
-        
-        Returns:
-            거래 수량
+        거래 수량 계산.
+        - max_loss_per_stock_krw > 0 이면: position size = risk / stop distance (고정 리스크 per trade).
+        - 아니면: 계좌 잔고·최대 거래금액 기반 금액/가격.
         """
+        min_q = max(1, int(self.min_order_quantity or 1))
+        if price <= 0:
+            return min_q
         max_trade_amount = min(
-            self.max_single_trade_amount,
-            self.account_balance * self.max_position_size_ratio
+            float(getattr(self, "max_single_trade_amount", 0) or 0),
+            float(getattr(self, "account_balance", 0) or 0) * float(getattr(self, "max_position_size_ratio", 0) or 0),
         )
-        # 기본: 금액 기반 수량
-        quantity = int(max_trade_amount / price) if price > 0 else 0
-        min_q = 1
-        try:
-            min_q = int(self.min_order_quantity or 1)
-        except Exception:
-            min_q = 1
-        min_q = max(1, min_q)
-        quantity = max(min_q, quantity)
-        return quantity
+        # 리스크 기반: 수량 = risk_per_trade / stop_distance (손절거리)
+        max_loss = int(getattr(self, "max_loss_per_stock_krw", 0) or 0)
+        stop_ratio = float(getattr(self, "stop_loss_ratio", 0.0) or 0.0)
+        if max_loss > 0 and stop_ratio > 0:
+            stop_distance = price * stop_ratio
+            if stop_distance > 0:
+                qty_risk = int(max_loss / stop_distance)
+                qty_cap = int(max_trade_amount / price) if max_trade_amount > 0 else qty_risk
+                quantity = max(min_q, min(qty_risk, qty_cap))
+                return quantity
+        # 기본: 금액 기반
+        quantity = int(max_trade_amount / price) if max_trade_amount > 0 else 0
+        return max(min_q, quantity)
 
     def calculate_quantity_with_volatility(
         self,
@@ -425,6 +513,8 @@ class RiskManager:
                 actual_qty = min(sell_qty, pos_qty)
                 pnl = (price - buy_price) * actual_qty
                 self.daily_pnl += pnl
+                self._cumulative_pnl_since = float(getattr(self, "_cumulative_pnl_since", 0.0) or 0.0) + pnl
+                self._monthly_pnl = float(getattr(self, "_monthly_pnl", 0.0) or 0.0) + pnl
 
                 remain = pos_qty - actual_qty
                 if remain > 0:
@@ -466,6 +556,32 @@ class RiskManager:
             prev = self._highest_price.get(stock_code, 0.0)
             if float(px) > float(prev or 0.0):
                 self._highest_price[stock_code] = float(px)
+
+    def get_intraday_vol_ratio(self, stock_code: str, lookback: Optional[int] = None) -> Optional[float]:
+        """최근 N틱 가격 변동의 평균 절대차를 현재가로 나눈 비율. 변동성 상한/ATR용. 데이터 부족 시 None."""
+        try:
+            hist = self._price_history.get(stock_code) or []
+            if lookback is None:
+                lookback = int(getattr(self, "volatility_lookback_ticks", 20) or 20)
+            lookback = max(2, min(300, lookback))
+            if len(hist) < lookback + 1:
+                return None
+            price = float(hist[-1]) if hist else 0.0
+            if price <= 0:
+                return None
+            start = max(0, len(hist) - (lookback + 1))
+            diffs = []
+            for i in range(start + 1, len(hist)):
+                try:
+                    diffs.append(abs(float(hist[i]) - float(hist[i - 1])))
+                except Exception:
+                    continue
+            if not diffs:
+                return None
+            avg_abs = sum(diffs) / len(diffs)
+            return float(avg_abs) / price
+        except Exception:
+            return None
 
     def get_unrealized_pnl(self) -> float:
         try:
@@ -515,9 +631,27 @@ class RiskManager:
             effective_buy = buy_price
         change_ratio = (float(current_price) - effective_buy) / effective_buy if effective_buy > 0 else 0.0
 
-        # 손절
-        if self.stop_loss_ratio and change_ratio <= -float(self.stop_loss_ratio):
-            return {"action": "sell", "quantity": qty, "reason": "손절"}
+        # ATR(틱 변동성) 배수 손절/익절
+        use_atr = bool(getattr(self, "use_atr_for_stop_take", False))
+        if use_atr and hasattr(self, "get_intraday_vol_ratio"):
+            lookback = max(2, min(300, int(getattr(self, "atr_lookback_ticks", 20) or 20)))
+            vol_ratio = self.get_intraday_vol_ratio(stock_code, lookback=lookback)
+            if vol_ratio is not None and vol_ratio > 0 and effective_buy > 0:
+                atr_proxy = float(vol_ratio) * float(effective_buy)
+                stop_mult = max(0.5, min(5.0, float(getattr(self, "atr_stop_mult", 1.5) or 1.5)))
+                take_mult = max(0.5, min(10.0, float(getattr(self, "atr_take_mult", 2.0) or 2.0)))
+                stop_price = effective_buy - stop_mult * atr_proxy
+                take_price = effective_buy + take_mult * atr_proxy
+                if float(current_price) <= stop_price:
+                    return {"action": "sell", "quantity": qty, "reason": "손절(ATR)"}
+                if float(current_price) >= take_price:
+                    return {"action": "sell", "quantity": qty, "reason": "익절(ATR)"}
+            else:
+                use_atr = False
+        if not use_atr:
+            # 손절 (비율)
+            if self.stop_loss_ratio and change_ratio <= -float(self.stop_loss_ratio):
+                return {"action": "sell", "quantity": qty, "reason": "손절"}
 
         # 부분 익절
         try:
@@ -538,8 +672,8 @@ class RiskManager:
         except Exception:
             pass
 
-        # 익절(전량)
-        if self.take_profit_ratio and change_ratio >= float(self.take_profit_ratio):
+        # 익절(전량) — ATR 모드가 아닐 때만 비율 적용
+        if not use_atr and self.take_profit_ratio and change_ratio >= float(self.take_profit_ratio):
             return {"action": "sell", "quantity": qty, "reason": "익절"}
 
         # 트레일링 스탑
@@ -713,6 +847,28 @@ class QuantStrategy:
 # 안전한 매매 실행 함수
 # ============================================================================
 
+def _classify_order_rejection(resp: dict) -> tuple:
+    """
+    주문 거절 시 사유 분류. (reason_key, label) 반환.
+    reason_key: "vi" | "balance" | "suspended" | "auth" | "unknown"
+    """
+    if not resp or not isinstance(resp, dict):
+        return "unknown", ""
+    summary = resp.get("summary") or {}
+    msg = (summary.get("msg") or summary.get("MSG1") or "").strip()
+    msg_cd = (summary.get("msg_cd") or summary.get("MSG_CD") or "").strip()
+    msg_lower = msg.lower()
+    if "vi" in msg_lower or "변동성" in msg or "완화장치" in msg:
+        return "vi", msg or "VI(변동성완화장치) 발동"
+    if "잔고" in msg or "balance" in msg_lower or "예수금" in msg or "주문가능" in msg:
+        return "balance", msg or "잔고/주문가능수량 부족"
+    if "거래정지" in msg or "정지" in msg or "suspended" in msg_lower or "관리" in msg:
+        return "suspended", msg or "거래정지/관리종목"
+    if "401" in msg or "unauthorized" in msg_lower or "token" in msg_lower or "인증" in msg or "만료" in msg:
+        return "auth", msg or "인증/토큰 만료"
+    return "unknown", msg or "주문 거절"
+
+
 def _extract_order_response(df):
     """order_cash 응답 DataFrame에서 핵심 필드만 추출."""
     try:
@@ -854,6 +1010,24 @@ def _check_filled_order(env_dv: str, trenv, ord_dv: str, stock_code: str, odno: 
         return {"ok": False, "found": False, "reason": str(e)}
 
 
+def _call_with_network_retry(callable_fn, max_network_retries: int = 3, base_delay_ms: int = 1000, use_exponential: bool = True):
+    """네트워크 오류 시 재시도(지수 백오프). callable_fn() 인자 없음. (result, last_error) 반환."""
+    last_err = None
+    for attempt in range(max(1, max_network_retries + 1)):
+        try:
+            return callable_fn(), None
+        except (TimeoutError, ConnectionError, OSError) as e:
+            last_err = e
+            if attempt < max_network_retries:
+                delay_ms = base_delay_ms * (2 ** attempt) if use_exponential else base_delay_ms
+                delay_ms = max(100, min(30000, delay_ms))
+                logging.warning(f"[네트워크 재시도] {attempt + 1}/{max_network_retries + 1} 실패, {delay_ms}ms 후 재시도: {e}")
+                time.sleep(delay_ms / 1000.0)
+            else:
+                break
+    return None, last_err
+
+
 def safe_execute_order(
     signal: str,
     stock_code: str,
@@ -941,21 +1115,31 @@ def safe_execute_order(
             attempts = []
             last_result = pd.DataFrame()
             last_style_used = style
+            net_retries = min(3, 2)
+            base_delay = max(200, min(10000, int(getattr(risk_mgr, "order_retry_base_delay_ms", 1000) or 1000)))
+            use_backoff = bool(getattr(risk_mgr, "order_retry_exponential_backoff", True))
             for i in range(retries + 1):
                 style_used = last_style_used
                 ord_dvsn = "01" if style_used == "market" else "04"  # 04: 최우선 지정가
                 ord_unpr = "0"
-                result = order_cash(
-                    env_dv=details["env_dv"],
-                    ord_dv="buy",
-                    cano=trenv.my_acct,
-                    acnt_prdt_cd=trenv.my_prod,
-                    pdno=stock_code,
-                    ord_dvsn=ord_dvsn,
-                    ord_qty=str(quantity),
-                    ord_unpr=ord_unpr,
-                    excg_id_dvsn_cd="KRX",
-                )
+
+                def _do_buy(od=ord_dvsn, oq=str(quantity)):
+                    return order_cash(
+                        env_dv=details["env_dv"],
+                        ord_dv="buy",
+                        cano=trenv.my_acct,
+                        acnt_prdt_cd=trenv.my_prod,
+                        pdno=stock_code,
+                        ord_dvsn=od,
+                        ord_qty=oq,
+                        ord_unpr="0",
+                        excg_id_dvsn_cd="KRX",
+                    )
+                result, net_err = _call_with_network_retry(_do_buy, max_network_retries=net_retries, base_delay_ms=base_delay, use_exponential=use_backoff)
+                if net_err is not None:
+                    raise net_err
+                if result is None:
+                    raise ConnectionError("order_cash returned None")
                 last_result = result
                 resp = _extract_order_response(result)
                 accepted = bool(resp.get("accepted", False))
@@ -1079,16 +1263,43 @@ def safe_execute_order(
                 details["accepted"] = False
                 details["filled"] = False
                 details["status"] = "rejected"
+                rej_key, rej_msg = _classify_order_rejection(details.get("order_response"))
+                details["rejection_reason"] = rej_key
+                details["rejection_message"] = rej_msg
+                if rej_msg:
+                    logging.warning(f"[매수 거절] {stock_code}: {rej_msg}")
                 if return_details:
                     return False, details
                 return False
 
+        except (TimeoutError, ConnectionError, OSError) as e:
+            err_str = str(e).lower()
+            if "401" in err_str or "unauthorized" in err_str or "token" in err_str:
+                details["error_type"] = "auth_expired"
+                details["error"] = "토큰 만료 가능성. 재로그인 후 이용하세요."
+                logging.error(f"[매수 오류-인증] {stock_code}: 토큰 만료 가능성")
+            else:
+                details["error_type"] = "network"
+                details["error"] = f"API 지연/연결 실패: {e}"
+                logging.error(f"[매수 오류-네트워크] {stock_code}: {e}")
+            details["ok"] = False
+            details["accepted"] = False
+            details["filled"] = False
+            details["status"] = "error"
+            if return_details:
+                return False, details
+            return False
         except Exception as e:
-            logging.error(f"[매수 오류] {stock_code}: {e}")
+            err_str = str(e).lower()
+            if "401" in err_str or "unauthorized" in err_str or "token" in err_str:
+                details["error_type"] = "auth_expired"
+                details["error"] = "토큰 만료 가능성. 재로그인 후 이용하세요."
+            else:
+                details["error"] = str(e)
+            logging.error(f"[매수 오류] {stock_code}: {details.get('error', e)}")
             import traceback
             traceback.print_exc()
             details["ok"] = False
-            details["error"] = str(e)
             details["accepted"] = False
             details["filled"] = False
             details["status"] = "error"
@@ -1155,21 +1366,31 @@ def safe_execute_order(
             attempts = []
             last_result = pd.DataFrame()
             last_style_used = style
+            net_retries = min(3, 2)
+            base_delay = max(200, min(10000, int(getattr(risk_mgr, "order_retry_base_delay_ms", 1000) or 1000)))
+            use_backoff = bool(getattr(risk_mgr, "order_retry_exponential_backoff", True))
             for i in range(retries + 1):
                 style_used = last_style_used
                 ord_dvsn = "01" if style_used == "market" else "04"
                 ord_unpr = "0"
-                result = order_cash(
-                    env_dv=details["env_dv"],
-                    ord_dv="sell",
-                    cano=trenv.my_acct,
-                    acnt_prdt_cd=trenv.my_prod,
-                    pdno=stock_code,
-                    ord_dvsn=ord_dvsn,
-                    ord_qty=str(quantity),
-                    ord_unpr=ord_unpr,
-                    excg_id_dvsn_cd="KRX",
-                )
+
+                def _do_sell(od=ord_dvsn, oq=str(quantity)):
+                    return order_cash(
+                        env_dv=details["env_dv"],
+                        ord_dv="sell",
+                        cano=trenv.my_acct,
+                        acnt_prdt_cd=trenv.my_prod,
+                        pdno=stock_code,
+                        ord_dvsn=od,
+                        ord_qty=oq,
+                        ord_unpr="0",
+                        excg_id_dvsn_cd="KRX",
+                    )
+                result, net_err = _call_with_network_retry(_do_sell, max_network_retries=net_retries, base_delay_ms=base_delay, use_exponential=use_backoff)
+                if net_err is not None:
+                    raise net_err
+                if result is None:
+                    raise ConnectionError("order_cash returned None")
                 last_result = result
                 resp = _extract_order_response(result)
                 accepted = bool(resp.get("accepted", False))
@@ -1292,16 +1513,43 @@ def safe_execute_order(
                 details["accepted"] = False
                 details["filled"] = False
                 details["status"] = "rejected"
+                rej_key, rej_msg = _classify_order_rejection(details.get("order_response"))
+                details["rejection_reason"] = rej_key
+                details["rejection_message"] = rej_msg
+                if rej_msg:
+                    logging.warning(f"[매도 거절] {stock_code}: {rej_msg}")
                 if return_details:
                     return False, details
                 return False
 
+        except (TimeoutError, ConnectionError, OSError) as e:
+            err_str = str(e).lower()
+            if "401" in err_str or "unauthorized" in err_str or "token" in err_str:
+                details["error_type"] = "auth_expired"
+                details["error"] = "토큰 만료 가능성. 재로그인 후 이용하세요."
+                logging.error(f"[매도 오류-인증] {stock_code}: 토큰 만료 가능성")
+            else:
+                details["error_type"] = "network"
+                details["error"] = f"API 지연/연결 실패: {e}"
+                logging.error(f"[매도 오류-네트워크] {stock_code}: {e}")
+            details["ok"] = False
+            details["accepted"] = False
+            details["filled"] = False
+            details["status"] = "error"
+            if return_details:
+                return False, details
+            return False
         except Exception as e:
-            logging.error(f"[매도 오류] {stock_code}: {e}")
+            err_str = str(e).lower()
+            if "401" in err_str or "unauthorized" in err_str or "token" in err_str:
+                details["error_type"] = "auth_expired"
+                details["error"] = "토큰 만료 가능성. 재로그인 후 이용하세요."
+            else:
+                details["error"] = str(e)
+            logging.error(f"[매도 오류] {stock_code}: {details.get('error', e)}")
             import traceback
             traceback.print_exc()
             details["ok"] = False
-            details["error"] = str(e)
             details["accepted"] = False
             details["filled"] = False
             details["status"] = "error"

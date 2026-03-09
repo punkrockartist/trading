@@ -49,6 +49,7 @@ config/kis_devlp.yaml
 !DOCKER_LOGIN_FIX.md
 !DOCKER_PUSH_FIX.md
 !README_DOCKERHUB.md
+!docs/GITHUB_ACTIONS_TROUBLESHOOTING.md
 
 # 테스트
 test/

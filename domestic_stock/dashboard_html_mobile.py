@@ -629,12 +629,12 @@ def get_dashboard_html_mobile(username: str) -> str:
     <div class="topbar">
         <div class="topbar-inner">
             <div class="tablist">
-                <button class="tab active" onclick="showTab('status')">상태</button>
-                <button class="tab" onclick="showTab('positions')">포지션</button>
+            <button class="tab active" onclick="showTab('status')">상태</button>
+            <button class="tab" onclick="showTab('positions')">포지션</button>
                 <button class="tab" onclick="showTab('performance')">성과</button>
-                <button class="tab" onclick="showTab('settings')">설정</button>
+            <button class="tab" onclick="showTab('settings')">설정</button>
                 <button class="tab" onclick="showTab('signals')">승인대기</button>
-                <button class="tab" onclick="showTab('trades')">거래내역</button>
+            <button class="tab" onclick="showTab('trades')">거래내역</button>
             </div>
             <div class="nav-right">
                 <span id="status" class="status stopped">중지됨</span>
@@ -667,7 +667,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                 </div>
             </div>
         </div>
-    </div>
+        </div>
 
     <div class="container">
 
@@ -675,7 +675,7 @@ def get_dashboard_html_mobile(username: str) -> str:
         <div id="tab-status" class="tab-content active">
             <div class="card">
                 <div class="card-header-row">
-                    <h2>시스템 상태</h2>
+                <h2>시스템 상태</h2>
                     <div style="display:flex; align-items:center; gap:10px;">
                         <label style="display:flex; align-items:center; gap:6px; font-size:12px;">
                             <input type="checkbox" id="auto_refresh_enabled">
@@ -761,6 +761,16 @@ def get_dashboard_html_mobile(username: str) -> str:
                     </div>
                 </div>
                 <div class="card">
+                    <div class="card-header-row">
+                        <h2>기간 성과 (최근 1개월)</h2>
+                        <button class="btn btn-inline" onclick="loadPerformancePeriodStats()">새로고침</button>
+                    </div>
+                    <div class="hint">저장된 일별 자산 기준. DynamoDB quant_trading_user_result 사용 시에만 표시.</div>
+                    <div id="performance_period_metrics" style="display:grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap:12px; margin:12px 0;">
+                        <p style="color: var(--muted); grid-column: 1/-1;">로딩 중...</p>
+                    </div>
+                </div>
+                <div class="card">
                     <h2>권장 설정 (성과 기반)</h2>
                     <div id="performance_recommendations" style="font-size:14px; line-height:1.6;">
                         <p style="color: var(--muted);">성과 요약 로딩 후 표시됩니다.</p>
@@ -772,7 +782,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                 <div class="card">
                     <h2>일별 성과 (저장된 데이터)</h2>
                     <div class="hint">중지 시 저장된 일별 데이터를 from ~ to 구간으로 조회합니다.</div>
-                    <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:12px;">
+                    <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; margin-bottom:12px;">
                         <div class="form-group" style="margin:0; min-width:auto;">
                             <label style="font-size:12px;">시작일</label>
                             <input type="date" id="perf_date_from" style="width:16ch; padding:6px 8px; font-size:13px;">
@@ -781,7 +791,8 @@ def get_dashboard_html_mobile(username: str) -> str:
                             <label style="font-size:12px;">종료일</label>
                             <input type="date" id="perf_date_to" style="width:16ch; padding:6px 8px; font-size:13px;">
                         </div>
-                        <button type="button" class="btn btn-inline" onclick="loadPerformanceDaily()">조회</button>
+                        <button type="button" class="btn btn-inline" onclick="loadPerformanceDaily()" style="height:2rem; padding:0 10px; line-height:2rem;">조회</button>
+                        <button type="button" class="btn btn-inline" onclick="exportPerformanceCsv()" style="height:2rem; padding:0 10px; line-height:2rem;">내보내기(CSV)</button>
                     </div>
                     <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px;">
                         <div style="font-size:12px; color:var(--muted);">
@@ -826,36 +837,52 @@ def get_dashboard_html_mobile(username: str) -> str:
                 <div class="card">
                     <h2>추천 프리셋</h2>
                     <div class="hint">
-                        오전 단타(9~12) 운영을 가정한 기본값을 한 번에 적용합니다. (리스크/전략/종목선정 기준)
+                        리스크·전략·종목선정을 한 번에 적용합니다. 용도에 맞는 프리셋을 선택한 뒤 적용하세요.
                     </div>
-                    <button type="button" class="btn" onclick="applyScalpMorningPreset()">오전 단타(9~12) 프리셋 적용</button>
+                    <div class="form-group">
+                        <label>프리셋 선택:</label>
+                        <div style="display:inline-flex; align-items:center; gap:10px;">
+                            <select id="recommended_preset_select" style="width:200px;">
+                                <option value="">선택하세요</option>
+                                <option value="scalp_morning">오전 단타(9~12)</option>
+                                <option value="scalp_fullday">전일 단타(오전~오후)</option>
+                                <option value="scalp_conservative">보수적 단타</option>
+                                <option value="scalp_aggressive">공격적 단타</option>
+                            </select>
+                            <button type="button" class="btn" onclick="applyRecommendedPreset()" style="padding:6px 14px; font-size:0.9rem; width:auto; flex-shrink:0;">프리셋 적용</button>
+                        </div>
+                        <div class="hint" style="margin-top:6px;">
+                            오전 단타: 09:05~11:30 매수·11:55 청산. 전일 단타: 09:05~15:20 매수·15:25 청산. 보수적/공격적은 손절·거래 횟수·포지션 수 차이.
+                        </div>
+                    </div>
                 </div>
             </div>
 
             <div id="settings-section-risk" class="settings-section">
-                <div class="card">
-                    <h2>리스크 관리</h2>
+            <div class="card">
+                <h2>리스크 관리</h2>
                     <div class="hint" id="risk_summary"></div>
-                    <div class="form-group">
-                        <label>최대 거래 금액 (원):</label>
-                        <input type="number" id="max_trade_amount" value="1000000">
-                    </div>
+                <div class="form-group">
+                    <label>최대 거래 금액 (원):</label>
+                    <input type="number" id="max_trade_amount" value="1000000">
+                </div>
                     <div class="form-group">
                         <label>최소 매수 수량(주):</label>
                         <input type="number" id="min_order_quantity" value="1" min="1" max="1000">
                     </div>
-                    <div class="form-group">
-                        <label>손절매 비율 (%):</label>
-                        <input type="number" id="stop_loss" value="2" step="0.1">
-                    </div>
-                    <div class="form-group">
-                        <label>익절매 비율 (%):</label>
-                        <input type="number" id="take_profit" value="5" step="0.1">
-                    </div>
-                    <div class="form-group">
-                        <label>일일 손실 한도 (원):</label>
-                        <input type="number" id="daily_loss_limit" value="500000">
-                    </div>
+                <div class="form-group">
+                    <label>손절매 비율 (%):</label>
+                    <input type="number" id="stop_loss" value="1" step="0.1" min="0.1" max="10" title="오전 단타는 0.5~1.2% 권장">
+                    <div class="hint">오전 단타: 0.5~1.2% 권장. 2%는 스윙에 가깝습니다.</div>
+                </div>
+                <div class="form-group">
+                    <label>익절매 비율 (%):</label>
+                    <input type="number" id="take_profit" value="2" step="0.1" min="0.2" max="20">
+                </div>
+                <div class="form-group">
+                    <label>일일 손실 한도 (원):</label>
+                    <input type="number" id="daily_loss_limit" value="50000" min="0" step="10000">
+                </div>
                     <div class="form-group">
                         <label>일일 손실 한도 기준:</label>
                         <select id="daily_loss_limit_basis">
@@ -864,8 +891,17 @@ def get_dashboard_html_mobile(username: str) -> str:
                         </select>
                     </div>
                     <div class="form-group">
+                        <label>일일 최대 거래 횟수 (매수+매도=1회):</label>
+                        <input type="number" id="max_trades_per_day" value="5" min="1" max="50">
+                    </div>
+                    <div class="form-group">
+                        <label>동시 보유 종목 수 상한 (0=제한 없음):</label>
+                        <input type="number" id="max_positions_count" value="0" min="0" max="50">
+                    </div>
+                    <div class="form-group">
                         <label>일일 이익 한도(원) (전량매도 트리거):</label>
-                        <input type="number" id="daily_profit_limit" value="0" min="0" step="10000">
+                        <input type="number" id="daily_profit_limit" value="50000" min="0" step="10000">
+                        <div class="hint">dailyProfit ≥ dailyLoss 권장(대칭 한도). 예: 5만/5만.</div>
                     </div>
                     <div class="form-group">
                         <label>일일 이익 한도 기준:</label>
@@ -875,8 +911,22 @@ def get_dashboard_html_mobile(username: str) -> str:
                         </select>
                     </div>
                     <div class="form-group">
-                        <label style="color:var(--muted);">팁: “실현+미실현” 기반 손실 제한은 위의 ‘일일 손실 한도 기준’을 <strong>total</strong>로 바꾸면 됩니다.</label>
+                        <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="daily_loss_limit_calendar" checked> 일일 손실 한도 기준일: 캘린더일</label>
                     </div>
+                    <div class="form-group">
+                        <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="daily_profit_limit_calendar" checked> 일일 이익 한도 기준일: 캘린더일</label>
+                    </div>
+                    <div class="form-group">
+                        <label>월간 손실 한도(원,0=미적용):</label>
+                        <input type="number" id="monthly_loss_limit" value="0" min="0" step="100000">
+                    </div>
+                    <div class="form-group">
+                        <label>누적 손실 한도(원,0=미적용):</label>
+                        <input type="number" id="cumulative_loss_limit" value="0" min="0" step="100000">
+                    </div>
+                    <div class="form-group">
+                        <label style="color:var(--muted);">팁: “실현+미실현” 기반 손실 제한은 위의 ‘일일 손실 한도 기준’을 <strong>total</strong>로 바꾸면 됩니다.</label>
+            </div>
 
                     <details>
                         <summary>고급(주문/재시도/사이징/트레일링)</summary>
@@ -904,6 +954,16 @@ def get_dashboard_html_mobile(username: str) -> str:
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="order_retry_exponential_backoff" checked>
+                                네트워크 오류 시 지수 백오프
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label>백오프 기준 지연(ms):</label>
+                            <input type="number" id="order_retry_base_delay_ms" value="1000" min="200" max="10000" step="100">
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="order_fallback_to_market" checked>
                                 최우선 지정가 실패 시 시장가로 폴백
                             </label>
@@ -925,16 +985,49 @@ def get_dashboard_html_mobile(username: str) -> str:
                         <div class="form-group">
                             <label>종목당 최대 손실액(원):</label>
                             <input type="number" id="max_loss_per_stock_krw" value="0" min="0" step="10000">
+                            <div class="hint">0이면 금액 기반. &gt;0이면 포지션 수량 = 이 값 / 손절거리(가격×SL%).</div>
                         </div>
                         <div class="form-group">
                             <label>슬리피지·체결지연 보정(bps):</label>
-                            <input type="number" id="slippage_bps" value="0" min="0" max="500" step="5" title="손절/익절 판단 시 매수가 불리하게 체결된 것으로 가정">
+                            <input type="number" id="slippage_bps" value="20" min="0" max="500" step="5" title="손절/익절 판단 시 매수가 불리하게 체결된 것으로 가정">
+                            <div class="hint">한국 시장 10~30bps(0.1~0.3%) 흔함. 0이면 미적용.</div>
                             <div class="hint">0=미적용. 10=0.1%, 50=0.5%. 보수적 손익 판단용.</div>
                         </div>
                         <div class="form-group">
                             <label>변동성 하한(가격 대비 비율):</label>
                             <input type="number" id="volatility_floor_ratio" value="0.005" min="0" max="0.05" step="0.001" title="틱 부족 시 최소 변동성(장 초반 사이징)">
                             <div class="hint">예: 0.005=0.5%. 틱 부족 시 이 비율로 risk 계산.</div>
+                        </div>
+                        <div class="form-group">
+                            <label>진입 변동성 상한 (%):</label>
+                            <input type="number" id="max_intraday_vol_pct" value="0" min="0" max="20" step="0.5" title="틱 변동성(가격 대비)이 이 값 초과면 매수 스킵. 0=미적용">
+                            <div class="hint">0이면 미적용. 예: 3 = 최근 틱 변동성 3% 초과 시 진입 안 함.</div>
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="atr_filter_enabled">
+                                ATR(분봉) 변동성 필터
+                            </label>
+                            <div class="hint">분봉으로 ATR 계산. ATR/현재가 비율이 상한 초과면 매수 스킵. 0=미적용.</div>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>ATR 기간(봉):</label>
+                            <input type="number" id="atr_period" value="14" min="2" max="30">
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>ATR 비율 상한(%):</label>
+                            <input type="number" id="atr_ratio_max_pct" value="0" step="0.1" min="0" max="20" placeholder="0=미적용">
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="sap_deviation_filter_enabled">
+                                SAP(세션 평균가) 이탈 필터
+                            </label>
+                            <div class="hint">당일 분봉 (H+L+C)/3 평균 대비 이탈률이 상한 초과면 매수 스킵(과열/과매도 구간).</div>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>이탈률 상한(%):</label>
+                            <input type="number" id="sap_deviation_max_pct" value="3" step="0.5" min="0.5" max="20">
                         </div>
                         <details>
                             <summary>레거시(합산 손실 한도)</summary>
@@ -961,6 +1054,25 @@ def get_dashboard_html_mobile(username: str) -> str:
                         <div class="form-group">
                             <label>트레일링 활성화 최소 수익(%):</label>
                             <input type="number" id="trailing_activation_pct" value="0" step="0.1" min="0" max="50">
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="use_atr_for_stop_take">
+                                ATR(틱 변동성) 배수 손절/익절 사용
+                            </label>
+                            <div class="hint">체크 시 고정 비율 대신 변동성 배수로 손절/익절 거리 적용</div>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>ATR 손절 배수:</label>
+                            <input type="number" id="atr_stop_mult" value="1.5" step="0.1" min="0.5" max="5">
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>ATR 익절 배수:</label>
+                            <input type="number" id="atr_take_mult" value="2" step="0.1" min="0.5" max="10">
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>ATR lookback(틱):</label>
+                            <input type="number" id="atr_lookback_ticks" value="20" min="2" max="300">
                         </div>
                         <div class="form-group">
                             <label>주문 허용 최소 가격 변동(%):</label>
@@ -1181,6 +1293,154 @@ def get_dashboard_html_mobile(username: str) -> str:
                             <input type="number" id="reentry_cooldown_seconds" value="0" min="0" max="3600">
                         </div>
                         <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="consecutive_loss_cooldown_enabled">
+                                연속 손실 시 쿨다운 확대
+                            </label>
+                            <div class="hint">연속 N회 손실 후, 재진입 쿨다운 × 배수만큼 대기 후 다음 매수 허용.</div>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>연속 손실 횟수 (N):</label>
+                            <input type="number" id="consecutive_loss_count_threshold" value="2" min="2" max="5">
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>쿨다운 배수:</label>
+                            <input type="number" id="consecutive_loss_cooldown_mult" value="2" min="1" max="5" step="0.5">
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="circuit_breaker_filter_enabled" checked>
+                                거래소 서킷(급락) 필터
+                            </label>
+                            <div class="hint">전일 대비 지수 하락률이 N% 이하이면 신규 매수 스킵. KRX 1단계 서킷(~-8%) 직전 대응.</div>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>지수:</label>
+                            <select id="circuit_breaker_market">
+                                <option value="0001">코스피(0001)</option>
+                                <option value="1001">코스닥(1001)</option>
+                            </select>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>하락률 임계(%):</label>
+                            <input type="number" id="circuit_breaker_threshold_pct" value="-7" min="-20" max="0" step="0.5" title="-7 = 7% 하락 시 스킵">
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>서킷 시 동작:</label>
+                            <select id="circuit_breaker_action">
+                                <option value="skip_buy_only">신규 매수만 스킵</option>
+                                <option value="liquidate_all">전량 청산</option>
+                                <option value="liquidate_partial">일부 청산(50%)</option>
+                                <option value="no_buy_rest_of_day">당일 매수 금지</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="sidecar_filter_enabled" checked>
+                                사이드카 구간 필터
+                            </label>
+                            <div class="hint">지수 ±5%(코스피)/±6%(코스닥) 변동 시 N분간 신규 매수 스킵. KRX 프로그램매매 5분 정지에 맞춤.</div>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>지수:</label>
+                            <select id="sidecar_market">
+                                <option value="0001">코스피(0001)</option>
+                                <option value="1001">코스닥(1001)</option>
+                            </select>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>냉각(분):</label>
+                            <input type="number" id="sidecar_cooling_minutes" value="5" min="1" max="30" title="변동 감지 후 매수 스킵 시간">
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>사이드카 시 동작:</label>
+                            <select id="sidecar_action">
+                                <option value="skip_buy_only">신규 매수만 스킵</option>
+                                <option value="liquidate_all">전량 청산</option>
+                                <option value="liquidate_partial">일부 청산(50%)</option>
+                                <option value="no_buy_rest_of_day">당일 매수 금지</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="vi_filter_enabled" checked>
+                                VI(종목별 변동성완화장치) 필터
+                            </label>
+                            <div class="hint">VI 발동 종목은 N분간 해당 종목만 매수 스킵.</div>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>해당 종목 냉각(분):</label>
+                            <input type="number" id="vi_cooling_minutes" value="5" min="1" max="30">
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="index_ma_filter_enabled">
+                                지수 MA 시장 레짐 필터
+                            </label>
+                            <div class="hint">지수(코스닥/코스피)가 N일 MA 미만이면 매수 전부 스킵. 하락장 진입 억제.</div>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>지수:</label>
+                            <select id="index_ma_code">
+                                <option value="1001">코스닥(1001)</option>
+                                <option value="0001">코스피(0001)</option>
+                            </select>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>MA 기간(일):</label>
+                            <input type="number" id="index_ma_period" value="20" min="5" max="60">
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="advance_ratio_filter_enabled">
+                                상승 종목 비율 시장 레짐 필터
+                            </label>
+                            <div class="hint">등락률 순위 API 기준 상승/하락 건수 비율. N% 미만이면 매수 스킵.</div>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>시장:</label>
+                            <select id="advance_ratio_market">
+                                <option value="1001">코스닥(1001)</option>
+                                <option value="0001">코스피(0001)</option>
+                            </select>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>상승 비율 하한(%):</label>
+                            <input type="number" id="advance_ratio_min_pct" value="40" min="0" max="100" step="5">
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="advance_ratio_down_market_skip" checked>
+                                하락장 강화(상승비율 &lt;50% 시 전량 매수 스킵)
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="trade_value_concentration_filter_enabled">
+                                거래대금 집중 시장 레짐 필터
+                            </label>
+                            <div class="hint">상위 N종목 거래대금/상위 M종목 비율이 X% 초과면 매수 스킵(좁은 시장).</div>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>시장:</label>
+                            <select id="trade_value_concentration_market">
+                                <option value="1001">코스닥(1001)</option>
+                                <option value="0001">코스피(0001)</option>
+                            </select>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>상위 N종목:</label>
+                            <input type="number" id="trade_value_concentration_top_n" value="10" min="2" max="20">
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>분모 상위 M종목:</label>
+                            <input type="number" id="trade_value_concentration_denom_n" value="30" min="5" max="50">
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>집중도 상한(%):</label>
+                            <input type="number" id="trade_value_concentration_max_pct" value="45" min="10" max="80" step="5">
+                        </div>
+                        <div class="form-group">
                             <label>진입 확인(연속 틱 수):</label>
                             <input type="number" id="buy_confirm_ticks" value="1" min="1" max="10">
                         </div>
@@ -1195,6 +1455,39 @@ def get_dashboard_html_mobile(username: str) -> str:
                         <div class="form-group">
                             <label>횡보장 제외: 최소 레인지(%)</label>
                             <input type="number" id="min_range_pct" value="0" step="0.01" min="0" max="20">
+                        </div>
+                        <div class="form-group">
+                            <label>진입 거래량 하한(평균 대비 배수, 0=미적용):</label>
+                            <input type="number" id="min_volume_ratio_for_entry" value="0" step="0.1" min="0" max="5">
+                        </div>
+                        <div class="form-group">
+                            <label>진입 거래대금 하한(평균 대비 배수, 0=미적용):</label>
+                            <input type="number" id="min_trade_amount_ratio_for_entry" value="0" step="0.1" min="0" max="5">
+                        </div>
+                        <div class="form-group">
+                            <label>장 초반 매수 스킵(분, 09:00 KST 기준, 0=미적용):</label>
+                            <input type="number" id="skip_buy_first_minutes" value="0" min="0" max="30">
+                        </div>
+                        <div class="form-group">
+                            <label>장 마감 전 N분 매수 스킵(0=미적용):</label>
+                            <input type="number" id="last_minutes_no_buy" value="0" min="0" max="60">
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="relative_strength_filter_enabled">
+                                지수 대비 상대 강도 필터(종목 변동률 &gt; 지수+margin일 때만 매수)
+                            </label>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>지수:</label>
+                            <select id="relative_strength_index_code">
+                                <option value="0001">코스피(0001)</option>
+                                <option value="1001">코스닥(1001)</option>
+                            </select>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>margin(%):</label>
+                            <input type="number" id="relative_strength_margin_pct" value="0" step="0.1">
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
@@ -1213,32 +1506,32 @@ def get_dashboard_html_mobile(username: str) -> str:
             </div>
 
             <div id="settings-section-stocks" class="settings-section">
-                <div class="card">
-                    <h2>종목 선정 기준</h2>
+            <div class="card">
+                <h2>종목 선정 기준</h2>
                     <div class="hint" id="stocks_summary"></div>
-                    <div class="form-group">
-                        <label>프리셋:</label>
-                        <select id="preset_select" onchange="loadPreset()">
-                            <option value="">직접 설정</option>
+                <div class="form-group">
+                    <label>프리셋:</label>
+                    <select id="preset_select" onchange="loadPreset()">
+                        <option value="">직접 설정</option>
                             <option value="scalp_morning">오전 단타(9~12)</option>
-                            <option value="common">보편적</option>
-                            <option value="conservative">보수적</option>
-                            <option value="aggressive">공격적</option>
-                            <option value="beginner">초보자용</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>최소 상승률 (%):</label>
-                        <input type="number" id="min_change" value="1" step="0.1">
-                    </div>
-                    <div class="form-group">
-                        <label>최대 상승률 (%):</label>
-                        <input type="number" id="max_change" value="15" step="0.1">
-                    </div>
-                    <div class="form-group">
+                        <option value="common">보편적</option>
+                        <option value="conservative">보수적</option>
+                        <option value="aggressive">공격적</option>
+                        <option value="beginner">초보자용</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>최소 상승률 (%):</label>
+                    <input type="number" id="min_change" value="1" step="0.1">
+                </div>
+                <div class="form-group">
+                    <label>최대 상승률 (%):</label>
+                    <input type="number" id="max_change" value="15" step="0.1">
+                </div>
+                <div class="form-group">
                         <label>선정 후보군 수(최대 20):</label>
                         <input type="number" id="max_stocks" value="10" min="1" max="20">
-                    </div>
+                </div>
                     <div class="form-group">
                         <label>최소 가격 (원):</label>
                         <input type="number" id="min_price" value="1000">
@@ -1351,6 +1644,21 @@ def get_dashboard_html_mobile(username: str) -> str:
                         <label>추천 알림 간격 (분):</label>
                         <input type="number" id="performance_recommend_interval_minutes" value="5" min="1" max="60" step="1">
                     </div>
+                    <div class="form-group">
+                        <label>WebSocket 재연결 대기 (초):</label>
+                        <input type="number" id="ws_reconnect_sleep_sec" value="5" min="3" max="60" title="연결 끊김 후 재연결 시도 전 대기 시간">
+                    </div>
+                    <div class="form-group">
+                        <label>긴급 청산: 단절 N분 (0=미적용):</label>
+                        <input type="number" id="emergency_liquidate_disconnect_minutes" value="0" min="0" max="120" title="WS가 N분 이상 끊긴 뒤 복구 시 전량 매도. 0이면 사용 안 함">
+                    </div>
+                    <div class="form-group">
+                        <label style="display:flex; align-items:center; gap:8px;">
+                            <input type="checkbox" id="keep_previous_on_empty_selection" checked>
+                            종목 선정 결과 0건 시 이전 목록 유지
+                        </label>
+                        <div class="hint">선정 API가 빈 결과를 반환해도 기존 선정 종목 목록을 비우지 않고 유지합니다.</div>
+                    </div>
                     <button class="btn" onclick="updateOperationalConfig()">운영 옵션 저장</button>
                 </div>
             </div>
@@ -1359,60 +1667,106 @@ def get_dashboard_html_mobile(username: str) -> str:
                 <div class="card">
                     <h2>설정 도움말</h2>
                     <div class="hint">
-                        아래 설명은 “현재 시스템 구현 기준”으로, 값이 커질수록 보수적/공격적이 되는 방향이 어디인지 함께 정리했습니다.
-                        (단위가 %인 항목은 입력은 “퍼센트(예: 2.0)”이고, 내부에서는 비율(0.02)로 저장됩니다.)
+                        아래 설명은 “현재 시스템 구현 기준”으로, 값이 커질수록 보수적/공격적이 되는 방향을 함께 적었습니다.
+                        % 항목은 화면에는 퍼센트(예: 2.0)로 넣고, 내부에서는 비율(0.02)로 저장됩니다. 저장 후 다른 탭을 갔다 와도 설정이 유지되도록 각 탭에서 반드시 「저장」 버튼을 눌러 주세요.
                     </div>
+
+                    <details>
+                        <summary>추천 프리셋</summary>
+                        <div class="help-grid">
+                            <div class="help-item">
+                                <strong>추천 프리셋이란?</strong>
+                                리스크·전략·종목선정 값을 한 번에 맞춰 주는 묶음 설정입니다. 용도에 맞는 항목을 선택한 뒤 「프리셋 적용」을 누르면, 해당 프리셋의 기본값이 폼에 채워지고 저장·종목 재선정까지 순서대로 실행됩니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>오전 단타(9~12)</strong>
+                                매수 창 09:05~11:30(KST), 11:55 시간 청산. 손절·익절·일일 한도·변동성 필터(ATR/SAP)·시장 레짐(지수 MA, 상승 비율) 등이 단타에 맞게 설정됩니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>전일 단타(오전~오후)</strong>
+                                매수 창 09:05~15:20, 15:25 시간 청산. 오전 단타와 동일한 전략·리스크 구조에, 장 마감 직전까지 매수·청산을 허용하는 버전입니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>보수적 단타 / 공격적 단타</strong>
+                                매수 창은 오전 단타와 동일(11:30/11:55). 보수적은 손절·익절을 더 타이트하게, 일일 거래 횟수·동시 보유 종목 수를 줄입니다. 공격적은 손절·익절을 넓히고 거래 횟수·동시 보유 종목을 늘립니다.
+                            </div>
+                        </div>
+                    </details>
 
                     <details open>
                         <summary>리스크 관리</summary>
                         <div class="help-grid">
                             <div class="help-item">
                                 <strong>최대 거래 금액 (원) (<code>max_single_trade_amount</code>)</strong>
-                                한 번의 매수에서 사용할 수 있는 최대 금액 상한입니다. 너무 크게 잡으면 급등락 시 손익 변동이 커집니다.
+                                한 번의 매수에서 쓸 수 있는 최대 금액입니다. 이 값을 넘는 주문은 실행되지 않습니다. 너무 크면 종목당 손익 변동이 커지므로, 단타에서는 50~200만 원 구간을 많이 씁니다.
                             </div>
                             <div class="help-item">
                                 <strong>최소 매수 수량(주) (<code>min_order_quantity</code>)</strong>
                                 매수 시 최소 수량을 강제합니다. 너무 크게 잡으면 “조건은 좋은데 주문이 거절(수량 부족)”될 수 있습니다.
                             </div>
                             <div class="help-item">
+                                <strong>일일 최대 거래 횟수 (<code>max_trades_per_day</code>)</strong>
+                                하루에 허용하는 “매수+매도” 쌍의 횟수입니다. 예: 5이면 매수 5회·매도 5회까지 가능합니다. 초과 시 당일 신규 매수가 막힙니다. 단타는 보통 3~8회 정도로 설정합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>동시 보유 종목 수 상한 (<code>max_positions_count</code>)</strong>
+                                동시에 보유할 수 있는 종목 수의 상한입니다. 0이면 제한 없음, 1~2로 두면 한두 종목만 보유하는 집중 운영이 됩니다. 리스크 분산을 원하면 3~5 정도로 넉넉히 둡니다.
+                            </div>
+                            <div class="help-item">
                                 <strong>손절매 비율(%) (<code>stop_loss_ratio</code>)</strong>
-                                종목별 손실률이 이 값 이상이면 매도 신호를 냅니다. 값이 작을수록 더 빨리 손절(보수적)합니다.
+                                매수가 대비 손실률이 이 값에 도달하면 매도 신호를 냅니다. 값이 작을수록 빨리 손절(보수적)합니다. 단타에서는 0.5~1.2%를 많이 씁니다.
                             </div>
                             <div class="help-item">
                                 <strong>익절매 비율(%) (<code>take_profit_ratio</code>)</strong>
-                                종목별 수익률이 이 값 이상이면 매도 신호를 냅니다. 값이 작을수록 빠르게 이익 실현합니다.
+                                매수가 대비 수익률이 이 값에 도달하면 매도 신호를 냅니다. 손절 대비 2배 정도(예: 손절 0.8%·익절 1.8%)로 두면 손익비를 맞추기 쉽습니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>ATR(틱 변동성) 배수 손절/익절 (<code>use_atr_for_stop_take</code>)</strong>
+                                켜면 고정 % 대신 “최근 틱 변동성(ATR 대용)”의 배수로 손절·익절 거리를 정합니다. 변동성이 큰 종목은 손절선이 넓어지고, 작은 종목은 좁아져 자동으로 맞춥니다. <code>atr_stop_mult</code>(손절 배수), <code>atr_take_mult</code>(익절 배수)로 조절합니다.
                             </div>
                             <div class="help-item">
                                 <strong>일일 손실 한도 (원) (<code>daily_loss_limit</code>)</strong>
-                                누적 실현 손익(<code>daily_pnl</code>)이 손실 한도 이하로 내려가면 신규 매수가 차단됩니다.
+                                당일 실현 손익(또는 설정에 따라 실현+미실현 합산)이 이 한도 이하로 떨어지면 신규 매수가 차단됩니다. 단타에서는 3~10만 원 구간을 많이 씁니다.
                             </div>
                             <div class="help-item">
                                 <strong>일일 이익 한도(원) (<code>daily_profit_limit</code>)</strong>
-                                현재 보유 전량을 시장가로 청산한다고 가정한 “실현+미실현 합산 손익”이 이 값 이상이면, 그날 1회 전량 매도 신호를 생성합니다. 0이면 사용 안 함.
+                                실현+미실현 합산(전량 청산 가정)이 이 값 이상이면 그날 1회 전량 매도 신호가 나옵니다. 0이면 사용하지 않습니다. 일일 손실 한도와 대칭으로 두면(예: 5만/5만) 운영이 단순해집니다.
                             </div>
                             <div class="help-item">
                                 <strong>일일 손실 한도 기준 (<code>daily_loss_limit_basis</code>)</strong>
-                                기본은 <code>realized</code>(실현 손익)이며, <code>total</code>로 바꾸면 “실현+미실현 합산” 기준으로 손실 한도를 적용합니다.
+                                <code>realized</code>면 “실제 체결된 손익”만 보고, <code>total</code>이면 “실현+미실현 합산”으로 한도를 적용합니다. total이 더 보수적입니다.
                             </div>
                             <div class="help-item">
-                                <strong>일일 손실 한도(원) (레거시) (<code>daily_total_loss_limit</code>)</strong>
-                                과거 호환용입니다. 신규 방식은 <code>daily_loss_limit</code> + <code>daily_loss_limit_basis=total</code> 사용을 권장합니다.
+                                <strong>일일 손실 한도(원) 레거시 (<code>daily_total_loss_limit</code>)</strong>
+                                과거 호환용 필드입니다. 새로 설정할 때는 <code>daily_loss_limit</code>와 <code>daily_loss_limit_basis=total</code> 조합 사용을 권장합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>월간/누적 손실 한도 (<code>monthly_loss_limit</code> / <code>cumulative_loss_limit</code>)</strong>
+                                월간 손실 한도는 해당 달 실현 손익이 한도 이하로 떨어지면 신규 매수 차단, 누적 손실 한도는 설정 시점 이후 누적 실현 손익 기준입니다. 0이면 미적용입니다. 도달 시 알림이 나갑니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>변동성 기반 포지션 사이징 (<code>enable_volatility_sizing</code>)</strong>
+                                켜면 “종목당 최대 손실액”과 “틱 변동성(또는 손절 비율)”을 이용해 매수 수량을 자동 계산합니다. 변동성이 큰 종목은 수량이 줄어들어 리스크를 맞춥니다. <code>max_loss_per_stock_krw</code>를 넣어야 동작합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>진입 변동성 상한·ATR·SAP 필터</strong>
+                                <code>max_intraday_vol_pct</code>: 최근 틱의 가격 변동폭(가격 대비 비율)이 이 %를 넘으면 매수 스킵. <code>atr_filter_enabled</code>·<code>atr_ratio_max_pct</code>: 분봉 ATR/현재가가 상한을 넘으면 스킵. <code>sap_deviation_filter_enabled</code>·<code>sap_deviation_max_pct</code>: 당일 세션 평균가(SAP) 대비 이탈률이 너무 크면(과열/과매도 구간) 스킵합니다. 단타 프리셋에서는 ATR·SAP를 켜 두는 것을 권장합니다.
                             </div>
                             <div class="help-item">
                                 <strong>슬리피지·체결지연 보정(bps) (<code>slippage_bps</code>)</strong>
-                                손절/익절 판단 시 매수가 불리하게 체결된 것으로 가정하는 보수적 반영입니다. 10=0.1%, 50=0.5%. 체결 지연·슬리피지를 간단히 모델링할 때 사용합니다.
+                                손절/익절 판단 시 “매수가가 불리하게 체결됐다”고 가정하는 bps입니다. 10=0.1%, 50=0.5%. 체결 지연이나 슬리피지가 있을 때 보수적으로 쓰면 좋습니다.
                             </div>
                             <div class="help-item">
-                                <strong>변동성 하한(가격 대비 비율) (<code>volatility_floor_ratio</code>)</strong>
-                                틱이 부족한 장 초반 등에서 변동성 기반 사이징이 과소 수량이 되지 않도록 최소 변동성을 둡니다. 예: 0.005=0.5%.
+                                <strong>변동성 하한 (<code>volatility_floor_ratio</code>)</strong>
+                                장 초반처럼 틱이 적을 때 변동성 기반 사이징이 너무 적은 수량이 나오지 않도록, 변동성에 대한 최소값(가격 대비 비율)을 둡니다. 예: 0.005 = 0.5%.
                             </div>
                             <div class="help-item">
                                 <strong>부분 익절 트리거/비율</strong>
-                                트리거 수익률에 도달하면 보유 수량의 일부를 매도합니다. (수량이 1주면 부분익절은 사실상 전량 매도처럼 동작할 수 있습니다.)
+                                지정한 수익률에 도달하면 보유 수량의 일부만 매도합니다. 비율은 0~100%로 설정합니다. 1주만 보유 중이면 부분 익절도 전량 매도처럼 처리됩니다.
                             </div>
                             <div class="help-item">
                                 <strong>트레일링 스탑/활성화</strong>
-                                일정 수익(활성화) 이후에는 고점 대비 하락폭이 트레일링 스탑을 넘으면 매도합니다. 변동성 큰 종목에서 유효합니다.
+                                “활성화 수익률” 이상 오른 뒤, 고점 대비 “트레일링 스탑 %”만큼 내려오면 매도합니다. 추세가 길게 나갈 때 수익을 더 끌어당기면서도 급반전 시 보호할 수 있습니다.
                             </div>
                         </div>
                     </details>
@@ -1426,15 +1780,19 @@ def get_dashboard_html_mobile(username: str) -> str:
                             </div>
                             <div class="help-item">
                                 <strong>신규 매수 허용 시간 (KST) (<code>buy_window_start_hhmm</code>~<code>buy_window_end_hhmm</code>)</strong>
-                                매수만 시간 제한을 걸어 장중 노이즈 구간 진입을 줄입니다. 매도/청산은 항상 허용됩니다.
+                                이 구간에만 신규 매수가 허용됩니다. 매도·청산은 항상 가능합니다. 오전 단타는 09:05~11:30, 전일은 09:05~15:20처럼 끝 시각만 바꿔 쓰면 됩니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>장 초반 N분 매수 스킵 / 마감 N분 전 스킵 (<code>skip_buy_first_minutes</code> / <code>last_minutes_no_buy</code>)</strong>
+                                <code>skip_buy_first_minutes</code>: 09:00(KST) 기준으로 이 값(분) 동안은 신규 매수를 하지 않습니다. 장 초반 노이즈를 피할 때 씁니다(예: 5분). <code>last_minutes_no_buy</code>: 매수 창 종료 시각 기준 “끝 N분”에는 신규 매수를 막습니다. 마감 직전 진입을 줄일 때 씁니다(예: 10~15분).
                             </div>
                             <div class="help-item">
                                 <strong>단기MA 기울기 최소(%/틱) (<code>min_short_ma_slope_ratio</code>)</strong>
-                                단기 추세 강도가 약하면 매수 스킵합니다. 값이 커질수록 “강한 추세”만 진입합니다.
+                                단기 이평선이 올라가는 강도가 이 값 이상일 때만 매수합니다. 0이면 검사하지 않고, 값을 키우면 “추세가 더 선명한” 구간만 진입합니다.
                             </div>
                             <div class="help-item">
                                 <strong>모멘텀 필터(N틱/%) (<code>momentum_lookback_ticks</code>/<code>min_momentum_ratio</code>)</strong>
-                                최근 N틱 전 대비 상승률이 최소 % 이상일 때만 매수합니다. (0이면 사용 안 함)
+                                최근 N틱 전 가격 대비 현재가 상승률이 최소 % 이상일 때만 매수합니다. 0이면 사용하지 않습니다. 단타에서는 8틱·0.2% 정도를 많이 씁니다.
                             </div>
                             <div class="help-item">
                                 <strong>진입 보강(2단) (<code>entry_confirm_enabled</code>)</strong>
@@ -1467,24 +1825,44 @@ def get_dashboard_html_mobile(username: str) -> str:
                                 - <code>minute_trend_early_only</code>: 분봉 추세 필터를 장 초반 레짐에만 적용
                             </div>
                             <div class="help-item">
+                                <strong>시장 레짐: 지수 MA·상승 비율·하락장 강화 (<code>index_ma_filter</code> / <code>advance_ratio_*</code> / <code>advance_ratio_down_market_skip</code>)</strong>
+                                지수 MA: 선택한 지수(코스피/코스닥)가 N일 이평선 아래면 매수 스킵. 상승 비율: 시장에서 상승 종목 비율이 N% 미만이면 스킵. <code>advance_ratio_down_market_skip</code>을 켜면 상승 비율이 50% 미만(하락장)일 때 전량 매수 스킵으로 더 강하게 막습니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>서킷브레이커·사이드카·VI (<code>circuit_breaker_*</code> / <code>sidecar_*</code> / <code>vi_*</code>)</strong>
+                                서킷: 지수 전일 대비 하락률이 임계값(예: -7%) 이하이면 신규 매수 스킵(또는 설정에 따라 전량/일부 청산). 사이드카: 지수 급등락(코스피 ±5%, 코스닥 ±6%) 시 N분간 매수 스킵. VI: 해당 종목에 변동성완화장치가 걸리면 그 종목만 N분간 매수 스킵. 단타에서는 세 옵션 모두 켜 두는 것을 권장합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>진입 시 거래량·거래대금 하한 (<code>min_volume_ratio_for_entry</code> / <code>min_trade_amount_ratio_for_entry</code>)</strong>
+                                현재 틱의 거래량(또는 거래대금)이 “최근 평균” 대비 이 배수 미만이면 매수 스킵합니다. 0이면 사용 안 함. 유동성이 부족한 구간 진입을 줄일 때 씁니다(예: 0.5 = 평균의 절반 이상일 때만 매수).
+                            </div>
+                            <div class="help-item">
+                                <strong>지수 대비 상대 강도 (<code>relative_strength_filter_enabled</code>)</strong>
+                                켜면 “종목 당일 변동률 &gt; 지수 당일 변동률 + margin%”일 때만 매수합니다. 지수보다 강한 종목만 고르는 필터입니다. margin을 0으로 두면 “종목이 지수보다만 올라가면” 허용합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>거래대금 집중·연속 손실 쿨다운</strong>
+                                거래대금 집중: 상위 N종목 거래대금 비율이 X%를 넘으면 “좁은 시장”으로 보고 매수 스킵. 연속 손실 쿨다운: 직전 N회 모두 손실이면 재진입 쿨다운 시간을 배수만큼 늘려, 그동안 같은 종목 재매수를 막습니다.
+                            </div>
+                            <div class="help-item">
                                 <strong>재진입 쿨다운(초) (<code>reentry_cooldown_seconds</code>)</strong>
-                                매도 직후 같은 종목 재매수를 일정 시간 금지합니다. 횡보장에서 ‘사고팔고 반복’을 줄입니다.
+                                한 종목을 매도한 뒤 이 시간(초) 동안은 같은 종목 매수를 하지 않습니다. 횡보장에서 같은 종목을 반복 매매하는 것을 줄일 때 씁니다. 180초(3분) 정도를 많이 씁니다.
                             </div>
                             <div class="help-item">
                                 <strong>진입 확인(연속 틱 수) (<code>buy_confirm_ticks</code>)</strong>
-                                매수 조건이 연속으로 유지될 때만 매수합니다. 값이 커질수록 엄격해져 매수가 줄 수 있습니다.
+                                매수 조건(MA 크로스·추세·보강 조건 등)이 연속으로 이 틱 수만큼 유지될 때만 실제 매수 주문을 냅니다. 1이면 조건 만족 즉시, 2 이상이면 더 확실한 추세일 때만 진입합니다.
                             </div>
                             <div class="help-item">
                                 <strong>최대 스프레드(%) (<code>max_spread_ratio</code>)</strong>
-                                호가 스프레드가 크면 매수 스킵합니다. 너무 타이트하면 매수가 거의 안 될 수 있습니다.
+                                매수 호가와 매도 호가 차이(스프레드)가 현재가 대비 이 비율을 넘으면 매수 스킵합니다. 스프레드가 크면 체결 시 불리해지므로, 단타에서는 0.2% 정도로 두는 경우가 많습니다. 너무 작게 잡으면 매수 기회가 줄어듭니다.
                             </div>
                             <div class="help-item">
                                 <strong>횡보장 제외(N틱/레인지%) (<code>range_lookback_ticks</code>/<code>min_range_ratio</code>)</strong>
-                                최근 N틱의 고저 폭이 너무 작으면(레인지가 작으면) 매수 스킵합니다. “움직임 없는 구간” 진입을 피합니다.
+                                최근 N틱 동안의 고가−저가 폭(레인지)이 현재가 대비 이 비율보다 작으면 “움직임이 없는 구간”으로 보고 매수 스킵합니다. 레인지 %를 키우면 더 움직인 구간만 진입합니다.
                             </div>
                             <div class="help-item">
-                                <strong>시간기반 청산</strong>
-                                지정 시각 이후 보유 포지션을 전량 매도 신호로 청산합니다(하루 1회). 오전 단타 운영에서 정리용으로 씁니다.
+                                <strong>시간기반 청산 (<code>enable_time_liquidation</code> / <code>liquidate_after_hhmm</code>)</strong>
+                                켜면 지정 시각(<code>liquidate_after_hhmm</code>)이 지난 뒤, 보유 포지션에 대해 전량 매도 신호를 한 번 생성합니다. 오전 단타는 11:55, 전일 단타는 15:25처럼 “매수 창 종료 직후”로 두면 정리하기 좋습니다.
                             </div>
                         </div>
                     </details>
@@ -1494,31 +1872,53 @@ def get_dashboard_html_mobile(username: str) -> str:
                         <div class="help-grid">
                             <div class="help-item">
                                 <strong>최소/최대 상승률(%) (<code>min_price_change_ratio</code>/<code>max_price_change_ratio</code>)</strong>
-                                KIS 등락률 랭킹에서 이 범위에 해당하는 종목만 후보로 가져옵니다.
+                                KIS 등락률 랭킹에서 이 범위에 들어오는 종목만 후보로 가져옵니다. 예: 1~8%면 “오늘 1%~8% 오른 종목”만 후보가 됩니다. 범위를 너무 좁히면 후보가 0건이 될 수 있습니다.
                             </div>
                             <div class="help-item">
                                 <strong>가격/거래량/거래대금 조건</strong>
-                                너무 빡세면 “API OK but output empty/결과 없음”이 자주 나옵니다. 특히 거래대금(원)은 크게 잡으면 후보가 급감합니다.
+                                최소 가격(원), 최소 거래량(주), 최소 거래대금(원)으로 후보를 한 번 더 걸러냅니다. 조건을 너무 빡세게 두면 “API는 성공했는데 결과 0건”이 자주 나옵니다. 거래대금 하한을 크게 잡으면 후보가 크게 줄어듭니다.
                             </div>
                             <div class="help-item">
                                 <strong>선정 정렬 기준 (<code>sort_by</code>)</strong>
-                                최종 후보 중 어떤 종목을 우선 선택할지 결정합니다. 기본은 등락률(랭킹 그대로)이며, 전일 거래대금은 “전일에 거래가 많이 된 종목”을 우선으로 하는 대신 선정이 느릴 수 있습니다.
+                                후보가 여러 개일 때 어떤 순서로 우선 선택할지 정합니다. 등락률(기본)이면 랭킹 순 그대로, 전일 거래대금이면 “어제 많이 거래된 종목”을 앞에 두어 유동성·관심도를 반영합니다. 전일 거래대금은 API 호출이 추가돼 선정이 조금 느려질 수 있습니다.
                             </div>
                             <div class="help-item">
                                 <strong>전일 거래대금 후보 pool 크기 (<code>prev_day_rank_pool_size</code>)</strong>
-                                전일 거래대금 기반 정렬 시, 상위 몇 개 후보에 대해 전일 거래대금 조회를 수행할지 제한합니다. 값이 클수록 정확하지만 느려집니다.
+                                정렬을 “전일 거래대금”으로 쓸 때, 상위 몇 개 후보까지 전일 거래대금을 조회할지 제한합니다. 크게 두면 정확하지만 조회 시간이 길어지고, 작게 두면 빠르지만 상위 몇 개만 정렬됩니다.
                             </div>
                             <div class="help-item">
                                 <strong>장초 워밍업(분) (<code>warmup_minutes</code>)</strong>
-                                장 시작 직후 변동 노이즈가 큰 구간을 지나고 나서 종목 선정/재선정을 하도록 유도합니다.
+                                장 시작 후 이 시간(분)이 지날 때까지는 종목 선정·재선정을 하지 않습니다. 장 초반 급등락·체결 왜곡이 진정된 뒤에 선정해, 노이즈에 휘둘리지 않게 합니다.
                             </div>
                             <div class="help-item">
                                 <strong>장초 강화 필터 (<code>early_strict</code>)</strong>
-                                장 시작 후 일정 시간 동안 거래량/거래대금 최소치를 더 높여, “초기 체결 몇 건”에 의한 왜곡을 줄입니다.
+                                켜면 장 시작 후 일정 시간 동안 “최소 거래량·거래대금”을 기본값보다 더 높게 적용합니다. 초반 몇 건 체결만으로 랭킹에 올라온 종목을 걸러내는 용도입니다.
                             </div>
                             <div class="help-item">
-                                <strong>고점 대비 하락추세 제외 (<code>exclude_drawdown</code>)</strong>
-                                특히 오후 시작 시점에 고점 찍고 밀린 종목을 제외합니다. <code>max_drawdown_pct</code>를 너무 작게 잡으면 대부분 제외될 수 있습니다.
+                                <strong>고점 대비 하락추세 제외 (<code>exclude_drawdown</code> / <code>max_drawdown_pct</code>)</strong>
+                                켜면 “당일 고점 대비 N% 이상 내려온 종목”을 후보에서 제외합니다. 오후에 선정할 때 “아침에 고점 찍고 밀린 종목”을 빼는 데 씁니다. <code>max_drawdown_pct</code>를 너무 작게 두면 대부분이 제외될 수 있으니 3~5% 정도부터 시험해 보세요.
+                            </div>
+                        </div>
+                    </details>
+
+                    <details>
+                        <summary>운영 옵션</summary>
+                        <div class="help-grid">
+                            <div class="help-item">
+                                <strong>자동 리밸런싱(재선정 주기)</strong>
+                                주기적으로 종목 선정을 다시 수행해, “지금 시점에 맞는” 후보 목록으로 갱신합니다. 주기를 짧게 두면 시장 변화에 빠르게 맞추지만 API·부하가 늘고, 길게 두면 안정적이지만 반응이 느립니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>WebSocket 재연결 대기</strong>
+                                실시간 시세 연결이 끊겼을 때 재연결을 시도하기 전에 잠시 대기하는 시간입니다. 너무 짧으면 서버 부하가 커지고, 너무 길면 그동안 틱을 못 받을 수 있습니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>긴급 청산(연결 단절 N분)</strong>
+                                실시간 시세(또는 엔진)가 N분 이상 끊긴 상태가 되면, 보유 포지션을 전량 시장가 매도하고 매매를 중단하는 옵션입니다. 네트워크·장애 시 리스크를 제한할 때 씁니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>선정 결과 0건 시 이전 목록 유지</strong>
+                                종목 선정을 돌렸는데 후보가 한 건도 없을 때, “이전에 선정된 목록”을 그대로 쓸지 여부입니다. 켜 두면 선정 실패일 때도 직전 종목 목록으로 계속 매매 후보를 유지할 수 있습니다.
                             </div>
                         </div>
                     </details>
@@ -1676,6 +2076,31 @@ def get_dashboard_html_mobile(username: str) -> str:
             }}
         }}
 
+        async function exportPerformanceCsv() {{
+            const fromEl = document.getElementById('perf_date_from');
+            const toEl = document.getElementById('perf_date_to');
+            if (!fromEl || !toEl) return;
+            const date_from = (fromEl.value || '').trim().replace(/[-/]/g, '').slice(0, 8);
+            const date_to = (toEl.value || '').trim().replace(/[-/]/g, '').slice(0, 8);
+            if (date_from.length !== 8 || date_to.length !== 8) {{
+                alert('시작일·종료일을 선택한 뒤 내보내기를 실행해 주세요.');
+                return;
+            }}
+            try {{
+                const r = await fetch(`/api/performance/export?date_from=${{encodeURIComponent(date_from)}}&date_to=${{encodeURIComponent(date_to)}}&format=csv`, {{ credentials: 'include', headers: {{ 'Authorization': 'Bearer ' + (localStorage.getItem('token') || '') }} }});
+                if (!r.ok) {{ const j = await r.json().catch(() => ({{}})); throw new Error(j.message || r.statusText); }}
+                const blob = await r.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'performance_' + date_from + '_' + date_to + '.csv';
+                a.click();
+                URL.revokeObjectURL(url);
+            }} catch (e) {{
+                alert('내보내기 실패: ' + (e.message || ''));
+            }}
+        }}
+
         function renderPerformanceDailyPage() {{
             const statusEl = document.getElementById('performance_daily_status');
             const tableEl = document.getElementById('performance_daily_table');
@@ -1751,14 +2176,16 @@ def get_dashboard_html_mobile(username: str) -> str:
                     return;
                 }}
                 const s = data.summary;
+                const pf = s.profit_factor != null ? Number(s.profit_factor).toFixed(2) : (s.losses === 0 && s.wins > 0 ? '∞' : '-');
                 metricsEl.innerHTML = `
                     <div class="metric"><span class="metric-label">일일 실현손익</span><span class="metric-value">${{(s.total_pnl >= 0 ? '+' : '')}}${{Number(s.total_pnl).toLocaleString()}}원</span></div>
                     <div class="metric"><span class="metric-label">거래 횟수</span><span class="metric-value">${{s.trade_count}}회</span></div>
-                    <div class="metric"><span class="metric-label">승률</span><span class="metric-value">${{s.win_rate_pct}}%</span></div>
+                    <div class="metric"><span class="metric-label">Win rate</span><span class="metric-value">${{s.win_rate_pct}}%</span></div>
+                    <div class="metric"><span class="metric-label">Profit factor</span><span class="metric-value">${{pf}}</span></div>
                     <div class="metric"><span class="metric-label">승/패</span><span class="metric-value">${{s.wins}} / ${{s.losses}}</span></div>
                     <div class="metric"><span class="metric-label">평균 수익</span><span class="metric-value">${{Number(s.avg_win).toLocaleString()}}원</span></div>
                     <div class="metric"><span class="metric-label">평균 손실</span><span class="metric-value">${{Number(s.avg_loss).toLocaleString()}}원</span></div>
-                    <div class="metric"><span class="metric-label">세션 최대낙폭</span><span class="metric-value">${{Number(s.session_max_drawdown).toLocaleString()}}원 (${{s.session_max_drawdown_pct}}%)</span></div>
+                    <div class="metric"><span class="metric-label">Max drawdown (세션)</span><span class="metric-value">${{Number(s.session_max_drawdown).toLocaleString()}}원 (${{s.session_max_drawdown_pct}}%)</span></div>
                 `;
                 if (s.recommendations && s.recommendations.length) {{
                     recEl.innerHTML = s.recommendations.map(rec => `
@@ -1770,6 +2197,35 @@ def get_dashboard_html_mobile(username: str) -> str:
             }} catch (e) {{
                 metricsEl.innerHTML = '<p style="color:var(--error);">로드 실패: ' + (e.message || '') + '</p>';
                 recEl.innerHTML = '<p style="color:var(--muted);">-</p>';
+            }}
+            loadPerformancePeriodStats();
+        }}
+
+        async function loadPerformancePeriodStats() {{
+            const el = document.getElementById('performance_period_metrics');
+            if (!el) return;
+            try {{
+                const r = await fetch('/api/performance/period-stats?months=1', {{ headers: {{ 'Authorization': 'Bearer ' + (localStorage.getItem('token') || '') }} }});
+                const data = await r.json();
+                if (!data.success) {{
+                    el.innerHTML = '<p style="color:var(--muted);">' + (data.message || '기간 성과를 불러올 수 없습니다.') + '</p>';
+                    return;
+                }}
+                const p = data.period_stats || {{}};
+                const monthlyPct = p.monthly_return_pct != null ? (p.monthly_return_pct >= 0 ? '+' : '') + Number(p.monthly_return_pct).toFixed(2) + '%' : '-';
+                const ddPct = p.period_max_drawdown_pct != null ? Number(p.period_max_drawdown_pct).toFixed(2) + '%' : '-';
+                const monthlyCl = (p.monthly_return_pct != null && p.monthly_return_pct < 0) ? 'negative' : (p.monthly_return_pct != null && p.monthly_return_pct > 0) ? 'positive' : '';
+                const winRatePct = p.period_win_rate_pct != null ? Number(p.period_win_rate_pct).toFixed(1) + '%' : '-';
+                const pfVal = p.period_profit_factor != null ? Number(p.period_profit_factor).toFixed(2) : (p.period_trade_count > 0 ? '∞' : '-');
+                el.innerHTML = `
+                    <div class="metric"><span class="metric-label">Monthly return</span><span class="metric-value ${{monthlyCl}}">${{monthlyPct}}</span></div>
+                    <div class="metric"><span class="metric-label">Max drawdown (기간)</span><span class="metric-value">${{ddPct}}</span></div>
+                    <div class="metric"><span class="metric-label">Win rate (기간)</span><span class="metric-value">${{winRatePct}}</span></div>
+                    <div class="metric"><span class="metric-label">Profit factor (기간)</span><span class="metric-value">${{pfVal}}</span></div>
+                    <div class="metric"><span class="metric-label">기간 거래 횟수</span><span class="metric-value">${{(p.period_trade_count != null ? p.period_trade_count : 0)}}</span></div>
+                `;
+            }} catch (e) {{
+                el.innerHTML = '<p style="color:var(--error);">로드 실패: ' + (e.message || '') + '</p>';
             }}
         }}
 
@@ -2120,6 +2576,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                     const dtl = document.getElementById('daily_total_loss_limit')?.value || '0';
                     const dlb = document.getElementById('daily_loss_limit_basis')?.value || 'realized';
                     const dpb = document.getElementById('daily_profit_limit_basis')?.value || 'total';
+                    const mtpd = document.getElementById('max_trades_per_day')?.value || '5';
                     const pt = document.getElementById('partial_tp_pct')?.value || '0';
                     const tr = document.getElementById('trailing_stop_pct')?.value || '0';
                     const legacyLoss = (parseInt(dtl || '0') > 0) ? (' · legacyTotalLoss=' + dtl + '원') : '';
@@ -2128,6 +2585,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                         'minQty=' + minQty + '주 · ' +
                         'SL=' + sl + '%/TP=' + tp + '% · ' +
                         'dailyLoss=' + dly + '원(' + dlb + ') · ' +
+                        'maxTrades=' + mtpd + '회/일 · ' +
                         'dailyProfit=' + dpr + '원(' + dpb + ')' +
                         legacyLoss + ' · ' +
                         '부분익절=' + pt + '% · ' +
@@ -2151,6 +2609,15 @@ def get_dashboard_html_mobile(username: str) -> str:
                     const rr = document.getElementById('min_range_pct')?.value || '0';
                     const liqOn = !!document.getElementById('enable_time_liquidation')?.checked;
                     const liqAt = document.getElementById('liquidate_after_hhmm')?.value || '-';
+                    const idxMaOn = !!document.getElementById('index_ma_filter_enabled')?.checked;
+                    const idxCode = document.getElementById('index_ma_code')?.value || '1001';
+                    const idxPeriod = document.getElementById('index_ma_period')?.value || '20';
+                    const idxLabel = (idxCode === '1001' ? '코스닥' : '코스피') + idxPeriod + 'd';
+                    const advOn = !!document.getElementById('advance_ratio_filter_enabled')?.checked;
+                    const advMin = document.getElementById('advance_ratio_min_pct')?.value || '40';
+                    const tvcOn = !!document.getElementById('trade_value_concentration_filter_enabled')?.checked;
+                    const tvcTop = document.getElementById('trade_value_concentration_top_n')?.value || '10';
+                    const tvcMax = document.getElementById('trade_value_concentration_max_pct')?.value || '45';
                     strat.textContent =
                         'MA=' + sma + '/' + lma + ' · ' +
                         'buy=' + bwS + '-' + bwE + ' · ' +
@@ -2158,6 +2625,9 @@ def get_dashboard_html_mobile(username: str) -> str:
                         'mom≥' + momP + '%/N' + momN + ' · ' +
                         'confirm2=' + (ec ? 'on' : 'off') + ' · ' +
                         'cd=' + cd + 's · ' +
+                        (idxMaOn ? '지수MA=' + idxLabel + ' · ' : '') +
+                        (advOn ? '상승비율≥' + advMin + '% · ' : '') +
+                        (tvcOn ? '거래대금집중<' + tvcMax + '%(상위' + tvcTop + ') · ' : '') +
                         'confirm=' + conf + ' · ' +
                         'spr≤' + spr + '% · ' +
                         'range≥' + rr + '%/N' + n + ' · ' +
@@ -2376,11 +2846,19 @@ def get_dashboard_html_mobile(username: str) -> str:
                     if (risk.daily_profit_limit != null) document.getElementById('daily_profit_limit').value = risk.daily_profit_limit;
                     if (risk.daily_total_loss_limit != null) document.getElementById('daily_total_loss_limit').value = risk.daily_total_loss_limit;
                     if (risk.daily_loss_limit_basis != null) document.getElementById('daily_loss_limit_basis').value = risk.daily_loss_limit_basis;
+                    if (risk.max_trades_per_day != null) document.getElementById('max_trades_per_day').value = risk.max_trades_per_day;
+                    if (risk.max_positions_count != null) document.getElementById('max_positions_count').value = risk.max_positions_count;
                     if (risk.daily_profit_limit_basis != null) document.getElementById('daily_profit_limit_basis').value = risk.daily_profit_limit_basis;
                     if (risk.buy_order_style != null) document.getElementById('buy_order_style').value = risk.buy_order_style;
                     if (risk.sell_order_style != null) document.getElementById('sell_order_style').value = risk.sell_order_style;
                     if (risk.order_retry_count != null) document.getElementById('order_retry_count').value = risk.order_retry_count;
                     if (risk.order_retry_delay_ms != null) document.getElementById('order_retry_delay_ms').value = risk.order_retry_delay_ms;
+                    if (risk.order_retry_exponential_backoff != null) {{ const el = document.getElementById('order_retry_exponential_backoff'); if (el) el.checked = !!risk.order_retry_exponential_backoff; }}
+                    if (risk.order_retry_base_delay_ms != null) {{ const el = document.getElementById('order_retry_base_delay_ms'); if (el) el.value = risk.order_retry_base_delay_ms; }}
+                    if (risk.daily_loss_limit_calendar != null) {{ const el = document.getElementById('daily_loss_limit_calendar'); if (el) el.checked = !!risk.daily_loss_limit_calendar; }}
+                    if (risk.daily_profit_limit_calendar != null) {{ const el = document.getElementById('daily_profit_limit_calendar'); if (el) el.checked = !!risk.daily_profit_limit_calendar; }}
+                    if (risk.monthly_loss_limit != null) {{ const el = document.getElementById('monthly_loss_limit'); if (el) el.value = risk.monthly_loss_limit; }}
+                    if (risk.cumulative_loss_limit != null) {{ const el = document.getElementById('cumulative_loss_limit'); if (el) el.value = risk.cumulative_loss_limit; }}
                     if (risk.order_fallback_to_market != null) document.getElementById('order_fallback_to_market').checked = !!risk.order_fallback_to_market;
                     if (risk.enable_volatility_sizing != null) document.getElementById('enable_volatility_sizing').checked = !!risk.enable_volatility_sizing;
                     if (risk.volatility_lookback_ticks != null) document.getElementById('volatility_lookback_ticks').value = risk.volatility_lookback_ticks;
@@ -2388,11 +2866,21 @@ def get_dashboard_html_mobile(username: str) -> str:
                     if (risk.max_loss_per_stock_krw != null) document.getElementById('max_loss_per_stock_krw').value = risk.max_loss_per_stock_krw;
                     if (risk.slippage_bps != null) document.getElementById('slippage_bps').value = risk.slippage_bps;
                     if (risk.volatility_floor_ratio != null) document.getElementById('volatility_floor_ratio').value = risk.volatility_floor_ratio;
+                    if (risk.max_intraday_vol_pct != null) document.getElementById('max_intraday_vol_pct').value = risk.max_intraday_vol_pct;
+                    if (risk.atr_filter_enabled != null) document.getElementById('atr_filter_enabled').checked = !!risk.atr_filter_enabled;
+                    if (risk.atr_period != null) document.getElementById('atr_period').value = risk.atr_period;
+                    if (risk.atr_ratio_max_pct != null) document.getElementById('atr_ratio_max_pct').value = risk.atr_ratio_max_pct;
+                    if (risk.sap_deviation_filter_enabled != null) document.getElementById('sap_deviation_filter_enabled').checked = !!risk.sap_deviation_filter_enabled;
+                    if (risk.sap_deviation_max_pct != null) document.getElementById('sap_deviation_max_pct').value = risk.sap_deviation_max_pct;
                     if (risk.trailing_stop_ratio != null) document.getElementById('trailing_stop_pct').value = (risk.trailing_stop_ratio * 100).toFixed(1);
                     if (risk.trailing_activation_ratio != null) document.getElementById('trailing_activation_pct').value = (risk.trailing_activation_ratio * 100).toFixed(1);
                     if (risk.partial_take_profit_ratio != null) document.getElementById('partial_tp_pct').value = (risk.partial_take_profit_ratio * 100).toFixed(1);
                     if (risk.partial_take_profit_fraction != null) document.getElementById('partial_tp_fraction_pct').value = (risk.partial_take_profit_fraction * 100).toFixed(0);
                     if (risk.min_price_change_ratio != null) document.getElementById('min_price_change_ratio_pct').value = (risk.min_price_change_ratio * 100).toFixed(1);
+                    if (risk.use_atr_for_stop_take != null) document.getElementById('use_atr_for_stop_take').checked = !!risk.use_atr_for_stop_take;
+                    if (risk.atr_stop_mult != null) document.getElementById('atr_stop_mult').value = risk.atr_stop_mult;
+                    if (risk.atr_take_mult != null) document.getElementById('atr_take_mult').value = risk.atr_take_mult;
+                    if (risk.atr_lookback_ticks != null) document.getElementById('atr_lookback_ticks').value = risk.atr_lookback_ticks;
                 }}
                 if (strat) {{
                     if (strat.short_ma_period != null) document.getElementById('short_ma_period').value = strat.short_ma_period;
@@ -2436,12 +2924,44 @@ def get_dashboard_html_mobile(username: str) -> str:
                     if (strat.early_range_lookback_ticks != null) document.getElementById('early_range_lookback_ticks').value = strat.early_range_lookback_ticks;
                     if (strat.early_min_range_ratio != null) document.getElementById('early_min_range_pct').value = (strat.early_min_range_ratio * 100).toFixed(2);
                     if (strat.reentry_cooldown_seconds != null) document.getElementById('reentry_cooldown_seconds').value = strat.reentry_cooldown_seconds;
+                    if (strat.consecutive_loss_cooldown_enabled != null) document.getElementById('consecutive_loss_cooldown_enabled').checked = !!strat.consecutive_loss_cooldown_enabled;
+                    if (strat.consecutive_loss_count_threshold != null) document.getElementById('consecutive_loss_count_threshold').value = strat.consecutive_loss_count_threshold;
+                    if (strat.consecutive_loss_cooldown_mult != null) document.getElementById('consecutive_loss_cooldown_mult').value = strat.consecutive_loss_cooldown_mult;
+                    if (strat.circuit_breaker_filter_enabled != null) document.getElementById('circuit_breaker_filter_enabled').checked = !!strat.circuit_breaker_filter_enabled;
+                    if (strat.circuit_breaker_market != null) document.getElementById('circuit_breaker_market').value = strat.circuit_breaker_market;
+                    if (strat.circuit_breaker_threshold_pct != null) document.getElementById('circuit_breaker_threshold_pct').value = strat.circuit_breaker_threshold_pct;
+                    if (strat.circuit_breaker_action != null) {{ const el = document.getElementById('circuit_breaker_action'); if (el) el.value = strat.circuit_breaker_action; }}
+                    if (strat.sidecar_filter_enabled != null) document.getElementById('sidecar_filter_enabled').checked = !!strat.sidecar_filter_enabled;
+                    if (strat.sidecar_market != null) document.getElementById('sidecar_market').value = strat.sidecar_market;
+                    if (strat.sidecar_cooling_minutes != null) document.getElementById('sidecar_cooling_minutes').value = strat.sidecar_cooling_minutes;
+                    if (strat.sidecar_action != null) {{ const el = document.getElementById('sidecar_action'); if (el) el.value = strat.sidecar_action; }}
+                    if (strat.vi_filter_enabled != null) document.getElementById('vi_filter_enabled').checked = !!strat.vi_filter_enabled;
+                    if (strat.vi_cooling_minutes != null) document.getElementById('vi_cooling_minutes').value = strat.vi_cooling_minutes;
+                    if (strat.index_ma_filter_enabled != null) document.getElementById('index_ma_filter_enabled').checked = !!strat.index_ma_filter_enabled;
+                    if (strat.index_ma_code != null) document.getElementById('index_ma_code').value = strat.index_ma_code;
+                    if (strat.index_ma_period != null) document.getElementById('index_ma_period').value = strat.index_ma_period;
+                    if (strat.advance_ratio_filter_enabled != null) document.getElementById('advance_ratio_filter_enabled').checked = !!strat.advance_ratio_filter_enabled;
+                    if (strat.advance_ratio_market != null) document.getElementById('advance_ratio_market').value = strat.advance_ratio_market;
+                    if (strat.advance_ratio_min_pct != null) document.getElementById('advance_ratio_min_pct').value = strat.advance_ratio_min_pct;
+                    if (strat.trade_value_concentration_filter_enabled != null) document.getElementById('trade_value_concentration_filter_enabled').checked = !!strat.trade_value_concentration_filter_enabled;
+                    if (strat.trade_value_concentration_market != null) document.getElementById('trade_value_concentration_market').value = strat.trade_value_concentration_market;
+                    if (strat.trade_value_concentration_top_n != null) document.getElementById('trade_value_concentration_top_n').value = strat.trade_value_concentration_top_n;
+                    if (strat.trade_value_concentration_denom_n != null) document.getElementById('trade_value_concentration_denom_n').value = strat.trade_value_concentration_denom_n;
+                    if (strat.trade_value_concentration_max_pct != null) document.getElementById('trade_value_concentration_max_pct').value = strat.trade_value_concentration_max_pct;
                     if (strat.buy_confirm_ticks != null) document.getElementById('buy_confirm_ticks').value = strat.buy_confirm_ticks;
                     if (strat.enable_time_liquidation != null) document.getElementById('enable_time_liquidation').checked = !!strat.enable_time_liquidation;
                     if (strat.liquidate_after_hhmm != null) document.getElementById('liquidate_after_hhmm').value = strat.liquidate_after_hhmm;
                     if (strat.max_spread_ratio != null) document.getElementById('max_spread_pct').value = (strat.max_spread_ratio * 100).toFixed(2);
                     if (strat.range_lookback_ticks != null) document.getElementById('range_lookback_ticks').value = strat.range_lookback_ticks;
                     if (strat.min_range_ratio != null) document.getElementById('min_range_pct').value = (strat.min_range_ratio * 100).toFixed(2);
+                    if (strat.min_volume_ratio_for_entry != null) document.getElementById('min_volume_ratio_for_entry').value = strat.min_volume_ratio_for_entry;
+                    if (strat.min_trade_amount_ratio_for_entry != null) document.getElementById('min_trade_amount_ratio_for_entry').value = strat.min_trade_amount_ratio_for_entry;
+                    if (strat.skip_buy_first_minutes != null) document.getElementById('skip_buy_first_minutes').value = strat.skip_buy_first_minutes;
+                    if (strat.last_minutes_no_buy != null) document.getElementById('last_minutes_no_buy').value = strat.last_minutes_no_buy;
+                    if (strat.relative_strength_filter_enabled != null) document.getElementById('relative_strength_filter_enabled').checked = !!strat.relative_strength_filter_enabled;
+                    if (strat.relative_strength_index_code != null) {{ const el = document.getElementById('relative_strength_index_code'); if (el) el.value = strat.relative_strength_index_code; }}
+                    if (strat.relative_strength_margin_pct != null) document.getElementById('relative_strength_margin_pct').value = strat.relative_strength_margin_pct;
+                    if (strat.advance_ratio_down_market_skip != null) document.getElementById('advance_ratio_down_market_skip').checked = !!strat.advance_ratio_down_market_skip;
                 }}
                 if (stocksel) {{
                     const preset = document.getElementById('preset_select');
@@ -2472,6 +2992,9 @@ def get_dashboard_html_mobile(username: str) -> str:
                     if (oper.auto_rebalance_interval_minutes != null) document.getElementById('auto_rebalance_interval_minutes').value = oper.auto_rebalance_interval_minutes;
                     if (oper.enable_performance_auto_recommend != null) document.getElementById('enable_performance_auto_recommend').checked = !!oper.enable_performance_auto_recommend;
                     if (oper.performance_recommend_interval_minutes != null) document.getElementById('performance_recommend_interval_minutes').value = oper.performance_recommend_interval_minutes;
+                    if (oper.ws_reconnect_sleep_sec != null) {{ const el = document.getElementById('ws_reconnect_sleep_sec'); if (el) el.value = oper.ws_reconnect_sleep_sec; }}
+                    if (oper.emergency_liquidate_disconnect_minutes != null) {{ const el = document.getElementById('emergency_liquidate_disconnect_minutes'); if (el) el.value = oper.emergency_liquidate_disconnect_minutes; }}
+                    if (oper.keep_previous_on_empty_selection != null) {{ const el = document.getElementById('keep_previous_on_empty_selection'); if (el) el.checked = !!oper.keep_previous_on_empty_selection; }}
                 }}
                 updateSettingsSummaries();
             }} catch (e) {{
@@ -2495,6 +3018,12 @@ def get_dashboard_html_mobile(username: str) -> str:
                     sell_order_style: (document.getElementById('sell_order_style')?.value || 'market'),
                     order_retry_count: parseInt(document.getElementById('order_retry_count')?.value) || 0,
                     order_retry_delay_ms: parseInt(document.getElementById('order_retry_delay_ms')?.value) || 300,
+                    order_retry_exponential_backoff: !!document.getElementById('order_retry_exponential_backoff')?.checked,
+                    order_retry_base_delay_ms: parseInt(document.getElementById('order_retry_base_delay_ms')?.value) || 1000,
+                    daily_loss_limit_calendar: !!document.getElementById('daily_loss_limit_calendar')?.checked,
+                    daily_profit_limit_calendar: !!document.getElementById('daily_profit_limit_calendar')?.checked,
+                    monthly_loss_limit: parseInt(document.getElementById('monthly_loss_limit')?.value) || 0,
+                    cumulative_loss_limit: parseInt(document.getElementById('cumulative_loss_limit')?.value) || 0,
                     order_fallback_to_market: !!document.getElementById('order_fallback_to_market')?.checked,
                     enable_volatility_sizing: !!document.getElementById('enable_volatility_sizing')?.checked,
                     volatility_lookback_ticks: parseInt(document.getElementById('volatility_lookback_ticks')?.value) || 20,
@@ -2502,13 +3031,24 @@ def get_dashboard_html_mobile(username: str) -> str:
                     max_loss_per_stock_krw: parseInt(document.getElementById('max_loss_per_stock_krw')?.value) || 0,
                     slippage_bps: parseInt(document.getElementById('slippage_bps')?.value) || 0,
                     volatility_floor_ratio: parseFloat(document.getElementById('volatility_floor_ratio')?.value) || 0.005,
-                    max_trades_per_day: 5,
+                    max_intraday_vol_pct: parseFloat(document.getElementById('max_intraday_vol_pct')?.value) || 0,
+                    atr_filter_enabled: !!document.getElementById('atr_filter_enabled')?.checked,
+                    atr_period: parseInt(document.getElementById('atr_period')?.value) || 14,
+                    atr_ratio_max_pct: parseFloat(document.getElementById('atr_ratio_max_pct')?.value) || 0,
+                    sap_deviation_filter_enabled: !!document.getElementById('sap_deviation_filter_enabled')?.checked,
+                    sap_deviation_max_pct: parseFloat(document.getElementById('sap_deviation_max_pct')?.value) || 3,
+                    max_trades_per_day: parseInt(document.getElementById('max_trades_per_day')?.value) || 5,
+                    max_positions_count: parseInt(document.getElementById('max_positions_count')?.value) || 0,
                     max_position_size_ratio: 0.1,
                     trailing_stop_ratio: (parseFloat(document.getElementById('trailing_stop_pct').value) || 0) / 100,
                     trailing_activation_ratio: (parseFloat(document.getElementById('trailing_activation_pct').value) || 0) / 100,
                     partial_take_profit_ratio: (parseFloat(document.getElementById('partial_tp_pct').value) || 0) / 100,
                     partial_take_profit_fraction: (parseFloat(document.getElementById('partial_tp_fraction_pct').value) || 0) / 100,
                     min_price_change_ratio: (function(){{ var el = document.getElementById('min_price_change_ratio_pct'); if (!el) return 0.01; var v = parseFloat(el.value); return Number.isNaN(v) ? 0.01 : v / 100; }})(),
+                    use_atr_for_stop_take: !!document.getElementById('use_atr_for_stop_take')?.checked,
+                    atr_stop_mult: parseFloat(document.getElementById('atr_stop_mult')?.value) || 1.5,
+                    atr_take_mult: parseFloat(document.getElementById('atr_take_mult')?.value) || 2,
+                    atr_lookback_ticks: parseInt(document.getElementById('atr_lookback_ticks')?.value) || 20,
                 }};
                 const response = await fetch('/api/config/risk', {{
                     method: 'POST',
@@ -2569,12 +3109,44 @@ def get_dashboard_html_mobile(username: str) -> str:
                     early_range_lookback_ticks: parseInt(document.getElementById('early_range_lookback_ticks').value) || 0,
                     early_min_range_ratio: (parseFloat(document.getElementById('early_min_range_pct').value) || 0) / 100,
                     reentry_cooldown_seconds: parseInt(document.getElementById('reentry_cooldown_seconds').value) || 0,
+                    consecutive_loss_cooldown_enabled: !!document.getElementById('consecutive_loss_cooldown_enabled').checked,
+                    consecutive_loss_count_threshold: parseInt(document.getElementById('consecutive_loss_count_threshold').value) || 2,
+                    consecutive_loss_cooldown_mult: parseFloat(document.getElementById('consecutive_loss_cooldown_mult').value) || 2,
+                    circuit_breaker_filter_enabled: !!document.getElementById('circuit_breaker_filter_enabled').checked,
+                    circuit_breaker_market: (document.getElementById('circuit_breaker_market')?.value || '0001'),
+                    circuit_breaker_threshold_pct: parseFloat(document.getElementById('circuit_breaker_threshold_pct').value) || -7,
+                    circuit_breaker_action: (document.getElementById('circuit_breaker_action')?.value || 'skip_buy_only'),
+                    sidecar_filter_enabled: !!document.getElementById('sidecar_filter_enabled').checked,
+                    sidecar_market: (document.getElementById('sidecar_market')?.value || '0001'),
+                    sidecar_cooling_minutes: parseInt(document.getElementById('sidecar_cooling_minutes').value) || 5,
+                    sidecar_action: (document.getElementById('sidecar_action')?.value || 'skip_buy_only'),
+                    vi_filter_enabled: !!document.getElementById('vi_filter_enabled').checked,
+                    vi_cooling_minutes: parseInt(document.getElementById('vi_cooling_minutes').value) || 5,
+                    index_ma_filter_enabled: !!document.getElementById('index_ma_filter_enabled').checked,
+                    index_ma_code: (document.getElementById('index_ma_code')?.value || '1001'),
+                    index_ma_period: parseInt(document.getElementById('index_ma_period').value) || 20,
+                    advance_ratio_filter_enabled: !!document.getElementById('advance_ratio_filter_enabled').checked,
+                    advance_ratio_market: (document.getElementById('advance_ratio_market')?.value || '1001'),
+                    advance_ratio_min_pct: parseFloat(document.getElementById('advance_ratio_min_pct').value) || 40,
+                    trade_value_concentration_filter_enabled: !!document.getElementById('trade_value_concentration_filter_enabled').checked,
+                    trade_value_concentration_market: (document.getElementById('trade_value_concentration_market')?.value || '1001'),
+                    trade_value_concentration_top_n: parseInt(document.getElementById('trade_value_concentration_top_n').value) || 10,
+                    trade_value_concentration_denom_n: parseInt(document.getElementById('trade_value_concentration_denom_n').value) || 30,
+                    trade_value_concentration_max_pct: parseFloat(document.getElementById('trade_value_concentration_max_pct').value) || 45,
                     buy_confirm_ticks: parseInt(document.getElementById('buy_confirm_ticks').value) || 1,
                     enable_time_liquidation: !!document.getElementById('enable_time_liquidation').checked,
                     liquidate_after_hhmm: (document.getElementById('liquidate_after_hhmm').value || '11:55').trim(),
                     max_spread_ratio: (parseFloat(document.getElementById('max_spread_pct').value) || 0) / 100,
                     range_lookback_ticks: parseInt(document.getElementById('range_lookback_ticks').value) || 0,
                     min_range_ratio: (parseFloat(document.getElementById('min_range_pct').value) || 0) / 100,
+                    min_volume_ratio_for_entry: parseFloat(document.getElementById('min_volume_ratio_for_entry')?.value) || 0,
+                    min_trade_amount_ratio_for_entry: parseFloat(document.getElementById('min_trade_amount_ratio_for_entry')?.value) || 0,
+                    skip_buy_first_minutes: parseInt(document.getElementById('skip_buy_first_minutes')?.value) || 0,
+                    last_minutes_no_buy: parseInt(document.getElementById('last_minutes_no_buy')?.value) || 0,
+                    relative_strength_filter_enabled: !!document.getElementById('relative_strength_filter_enabled')?.checked,
+                    relative_strength_index_code: (document.getElementById('relative_strength_index_code')?.value || '0001').trim(),
+                    relative_strength_margin_pct: parseFloat(document.getElementById('relative_strength_margin_pct')?.value) || 0,
+                    advance_ratio_down_market_skip: !!document.getElementById('advance_ratio_down_market_skip')?.checked,
                 }};
                 const response = await fetch('/api/config/strategy', {{
                     method: 'POST',
@@ -2742,27 +3314,91 @@ def get_dashboard_html_mobile(username: str) -> str:
             }}
         }}
 
-        async function applyScalpMorningPreset() {{
-            try {{
-                addLog('오전 단타(9~12) 프리셋 적용 중...', 'info');
+        async function applyRecommendedPreset() {{
+            const presetId = document.getElementById('recommended_preset_select')?.value || '';
+            if (!presetId) {{
+                addLog('프리셋을 선택하세요', 'warning');
+                return;
+            }}
+            await applyScalpPresetWithOptions(presetId);
+        }}
 
-                // 리스크(보수적 기본값)
+        async function applyScalpPresetWithOptions(variant) {{
+            const overrides = {{
+                buy_window_end_hhmm: '11:30',
+                liquidate_after_hhmm: '11:55',
+                stop_loss: 0.8,
+                take_profit: 1.8,
+                daily_loss_limit: 50000,
+                daily_profit_limit: 50000,
+                max_trades_per_day: 5,
+                max_positions_count: 2,
+                last_minutes_no_buy: 10,
+                name: '오전 단타'
+            }};
+            if (variant === 'scalp_fullday') {{
+                overrides.buy_window_end_hhmm = '15:20';
+                overrides.liquidate_after_hhmm = '15:25';
+                overrides.last_minutes_no_buy = 15;
+                overrides.name = '전일 단타';
+            }} else if (variant === 'scalp_conservative') {{
+                overrides.stop_loss = 0.6;
+                overrides.take_profit = 1.2;
+                overrides.daily_loss_limit = 30000;
+                overrides.daily_profit_limit = 30000;
+                overrides.max_trades_per_day = 3;
+                overrides.max_positions_count = 1;
+                overrides.name = '보수적 단타';
+            }} else if (variant === 'scalp_aggressive') {{
+                overrides.stop_loss = 1.0;
+                overrides.take_profit = 2.5;
+                overrides.daily_loss_limit = 80000;
+                overrides.daily_profit_limit = 80000;
+                overrides.max_trades_per_day = 8;
+                overrides.max_positions_count = 3;
+                overrides.name = '공격적 단타';
+            }}
+            try {{
+                addLog(overrides.name + ' 프리셋 적용 중...', 'info');
+
+                // 리스크: Position size = risk / stop distance, dailyProfit ≥ dailyLoss, 슬리피지 20bps
                 document.getElementById('max_trade_amount').value = 1000000;
                 document.getElementById('min_order_quantity').value = 2;
-                document.getElementById('stop_loss').value = 1.0;
-                document.getElementById('take_profit').value = 2.0;
-                document.getElementById('daily_loss_limit').value = 300000;
-                document.getElementById('partial_tp_pct').value = 1.0;
+                document.getElementById('stop_loss').value = overrides.stop_loss;
+                document.getElementById('take_profit').value = overrides.take_profit;
+                document.getElementById('daily_loss_limit').value = overrides.daily_loss_limit;
+                document.getElementById('daily_profit_limit').value = overrides.daily_profit_limit;
+                document.getElementById('max_loss_per_stock_krw').value = 50000;
+                document.getElementById('partial_tp_pct').value = 0.8;
                 document.getElementById('partial_tp_fraction_pct').value = 50;
-                document.getElementById('trailing_stop_pct').value = 0.8;
-                document.getElementById('trailing_activation_pct').value = 1.0;
+                document.getElementById('trailing_stop_pct').value = 0.5;
+                document.getElementById('trailing_activation_pct').value = 0.8;
+                document.getElementById('max_intraday_vol_pct').value = 3;
+                document.getElementById('slippage_bps').value = 20;
+                document.getElementById('order_retry_delay_ms').value = 300;
+                // 변동성 필터: ATR(분봉) / SAP(세션 평균가) 이탈 — 단타에서 과열·과매도 구간 진입 억제
+                document.getElementById('atr_filter_enabled').checked = true;
+                document.getElementById('atr_period').value = 14;
+                document.getElementById('atr_ratio_max_pct').value = 2.5;
+                document.getElementById('sap_deviation_filter_enabled').checked = true;
+                document.getElementById('sap_deviation_max_pct').value = 3;
+                // 단타: 일일 거래 횟수·동시 보유 종목 상한, 변동성 배수 손절/익절, 변동성 사이징
+                document.getElementById('max_trades_per_day').value = overrides.max_trades_per_day;
+                document.getElementById('max_positions_count').value = overrides.max_positions_count;
+                document.getElementById('use_atr_for_stop_take').checked = true;
+                document.getElementById('atr_stop_mult').value = 1.5;
+                document.getElementById('atr_take_mult').value = 2;
+                document.getElementById('atr_lookback_ticks').value = 20;
+                document.getElementById('enable_volatility_sizing').checked = true;
+                document.getElementById('volatility_lookback_ticks').value = 20;
+                document.getElementById('volatility_stop_mult').value = 1.0;
                 await updateRiskConfig();
 
                 // 전략(빠른 MA + 신규 매수 시간 제한)
                 document.getElementById('short_ma_period').value = 3;
                 document.getElementById('long_ma_period').value = 10;
                 document.getElementById('buy_window_start_hhmm').value = '09:05';
-                document.getElementById('buy_window_end_hhmm').value = '11:30';
+                document.getElementById('buy_window_end_hhmm').value = overrides.buy_window_end_hhmm;
                 document.getElementById('min_short_ma_slope_pct').value = 0.010;
                 document.getElementById('momentum_lookback_ticks').value = 8;
                 document.getElementById('min_momentum_pct').value = 0.20;
@@ -2802,12 +3438,33 @@ def get_dashboard_html_mobile(username: str) -> str:
                 document.getElementById('early_min_range_pct').value = 0.30;
                 document.getElementById('reentry_cooldown_seconds').value = 180;
                 document.getElementById('buy_confirm_ticks').value = 2;
+                // 연속 손실 시 쿨다운 확대 (2연패 시 재진입 대기 2배)
+                document.getElementById('consecutive_loss_cooldown_enabled').checked = true;
+                document.getElementById('consecutive_loss_count_threshold').value = 2;
+                document.getElementById('consecutive_loss_cooldown_mult').value = 2;
+                // 시장 레짐: 지수 MA + 상승 비율 (하락장 진입 억제)
+                document.getElementById('index_ma_filter_enabled').checked = true;
+                document.getElementById('index_ma_code').value = '1001';
+                document.getElementById('index_ma_period').value = 20;
+                document.getElementById('advance_ratio_filter_enabled').checked = true;
+                document.getElementById('advance_ratio_market').value = '1001';
+                document.getElementById('advance_ratio_min_pct').value = 40;
+                document.getElementById('advance_ratio_down_market_skip').checked = true;
+                // 서킷/사이드카/VI: 급락·변동 시 매수 스킵 (단타 보호)
+                document.getElementById('circuit_breaker_filter_enabled').checked = true;
+                document.getElementById('circuit_breaker_market').value = '0001';
+                document.getElementById('circuit_breaker_threshold_pct').value = -7;
+                document.getElementById('sidecar_filter_enabled').checked = true;
+                document.getElementById('vi_filter_enabled').checked = true;
+                // 시간대: 장 초반 N분 스킵, 마감 N분 전 신규 매수 스킵
+                document.getElementById('skip_buy_first_minutes').value = 5;
+                document.getElementById('last_minutes_no_buy').value = overrides.last_minutes_no_buy;
                 // 스프레드/횡보장 필터 기본값 튜닝(너무 타이트하면 매수 자체가 안 걸릴 수 있음)
                 document.getElementById('max_spread_pct').value = 0.20;
                 document.getElementById('range_lookback_ticks').value = 60;
                 document.getElementById('min_range_pct').value = 0.25;
                 document.getElementById('enable_time_liquidation').checked = true;
-                document.getElementById('liquidate_after_hhmm').value = '11:55';
+                document.getElementById('liquidate_after_hhmm').value = overrides.liquidate_after_hhmm;
                 await updateStrategyConfig();
 
                 // 종목 선정 프리셋
@@ -2823,9 +3480,9 @@ def get_dashboard_html_mobile(username: str) -> str:
                 // 1회 자동 재선정 (바로 표시)
                 const res = await selectStocks(true);
                 if (res && res.success) {{
-                    addLog('오전 단타 프리셋 적용 완료', 'info');
+                    addLog(overrides.name + ' 프리셋 적용 완료', 'info');
                 }} else {{
-                    addLog('오전 단타 프리셋 적용 완료(재선정 실패): ' + ((res && res.message) ? res.message : '알 수 없는 오류'), 'warning');
+                    addLog(overrides.name + ' 프리셋 적용 완료(재선정 실패): ' + ((res && res.message) ? res.message : '알 수 없는 오류'), 'warning');
                 }}
                 updateSettingsSummaries();
                 await refreshData();
@@ -2940,7 +3597,10 @@ def get_dashboard_html_mobile(username: str) -> str:
                     enable_auto_rebalance: !!document.getElementById('enable_auto_rebalance').checked,
                     auto_rebalance_interval_minutes: parseInt(document.getElementById('auto_rebalance_interval_minutes').value) || 30,
                     enable_performance_auto_recommend: !!document.getElementById('enable_performance_auto_recommend').checked,
-                    performance_recommend_interval_minutes: parseInt(document.getElementById('performance_recommend_interval_minutes').value) || 5
+                    performance_recommend_interval_minutes: parseInt(document.getElementById('performance_recommend_interval_minutes').value) || 5,
+                    ws_reconnect_sleep_sec: parseInt(document.getElementById('ws_reconnect_sleep_sec').value) || 5,
+                    emergency_liquidate_disconnect_minutes: parseInt(document.getElementById('emergency_liquidate_disconnect_minutes').value) || 0,
+                    keep_previous_on_empty_selection: !!document.getElementById('keep_previous_on_empty_selection').checked
                 }};
                 const response = await fetch('/api/config/operational', {{
                     method: 'POST',
@@ -3016,7 +3676,7 @@ def get_dashboard_html_mobile(username: str) -> str:
             }}
             await refreshData();
             await loadPendingSignals();
-            setInterval(refreshData, 5000);
+        setInterval(refreshData, 5000);
         }})();
     </script>
 </body>

@@ -55,6 +55,8 @@ class TradingState:
         self.is_running = False
         self.websocket_clients: List[WebSocket] = []
         self.trade_history: List[Dict] = []
+        self.consecutive_losses: int = 0  # 연속 손실 횟수 (매도 체결 시 갱신)
+        self.last_consecutive_loss_time: Optional[float] = None  # 마지막 손실 매도 시각 (time.time())
         self.current_positions: Dict[str, Dict] = {}
         self.selected_stocks: List[str] = []
         self.stock_selector: Optional[StockSelector] = None
@@ -82,10 +84,23 @@ class TradingState:
     
     def add_trade(self, trade_info: dict):
         """거래 내역 추가"""
+        import time as _time
         trade_info["timestamp"] = datetime.now().isoformat()
         self.trade_history.append(trade_info)
         if len(self.trade_history) > 100:
             self.trade_history = self.trade_history[-100:]
+        # 연속 손실 추적: 매도 체결 시 pnl 기준
+        if trade_info.get("order_type") == "sell" and trade_info.get("pnl") is not None:
+            try:
+                pnl = float(trade_info["pnl"])
+                if pnl < 0:
+                    self.consecutive_losses = getattr(self, "consecutive_losses", 0) + 1
+                    self.last_consecutive_loss_time = _time.time()
+                else:
+                    self.consecutive_losses = 0
+                    self.last_consecutive_loss_time = None
+            except (TypeError, ValueError):
+                pass
 
 state = TradingState()
 
@@ -110,11 +125,17 @@ class RiskConfig(BaseModel):
     # 일일 손익 한도 기준(실현/실현+미실현)
     daily_profit_limit_basis: str = "total"  # realized | total
     daily_loss_limit_basis: str = "realized"  # realized | total
+    daily_loss_limit_calendar: bool = True  # True=캘린더일(자정 리셋), False=세션
+    daily_profit_limit_calendar: bool = True
+    monthly_loss_limit: int = 0  # 0=미적용. 월간 손실 한도(원)
+    cumulative_loss_limit: int = 0  # 0=미적용. 누적 손실 한도(원)
     # 주문 실행 방식/재시도
     buy_order_style: str = "market"  # market | best_limit
     sell_order_style: str = "market"  # market | best_limit
     order_retry_count: int = 0
     order_retry_delay_ms: int = 300
+    order_retry_exponential_backoff: bool = True
+    order_retry_base_delay_ms: int = 1000
     order_fallback_to_market: bool = True
     # 변동성 기반 포지션 사이징 + 종목당 최대 손실액
     enable_volatility_sizing: bool = False
@@ -127,12 +148,24 @@ class RiskConfig(BaseModel):
     volatility_floor_ratio: float = 0.005
     max_trades_per_day: int
     max_position_size_ratio: float
+    max_positions_count: int = 0  # 동시 보유 종목 수 상한. 0=제한 없음
     trailing_stop_ratio: float = 0.0
     trailing_activation_ratio: float = 0.0
     partial_take_profit_ratio: float = 0.0
     partial_take_profit_fraction: float = 0.5
+    # ATR(틱 변동성) 배수 손절/익절
+    use_atr_for_stop_take: bool = False
+    atr_stop_mult: float = 1.5
+    atr_take_mult: float = 2.0
+    atr_lookback_ticks: int = 20
     # 매수 허용 최소 가격 변동(0~10%). 신호 가격이 last_prices 대비 이 비율만큼 변동해야 주문 실행. 0이면 검사 없음
     min_price_change_ratio: float = 0.01
+    # 변동성 필터(계산 지표): API 미제공 → 분봉/틱으로 자체 계산
+    atr_filter_enabled: bool = False  # ATR(분봉) 비율 상한 초과 시 매수 스킵
+    atr_period: int = 14
+    atr_ratio_max_pct: float = 0.0  # 0=미적용. ATR/현재가*100 > 이 값이면 스킵 (예: 2.5)
+    sap_deviation_filter_enabled: bool = False  # 세션 평균가(SAP) 대비 이탈률 상한
+    sap_deviation_max_pct: float = 3.0  # |현재가-SAP|/SAP*100 > 이 값이면 스킵 (과열/과매도 구간)
 
 class StockSelectionConfig(BaseModel):
     min_price_change_ratio: float
@@ -164,11 +197,14 @@ class StockSelectionConfig(BaseModel):
 
 
 class OperationalConfig(BaseModel):
-    """운영 옵션: 자동 리밸런싱, 성과 기반 자동 추천"""
+    """운영 옵션: 자동 리밸런싱, 성과 기반 자동 추천, WS 재연결·긴급 청산"""
     enable_auto_rebalance: bool = False
     auto_rebalance_interval_minutes: int = 30
     enable_performance_auto_recommend: bool = False
     performance_recommend_interval_minutes: int = 5
+    ws_reconnect_sleep_sec: int = 5  # WebSocket 끊김 후 재연결 대기(초)
+    emergency_liquidate_disconnect_minutes: int = 0  # 단절 N분 초과 시 전량 매도(0=미적용)
+    keep_previous_on_empty_selection: bool = True  # 종목 선정 결과 0건 시 이전 목록 유지
 
 
 class StrategyConfig(BaseModel):
@@ -219,6 +255,36 @@ class StrategyConfig(BaseModel):
     minute_trend_mode: str = "green"  # green | higher_close | higher_low | hh_hl
     minute_trend_early_only: bool = False
     reentry_cooldown_seconds: int = 0
+    consecutive_loss_cooldown_enabled: bool = False
+    consecutive_loss_count_threshold: int = 2
+    consecutive_loss_cooldown_mult: float = 2.0
+    # 지수 MA 시장 레짐: 지수(코스닥 등)가 N일 MA 미만이면 매수 스킵
+    index_ma_filter_enabled: bool = False
+    index_ma_code: str = "1001"  # 1001:코스닥, 0001:코스피
+    index_ma_period: int = 20
+    # 상승 종목 비율 시장 레짐: 등락률 순위 API로 상승/하락 건수 비율, N% 미만이면 매수 스킵
+    advance_ratio_filter_enabled: bool = False
+    advance_ratio_market: str = "1001"  # 1001:코스닥, 0001:코스피
+    advance_ratio_min_pct: float = 40.0  # 상승 비율 하한(0~100%)
+    # 거래소 서킷브레이커(급락) 구간: 전일 대비 지수 하락률이 N% 이하이면 신규 매수 스킵 (KRX 1단계 서킷 ~-8% 직전)
+    circuit_breaker_filter_enabled: bool = True
+    circuit_breaker_market: str = "0001"  # 0001:코스피, 1001:코스닥
+    circuit_breaker_threshold_pct: float = -7.0  # 이 하락률 이하이면 스킵 (예: -7 = 7% 하락 시)
+    circuit_breaker_action: str = "skip_buy_only"  # skip_buy_only | liquidate_all | liquidate_partial | no_buy_rest_of_day
+    # 사이드카 구간: 지수 ±5%(코스피)/±6%(코스닥) 변동 시 N분간 신규 매수 스킵 (KRX 프로그램매매 5분 정지에 맞춤)
+    sidecar_filter_enabled: bool = True
+    sidecar_market: str = "0001"  # 0001:코스피, 1001:코스닥
+    sidecar_cooling_minutes: int = 5  # 냉각 분
+    sidecar_action: str = "skip_buy_only"  # skip_buy_only | liquidate_all | liquidate_partial | no_buy_rest_of_day
+    # VI(종목별 변동성완화장치) 발동 시 해당 종목 N분 매수 스킵
+    vi_filter_enabled: bool = True
+    vi_cooling_minutes: int = 5  # 해당 종목 냉각 분
+    # 거래대금 집중 시장 레짐: 상위 N종목 거래대금 비율이 X% 초과면 매수 스킵(좁은 시장)
+    trade_value_concentration_filter_enabled: bool = False
+    trade_value_concentration_market: str = "1001"  # 1001:코스닥, 0001:코스피
+    trade_value_concentration_top_n: int = 10
+    trade_value_concentration_denom_n: int = 30
+    trade_value_concentration_max_pct: float = 45.0  # 상위 top_n / 상위 denom_n 비율이 이 값 초과면 스킵
     buy_confirm_ticks: int = 1
     enable_time_liquidation: bool = False
     liquidate_after_hhmm: str = "11:55"
@@ -226,6 +292,19 @@ class StrategyConfig(BaseModel):
     max_spread_ratio: float = 0.0  # 예: 0.001 = 0.1%
     range_lookback_ticks: int = 0
     min_range_ratio: float = 0.0  # 예: 0.003 = 0.3%
+    # 2. 진입 시 평균 대비 거래량/거래대금 하한 (0이면 미적용)
+    min_volume_ratio_for_entry: float = 0.0
+    min_trade_amount_ratio_for_entry: float = 0.0
+    # 3. 장 초반 N분 매수 스킵 (0이면 미적용)
+    skip_buy_first_minutes: int = 0
+    # 4. 지수 대비 상대 강도: 종목 > 지수 + margin일 때만 매수
+    relative_strength_filter_enabled: bool = False
+    relative_strength_index_code: str = "0001"  # 0001:코스피, 1001:코스닥
+    relative_strength_margin_pct: float = 0.0  # 종목 변동률 > 지수 변동률 + margin(%) 일 때만 매수
+    # 5. 장 마감 전 N분 신규 매수 스킵 (0이면 미적용)
+    last_minutes_no_buy: int = 0
+    # 6. 등락 비율 하락장 시 매수 스킵 강화: 상승 비율 < 50%이면 전량 스킵
+    advance_ratio_down_market_skip: bool = True
 
 class ManualOrder(BaseModel):
     stock_code: str
