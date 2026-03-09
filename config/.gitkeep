@@ -1,0 +1,2 @@
+# config 디렉터리를 Git/CI에 포함시키기 위한 파일.
+# kis_devlp.yaml은 .gitignore로 제외되며, 배포 시 볼륨/환경변수로 주입합니다.
