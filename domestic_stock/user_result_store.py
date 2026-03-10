@@ -11,6 +11,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,18 @@ class DynamoDBUserResultStore:
             logger.warning(f"User result get failed ({username}/{date}): {e}")
             return None
 
+    def _to_decimal(self, value: Optional[float], ndigits: Optional[int] = None) -> Optional[Decimal]:
+        """float → Decimal 변환 (None 안전). ndigits 지정 시 반올림."""
+        if value is None:
+            return None
+        try:
+            f = float(value)
+            if ndigits is not None:
+                f = round(f, ndigits)
+            return Decimal(str(f))
+        except Exception:
+            return None
+
     def save_daily_result(
         self,
         username: str,
@@ -170,10 +183,11 @@ class DynamoDBUserResultStore:
             item = {
                 "username": username,
                 "date": date,
-                "equity_start": round(start, 2),
-                "equity_end": round(equity_end, 2),
-                "pnl": round(pnl, 2),
-                "return_pct": round(return_pct, 4),
+                # DynamoDB는 float 대신 Decimal 타입을 권장/요구하므로 변환
+                "equity_start": self._to_decimal(start, 2),
+                "equity_end": self._to_decimal(equity_end, 2),
+                "pnl": self._to_decimal(pnl, 2),
+                "return_pct": self._to_decimal(return_pct, 4),
                 "trade_count": trade_count,
                 "updated_at": now,
             }

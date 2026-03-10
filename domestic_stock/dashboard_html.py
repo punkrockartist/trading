@@ -2,8 +2,8 @@
 대시보드 HTML 생성 모듈 (모바일 최적화)
 """
 
-def get_dashboard_html_mobile(username: str) -> str:
-    """모바일 최적화 대시보드 HTML"""
+def get_dashboard_html(username: str) -> str:
+    """대시보드 HTML (반응형)"""
     return f"""
 <!DOCTYPE html>
 <html lang="ko">
@@ -233,6 +233,10 @@ def get_dashboard_html_mobile(username: str) -> str:
             grid-template-columns: 1fr 1fr;
             gap: 10px;
         }}
+        .profile-form label {{ display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 4px; }}
+        .profile-form label .label-hint {{ font-weight: 400; font-size: 11px; color: var(--muted); }}
+        .profile-section {{ margin-bottom: 16px; }}
+        .profile-section-title {{ font-weight: 700; font-size: 13px; color: var(--text); margin-bottom: 8px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }}
         .checkbox-row {{
             display: flex;
             gap: 10px;
@@ -369,6 +373,7 @@ def get_dashboard_html_mobile(username: str) -> str:
             background: var(--nav-row-bg);
             border: none;
             box-shadow: 0 6px 18px rgba(0,0,0,0.06);
+            overflow: visible;
         }}
         .topbar-inner {{
             display: flex;
@@ -378,6 +383,7 @@ def get_dashboard_html_mobile(username: str) -> str:
             padding: 10px var(--container-pad);
             max-width: 1200px;
             margin: 0 auto;
+            overflow: visible;
         }}
         .tablist {{
             display: flex;
@@ -394,11 +400,13 @@ def get_dashboard_html_mobile(username: str) -> str:
             gap: 10px;
             flex: 0 0 auto;
             white-space: nowrap;
+            overflow: visible;
         }}
         .user-menu {{
             position: relative;
             display: inline-flex;
             align-items: center;
+            overflow: visible;
         }}
         .user-avatar {{
             width: 32px;
@@ -431,8 +439,12 @@ def get_dashboard_html_mobile(username: str) -> str:
             padding: 8px;
             display: none;
             z-index: 500;
+            overflow: visible;
         }}
         .user-dropdown.open {{
+            display: block;
+        }}
+        .user-dropdown .menu-item {{
             display: block;
         }}
         .user-dropdown .menu-header {{
@@ -462,6 +474,13 @@ def get_dashboard_html_mobile(username: str) -> str:
         }}
         .menu-item.danger:hover {{
             background: rgba(209, 50, 18, 0.08);
+        }}
+        .menu-item-signout {{
+            margin-top: 6px;
+            border-top: 1px solid var(--border);
+            padding-top: 10px;
+            display: block !important;
+            visibility: visible !important;
         }}
         .tab {{
             padding: 10px 14px;
@@ -603,6 +622,43 @@ def get_dashboard_html_mobile(username: str) -> str:
             font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
             font-size: 12px;
         }}
+        .doc-section {{ display: none; }}
+        .doc-section.active {{ display: block; }}
+        .doc-pre {{
+            background: var(--log-bg);
+            color: var(--log-text);
+            padding: 12px;
+            border-radius: var(--radius);
+            font-size: 12px;
+            line-height: 1.5;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }}
+        .doc-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }}
+        .doc-table th, .doc-table td {{
+            border: 1px solid var(--border);
+            padding: 8px 10px;
+            text-align: left;
+        }}
+        .doc-table th {{ background: var(--surface-2); font-weight: 600; }}
+        .doc-table code {{
+            font-size: 12px;
+            background: var(--surface-2);
+            padding: 2px 6px;
+            border-radius: 2px;
+        }}
+        .doc-list {{ margin: 8px 0; padding-left: 20px; line-height: 1.7; }}
+        .doc-list code {{
+            font-size: 12px;
+            background: var(--surface-2);
+            padding: 2px 6px;
+            border-radius: 2px;
+        }}
         @media (min-width: 768px) {{
             :root {{
                 --container-pad: 20px;
@@ -629,12 +685,13 @@ def get_dashboard_html_mobile(username: str) -> str:
     <div class="topbar">
         <div class="topbar-inner">
             <div class="tablist">
-            <button class="tab active" onclick="showTab('status')">상태</button>
-            <button class="tab" onclick="showTab('positions')">포지션</button>
-                <button class="tab" onclick="showTab('performance')">성과</button>
-            <button class="tab" onclick="showTab('settings')">설정</button>
-                <button class="tab" onclick="showTab('signals')">승인대기</button>
-            <button class="tab" onclick="showTab('trades')">거래내역</button>
+            <button class="tab active" data-tab="status" onclick="showTab('status')">상태</button>
+            <button class="tab" data-tab="positions" onclick="showTab('positions')">포지션</button>
+                <button class="tab" data-tab="performance" onclick="showTab('performance')">성과</button>
+            <button class="tab" data-tab="settings" onclick="showTab('settings')">설정</button>
+                <button class="tab" data-tab="signals" onclick="showTab('signals')">승인대기</button>
+            <button class="tab" data-tab="trades" onclick="showTab('trades')">거래내역</button>
+            <button class="tab" data-tab="docs" onclick="showTab('docs')">Docs</button>
             </div>
             <div class="nav-right">
                 <span id="status" class="status stopped">중지됨</span>
@@ -642,7 +699,8 @@ def get_dashboard_html_mobile(username: str) -> str:
                     <div class="user-avatar" id="userAvatar" role="button" tabindex="0" aria-haspopup="true" aria-expanded="false" onclick="toggleUserMenu()">{username[:1].upper()}</div>
                     <div class="user-dropdown" id="userDropdown" role="menu" aria-label="사용자 메뉴">
                         <div class="menu-header">Signed in as <strong>{username}</strong></div>
-                        <button type="button" class="menu-item danger" onclick="logout()">Sign out</button>
+                        <button type="button" class="menu-item" onclick="openProfileModal()">개인정보</button>
+                        <button type="button" class="menu-item menu-item-signout danger" onclick="logout()">Sign out</button>
                     </div>
                 </div>
             </div>
@@ -664,6 +722,16 @@ def get_dashboard_html_mobile(username: str) -> str:
                 <div class="subtabs">
                     <button type="button" class="subtab active" id="perf-subtab-summary" onclick="showPerformanceSection('summary')">요약·권장</button>
                     <button type="button" class="subtab" id="perf-subtab-daily" onclick="showPerformanceSection('daily')">일별 성과</button>
+                </div>
+            </div>
+        </div>
+        <div class="topbar-sub" id="docsSubbar">
+            <div class="topbar-sub-inner">
+                <div class="subtabs">
+                    <button type="button" class="subtab active" id="doc-subtab-overview" onclick="showDocsSection('overview')">개요·아키텍처</button>
+                    <button type="button" class="subtab" id="doc-subtab-workflow" onclick="showDocsSection('workflow')">워크플로우</button>
+                    <button type="button" class="subtab" id="doc-subtab-files" onclick="showDocsSection('files')">파일별</button>
+                    <button type="button" class="subtab" id="doc-subtab-functions" onclick="showDocsSection('functions')">기능·함수</button>
                 </div>
             </div>
         </div>
@@ -724,7 +792,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                 </div>
             </div>
             <div class="card">
-                <h2>선정 종목 리스트</h2>
+                <h2 style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">선정 종목 리스트 <a href="#" onclick="openCriteriaModal(); return false;" style="font-size: 13px; font-weight: normal; color: var(--primary); text-decoration: none;">선정 기준 보기</a></h2>
                 <div id="selected_stocks">
                     <p style="color: var(--muted); text-align: center; padding: 20px;">선정된 종목이 없습니다.</p>
                 </div>
@@ -844,6 +912,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                         <div style="display:inline-flex; align-items:center; gap:10px;">
                             <select id="recommended_preset_select" style="width:200px;">
                                 <option value="">선택하세요</option>
+                                <option value="custom">커스텀(DB 저장값)</option>
                                 <option value="scalp_morning">오전 단타(9~12)</option>
                                 <option value="scalp_fullday">전일 단타(오전~오후)</option>
                                 <option value="scalp_conservative">보수적 단타</option>
@@ -852,7 +921,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                             <button type="button" class="btn" onclick="applyRecommendedPreset()" style="padding:6px 14px; font-size:0.9rem; width:auto; flex-shrink:0;">프리셋 적용</button>
                         </div>
                         <div class="hint" style="margin-top:6px;">
-                            오전 단타: 09:05~11:30 매수·11:55 청산. 전일 단타: 09:05~15:20 매수·15:25 청산. 보수적/공격적은 손절·거래 횟수·포지션 수 차이.
+                            커스텀: quant_trading_user_settings DB에 저장된 값으로 폼 세팅. 오전 단타: 09:05~11:30 매수·11:55 청산. 전일 단타: 09:05~15:20 매수·15:25 청산. 보수적/공격적은 손절·거래 횟수·포지션 수 차이.
                         </div>
                     </div>
                 </div>
@@ -1076,8 +1145,8 @@ def get_dashboard_html_mobile(username: str) -> str:
                         </div>
                         <div class="form-group">
                             <label>주문 허용 최소 가격 변동(%):</label>
-                            <input type="number" id="min_price_change_ratio_pct" value="1" step="0.1" min="0" max="10" title="신호 가격이 직전 대비 이만큼 변동해야 주문 실행. 0이면 검사 없음">
-                            <span class="hint">0이면 변동 없어도 주문 허용</span>
+                            <input type="number" id="min_price_change_ratio_pct" value="0" step="0.1" min="0" max="10" title="직전 1틱 대비 이만큼 변동해야 매수 실행. 0=미적용(보통 권장), 1% 이상=급등 순간만 매수">
+                            <span class="hint">직전 틱 대비. 0=미적용(보편적), 1% 이상이면 급등한 순간만 허용</span>
                         </div>
                     </details>
 
@@ -1115,6 +1184,11 @@ def get_dashboard_html_mobile(username: str) -> str:
                     <div class="form-group">
                         <label>장기 이동평균 (틱):</label>
                         <input type="number" id="long_ma_period" value="10" min="3" max="200">
+                    </div>
+                    <div class="form-group">
+                        <label>진입 후 최소 보유 시간(초):</label>
+                        <input type="number" id="min_hold_seconds" value="0" min="0" max="600" title="매수 직후 데드크로스로 즉시 매도되는 것 방지. 0=미적용, 30~60 권장">
+                        <span class="hint">0=미적용. 30~60초 권장(같은 가격에 매수→매도 반복 방지)</span>
                     </div>
                     <div class="form-group">
                         <label>신규 매수 허용 시작 (HH:MM, KST):</label>
@@ -1940,20 +2014,207 @@ def get_dashboard_html_mobile(username: str) -> str:
         <div id="tab-trades" class="tab-content">
             <div class="card">
                 <h2>거래 내역</h2>
-                <div id="trade_history" style="max-height: 400px; overflow-y: auto;">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>시간</th>
-                                <th>종목</th>
-                                <th>유형</th>
-                                <th>수량</th>
-                                <th>가격</th>
-                            </tr>
-                        </thead>
-                        <tbody id="trade_history_body">
-                        </tbody>
+                <div class="trade-submenu" style="margin-bottom: 12px;">
+                    <button type="button" class="env-btn active" id="btn-trades-system" onclick="showTradeSubtab('system')">매매 시스템 거래내역</button>
+                    <button type="button" class="env-btn" id="btn-trades-account" onclick="showTradeSubtab('account')">계좌 거래내역</button>
+                </div>
+                <!-- 매매 시스템 거래내역 -->
+                <div id="trade-panel-system" class="trade-panel">
+                    <p class="hint">DB(quant_trading_user_hist) 또는 세션 메모리. 조회일 지정 후 조회.</p>
+                    <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; margin-bottom:12px;">
+                        <div class="form-group" style="margin:0; min-width:auto;">
+                            <label style="font-size:12px;">조회일</label>
+                            <input type="date" id="trades_system_date" style="width:16ch; padding:6px 8px; font-size:13px;">
+                        </div>
+                        <button type="button" class="btn btn-inline" onclick="fetchSystemTrades()" style="height:2rem; padding:0 10px; line-height:2rem;">조회</button>
+                    </div>
+                    <div id="trade_history" style="max-height: 400px; overflow-y: auto;">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>시간</th>
+                                    <th>종목</th>
+                                    <th>유형</th>
+                                    <th>수량</th>
+                                    <th>가격</th>
+                                    <th>손익</th>
+                                    <th>사유</th>
+                                </tr>
+                            </thead>
+                            <tbody id="trade_history_body">
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <!-- 계좌 거래내역 -->
+                <div id="trade-panel-account" class="trade-panel" style="display:none;">
+                    <p class="hint">한국투자증권 계좌 주문·체결 내역(일별주문체결조회).</p>
+                    <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; margin-bottom:12px;">
+                        <div class="form-group" style="margin:0; min-width:auto;">
+                            <label style="font-size:12px;">조회일</label>
+                            <input type="date" id="trades_account_date" style="width:16ch; padding:6px 8px; font-size:13px;">
+                        </div>
+                        <button type="button" class="btn btn-inline" onclick="fetchAccountTrades()" style="height:2rem; padding:0 10px; line-height:2rem;">조회</button>
+                    </div>
+                    <div id="account_trade_history" style="max-height: 400px; overflow-y: auto;">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>일자</th>
+                                    <th>시간</th>
+                                    <th>구분</th>
+                                    <th>종목</th>
+                                    <th>종목명</th>
+                                    <th>주문수량</th>
+                                    <th>체결수량</th>
+                                    <th>체결가</th>
+                                </tr>
+                            </thead>
+                            <tbody id="account_trade_history_body">
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Docs 탭 -->
+        <div id="tab-docs" class="tab-content">
+            <div id="doc-section-overview" class="doc-section active">
+                <div class="card">
+                    <h2>개요</h2>
+                    <p>국내 주식 실시간 틱 기반 자동매매 시스템. KIS(한국투자증권) API·WebSocket 연동, 리스크 관리·종목 선정·승인/자동 체결을 웹 대시보드에서 운영.</p>
+                </div>
+                <div class="card">
+                    <h2>아키텍처</h2>
+                    <pre class="doc-pre">클라이언트(브라우저)
+  → HTTPS/WSS
+FastAPI (quant_dashboard.py) + REST (quant_dashboard_api.py)
+  → JWT, 설정 CRUD, 종목선정, 시스템 제어, WebSocket 브로드캐스트
+매매 엔진 (quant_trading_safe.py, 백그라운드 스레드)
+  → create_safe_on_result() 콜백으로 틱 수신
+  → QuantStrategy.get_signal(), RiskManager.check_exit_signal(), safe_execute_order()
+  → reconcile: 체결 반영
+KIS REST (domestic_stock_functions) / KIS WebSocket (domestic_stock_functions_ws) / DynamoDB
+  → kis_auth: 토큰·계정·env_dv(실전/모의)</pre>
+                    <table class="doc-table">
+                        <tr><th>레이어</th><th>파일/역할</th></tr>
+                        <tr><td>UI</td><td>dashboard_html.py — 설정·승인대기·거래내역·WebSocket 수신</td></tr>
+                        <tr><td>API</td><td>quant_dashboard_api.py — 인증·설정·종목·시스템·성과</td></tr>
+                        <tr><td>엔진</td><td>quant_trading_safe.py — 틱→신호→리스크→주문→체결</td></tr>
+                        <tr><td>전략</td><td>QuantStrategy — MA 골든/데드 크로스, 필터</td></tr>
+                        <tr><td>리스크</td><td>RiskManager — 한도·손절/익절·ATR·pending·reconcile</td></tr>
+                        <tr><td>종목선정</td><td>stock_selector.py — 등락률 API, 필터·정렬</td></tr>
                     </table>
+                </div>
+            </div>
+            <div id="doc-section-workflow" class="doc-section">
+                <div class="card">
+                    <h2>워크플로우 (파일·함수 흐름)</h2>
+                    <h3>1. 로그인 → 대시보드</h3>
+                    <pre class="doc-pre">auth_manager.login()  ← auth_manager.py
+  → JWT 발급
+quant_dashboard.get_dashboard_html(username)  ← quant_dashboard.py
+  → HTML 렌더 (dashboard_html.get_dashboard_html 호출)
+클라이언트: WebSocket 연결 /api/ws → state.broadcast() 수신  ← quant_dashboard.py (TradingState)</pre>
+                    <h3>2. 설정 로드/저장</h3>
+                    <pre class="doc-pre">API: GET /api/settings/risk 등  ← quant_dashboard_api.py
+  → user_settings_store.load_risk_config(username)  ← user_settings_store.py
+API: POST /api/settings/risk 등  ← quant_dashboard_api.py
+  → user_settings_store.save_risk_config(username, config)  ← user_settings_store.py
+  → audit_log(username, "config_save", ...)  ← audit_log.py</pre>
+                    <h3>3. 종목 선정</h3>
+                    <pre class="doc-pre">API: POST /api/stocks/select  ← quant_dashboard_api.py
+  → StockSelector(설정) 생성  ← stock_selector.py
+  → selector.select_stocks_by_fluctuation()  ← stock_selector.py
+  → domestic_stock_functions.fluctuation()  ← domestic_stock_functions.py
+  → state.selected_stocks 갱신
+  → audit_log("stock_selection", ...)  ← audit_log.py</pre>
+                    <h3>4. 시스템 시작 (매매 엔진)</h3>
+                    <pre class="doc-pre">API: POST /api/system/start  ← quant_dashboard_api.py
+  → initialize_trading_system()  ← quant_dashboard_api.py
+  → create_safe_on_result(strategy, trenv, ...)  ← quant_trading_safe.py
+  → 엔진 스레드: domestic_stock_functions_ws 구독 (호가·체결)  ← domestic_stock_functions_ws.py
+  → 틱 수신 시 콜백 on_result() 실행  ← quant_trading_safe.py (create_safe_on_result 내부)</pre>
+                    <h3>5. 틱 → 신호 → 주문 (엔진 내부)</h3>
+                    <pre class="doc-pre">on_result(ws, tr_id, result, data_info)  ← quant_trading_safe.py
+  → 선정 종목 필터 (state.selected_stocks)
+  → strategy.get_signal(stock_code, current_price)  ← quant_trading_safe.py (QuantStrategy)
+       → update_price(), calculate_ma() → 골든/데드 크로스 → "buy"|"sell"|None
+  → risk_mgr.check_exit_signal(stock_code, current_price)  ← quant_trading_safe.py (RiskManager)
+       → 손절/익절/트레일링/부분익절 판단
+  → risk_mgr.can_trade(stock_code, price, quantity)  ← quant_trading_safe.py (RiskManager)
+  → safe_execute_order(signal, stock_code, price, strategy, trenv, ...)  ← quant_trading_safe.py
+       → order_cash()  ← domestic_stock_functions.py
+       → set_pending_order(), update_position()  ← quant_trading_safe.py (RiskManager)
+  → reconcile 루프: _check_filled_order(), clear_pending_order()  ← quant_trading_safe.py</pre>
+                    <h3>6. 승인 대기 (수동 모드)</h3>
+                    <pre class="doc-pre">엔진: manual_approval이 True면 safe_execute_order 내부 input() 대기  ← quant_trading_safe.py
+대시보드: 신호 발생 시 pending_signals 적재 → API GET /api/signals/pending  ← quant_dashboard_api.py
+  → 사용자 승인: POST /api/signals/approve  ← quant_dashboard_api.py
+  → safe_execute_order(..., manual_approval=False)  ← quant_trading_safe.py
+  → audit_log("signal_approve"|"signal_reject", ...)  ← audit_log.py</pre>
+                </div>
+            </div>
+            <div id="doc-section-files" class="doc-section">
+                <div class="card">
+                    <h2>파일별 설명</h2>
+                    <table class="doc-table">
+                        <tr><th>파일</th><th>역할</th></tr>
+                        <tr><td>quant_dashboard.py</td><td>FastAPI 앱, TradingState, 로그인/JWT, WebSocket, create_safe_on_result 등록</td></tr>
+                        <tr><td>quant_dashboard_api.py</td><td>REST: 설정 CRUD, 종목선정, 시스템 시작/중지, 승인/거절, 성과 export, 지수/서킷/VI 캐시</td></tr>
+                        <tr><td>dashboard_html.py</td><td>단일 HTML/CSS/JS 대시보드, 설정 폼·프리셋·도움말·Docs</td></tr>
+                        <tr><td>quant_trading_safe.py</td><td>RiskManager, QuantStrategy, safe_execute_order, create_safe_on_result, reconcile</td></tr>
+                        <tr><td>stock_selector.py</td><td>StockSelector, select_stocks_by_fluctuation(), 등락률 API·필터·정렬</td></tr>
+                        <tr><td>stock_selection_presets.py</td><td>종목선정 프리셋, get_preset(), list_presets()</td></tr>
+                        <tr><td>user_settings_store.py</td><td>DynamoDBUserSettingsStore, 사용자별 설정 저장/로드</td></tr>
+                        <tr><td>user_result_store.py</td><td>일별 성과 DynamoDB 저장·조회·내보내기</td></tr>
+                        <tr><td>audit_log.py</td><td>audit_log(username, action, details), 설정/수동주문/승인 기록</td></tr>
+                        <tr><td>notifier.py</td><td>send_alert(level, message, title), log_only | telegram</td></tr>
+                        <tr><td>auth_manager.py</td><td>로그인·회원가입·JWT·get_current_user</td></tr>
+                        <tr><td>kis_auth.py</td><td>KIS 토큰·config_root·token_root·env_dv</td></tr>
+                        <tr><td>domestic_stock_functions.py</td><td>order_cash, 잔고·체결·지수·등락률(fluctuation) REST</td></tr>
+                        <tr><td>domestic_stock_functions_ws.py</td><td>asking_price_krx, ccnl_krx 등 WebSocket 호가·체결</td></tr>
+                    </table>
+                </div>
+            </div>
+            <div id="doc-section-functions" class="doc-section">
+                <div class="card">
+                    <h2>기능별 주요 함수</h2>
+                    <h3>RiskManager (quant_trading_safe.py)</h3>
+                    <ul class="doc-list">
+                        <li><code>can_trade(stock_code, price, quantity)</code> → (bool, reason): 일일 한도·거래 횟수·동시 보유·pending·시간대 검사</li>
+                        <li><code>check_exit_signal(stock_code, current_price)</code> → "sell"|None: 손절/익절/ATR/트레일링/부분익절</li>
+                        <li><code>calculate_quantity(price)</code>, <code>calculate_quantity_with_volatility(...)</code>: 매수 수량</li>
+                        <li><code>update_position(stock_code, price, quantity, action)</code>: positions 갱신 (Lock)</li>
+                        <li><code>has_pending_order</code>, <code>set_pending_order</code>, <code>clear_pending_order</code>: 접수 후 체결 대기</li>
+                        <li><code>get_unrealized_pnl()</code>, <code>get_total_pnl()</code>: 손익 집계</li>
+                    </ul>
+                    <h3>QuantStrategy (quant_trading_safe.py)</h3>
+                    <ul class="doc-list">
+                        <li><code>update_price(stock_code, price)</code>: price_history·last_prices 반영</li>
+                        <li><code>calculate_ma(stock_code, period)</code>: 최근 period틱 종가 평균</li>
+                        <li><code>get_signal(stock_code, current_price)</code> → "buy"|"sell"|None: MA 골든/데드 크로스</li>
+                    </ul>
+                    <h3>주문 실행 (quant_trading_safe.py)</h3>
+                    <ul class="doc-list">
+                        <li><code>safe_execute_order(signal, stock_code, price, strategy, trenv, ...)</code>: can_trade → 수량 계산 → order_cash·재시도·폴백</li>
+                        <li><code>_extract_order_response(df)</code>: ODNO·RT_CD 등 추출</li>
+                        <li><code>_check_filled_order</code>, <code>_check_unfilled_order_acceptance</code>: 체결/미체결 조회</li>
+                        <li><code>create_safe_on_result(strategy, trenv, ...)</code>: WebSocket 틱 콜백 등록, 신호→주문→reconcile</li>
+                    </ul>
+                    <h3>종목 선정 (stock_selector.py)</h3>
+                    <ul class="doc-list">
+                        <li><code>select_stocks_by_fluctuation()</code> → List[str]: 등락률 API 후 필터·정렬·워밍업·고점 대비 제외</li>
+                    </ul>
+                    <h3>API (quant_dashboard_api.py)</h3>
+                    <ul class="doc-list">
+                        <li>설정: load_risk_config, save_risk_config 등 → user_settings_store</li>
+                        <li>종목: POST /api/stocks/select → StockSelector().select_stocks_by_fluctuation()</li>
+                        <li>시스템: start/stop, set-env, set-trade-mode</li>
+                        <li>승인: GET /api/signals/pending, POST /api/signals/approve|reject</li>
+                        <li>성과: GET /api/performance/export (CSV/JSON, 슬리피지·수수료 옵션)</li>
+                    </ul>
                 </div>
             </div>
         </div>
@@ -1990,6 +2251,67 @@ def get_dashboard_html_mobile(username: str) -> str:
         </div>
     </div>
 
+    <!-- 선정 기준 모달 -->
+    <div id="criteriaModalOverlay" class="modal-overlay" style="display:none;" onclick="closeCriteriaModal(event)">
+        <div class="modal" onclick="event.stopPropagation()" style="max-width: 420px;">
+            <div class="modal-header" style="display:flex; justify-content:space-between; align-items:center;">
+                <span>선정 기준</span>
+                <button type="button" class="btn" style="padding: 3px 10px; font-size: 11px; margin-left: auto; min-width: auto;" onclick="closeCriteriaModal()">닫기</button>
+            </div>
+            <div class="modal-body" id="criteria_modal_body" style="font-size: 13px; line-height: 1.6;">
+                <p style="color: var(--muted);">기준을 불러오는 중...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- 프로필 모달 (quant_trading_users 조회/수정) -->
+    <div id="profileModalOverlay" class="modal-overlay" style="display:none;" onclick="closeProfileModal(event)">
+        <div class="modal" onclick="event.stopPropagation()" style="max-width: 520px;">
+            <div class="modal-header" style="display:flex; justify-content:space-between; align-items:center;">
+                <span>프로필</span>
+                <button type="button" class="btn" style="padding: 3px 10px; font-size: 11px; min-width: auto;" onclick="closeProfileModal()">닫기</button>
+            </div>
+            <div class="modal-body" id="profile_modal_body">
+                <p style="color: var(--muted); margin-bottom: 12px;">개인정보 및 실전/모의 계좌 정보는 quant_trading_users 테이블에 저장됩니다.</p>
+                <div class="profile-form">
+                    <div class="profile-section">
+                        <div class="profile-section-title">계정</div>
+                        <label>이메일</label>
+                        <input type="text" id="profile_email" placeholder="email@example.com" style="width:100%; margin-bottom:10px;">
+                    </div>
+                    <div class="profile-section">
+                        <div class="profile-section-title">실전 계좌</div>
+                        <label>캐노(실전) <span class="label-hint">— 계좌 앞 8자리, 한국투자증권 등</span></label>
+                        <input type="text" id="profile_real_cano" placeholder="8자리" style="width:100%; margin-bottom:8px;">
+                        <label>계좌번호(실전)</label>
+                        <input type="text" id="profile_real_acnt_no" placeholder="계좌번호" style="width:100%; margin-bottom:10px;">
+                    </div>
+                    <div class="profile-section">
+                        <div class="profile-section-title">모의 계좌</div>
+                        <label>캐노(모의) <span class="label-hint">— 계좌 앞 8자리</span></label>
+                        <input type="text" id="profile_paper_cano" placeholder="8자리" style="width:100%; margin-bottom:8px;">
+                        <label>계좌번호(모의)</label>
+                        <input type="text" id="profile_paper_acnt_no" placeholder="계좌번호" style="width:100%; margin-bottom:10px;">
+                    </div>
+                    <div class="profile-section">
+                        <div class="profile-section-title">비밀번호 변경</div>
+                        <label>현재 비밀번호</label>
+                        <input type="password" id="profile_current_password" placeholder="현재 비밀번호" style="width:100%; margin-bottom:8px;">
+                        <label>새 비밀번호</label>
+                        <input type="password" id="profile_new_password" placeholder="4자 이상" style="width:100%; margin-bottom:8px;">
+                        <label>새 비밀번호 확인</label>
+                        <input type="password" id="profile_new_password_confirm" placeholder="다시 입력" style="width:100%; margin-bottom:10px;">
+                        <button type="button" class="btn" style="margin-top:4px;" onclick="changePassword()">비밀번호 변경</button>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn" onclick="closeProfileModal()">취소</button>
+                <button type="button" class="btn btn-primary" onclick="saveProfile()">저장</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         let ws = null;
         let reconnectInterval = null;
@@ -2002,16 +2324,30 @@ def get_dashboard_html_mobile(username: str) -> str:
         function showTab(tabName) {{
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            event.target.classList.add('active');
-            document.getElementById(`tab-${{tabName}}`).classList.add('active');
+            const tabEl = document.querySelector(`.tab[data-tab="${{tabName}}"]`);
+            if (tabEl) tabEl.classList.add('active');
+            else if (typeof event !== 'undefined' && event && event.target) event.target.classList.add('active');
+            const content = document.getElementById(`tab-${{tabName}}`);
+            if (content) content.classList.add('active');
             const settingsSub = document.getElementById('settingsSubbar');
             const perfSub = document.getElementById('performanceSubbar');
+            const docsSub = document.getElementById('docsSubbar');
             if (settingsSub) settingsSub.style.display = (tabName === 'settings') ? 'block' : 'none';
             if (perfSub) perfSub.style.display = (tabName === 'performance') ? 'block' : 'none';
+            if (docsSub) docsSub.style.display = (tabName === 'docs') ? 'block' : 'none';
             if (tabName === 'performance') {{
                 showPerformanceSection('summary');
                 loadPerformanceSummary();
                 setDefaultPerformanceDailyRange();
+            }}
+            if (tabName === 'docs') showDocsSection('overview');
+            if (tabName === 'trades') {{
+                const today = new Date().toISOString().slice(0, 10);
+                const sysDateEl = document.getElementById('trades_system_date');
+                const accEl = document.getElementById('trades_account_date');
+                if (sysDateEl && !sysDateEl.value) sysDateEl.value = today;
+                if (accEl && !accEl.value) accEl.value = today;
+                showTradeSubtab('system');
             }}
         }}
 
@@ -2237,6 +2573,104 @@ def get_dashboard_html_mobile(username: str) -> str:
             av.setAttribute('aria-expanded', open ? 'true' : 'false');
         }}
 
+        function openProfileModal() {{
+            closeUserMenu();
+            const ov = document.getElementById('profileModalOverlay');
+            if (ov) {{ ov.style.display = 'flex'; }}
+            loadProfile();
+        }}
+
+        function closeProfileModal(ev) {{
+            if (ev && ev.target !== ev.currentTarget) return;
+            const ov = document.getElementById('profileModalOverlay');
+            if (ov) {{ ov.style.display = 'none'; }}
+        }}
+
+        async function loadProfile() {{
+            try {{
+                const response = await fetch('/api/profile', {{ credentials: 'include' }});
+                const data = await response.json();
+                if (data.success && data.profile) {{
+                    const p = data.profile;
+                    const set = (id, val) => {{ const el = document.getElementById(id); if (el) el.value = (val != null && val !== undefined) ? String(val) : ''; }};
+                    set('profile_email', p.email);
+                    set('profile_real_cano', p.real_cano);
+                    set('profile_real_acnt_no', p.real_acnt_no);
+                    set('profile_paper_cano', p.paper_cano);
+                    set('profile_paper_acnt_no', p.paper_acnt_no);
+                }} else {{
+                    addLog('프로필 로드 실패: ' + (data.message || '알 수 없음'), 'warning');
+                }}
+            }} catch (e) {{
+                addLog('프로필 로드 오류: ' + (e.message || ''), 'error');
+            }}
+        }}
+
+        async function saveProfile() {{
+            try {{
+                const get = (id) => {{ const el = document.getElementById(id); return el ? (el.value || '').trim() : ''; }};
+                const body = {{
+                    email: get('profile_email'),
+                    real_cano: get('profile_real_cano'),
+                    real_acnt_no: get('profile_real_acnt_no'),
+                    paper_cano: get('profile_paper_cano'),
+                    paper_acnt_no: get('profile_paper_acnt_no'),
+                }};
+                const response = await fetch('/api/profile', {{
+                    method: 'PUT',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    credentials: 'include',
+                    body: JSON.stringify(body)
+                }});
+                const data = await response.json();
+                if (data.success) {{
+                    addLog('프로필이 저장되었습니다.', 'info');
+                    closeProfileModal();
+                }} else {{
+                    addLog('프로필 저장 실패: ' + (data.message || '알 수 없음'), 'error');
+                }}
+            }} catch (e) {{
+                addLog('프로필 저장 오류: ' + (e.message || ''), 'error');
+            }}
+        }}
+
+        async function changePassword() {{
+            const current = (document.getElementById('profile_current_password')?.value || '').trim();
+            const newPw = (document.getElementById('profile_new_password')?.value || '').trim();
+            const confirmPw = (document.getElementById('profile_new_password_confirm')?.value || '').trim();
+            if (!current) {{
+                addLog('현재 비밀번호를 입력하세요.', 'warning');
+                return;
+            }}
+            if (newPw.length < 4) {{
+                addLog('새 비밀번호는 4자 이상이어야 합니다.', 'warning');
+                return;
+            }}
+            if (newPw !== confirmPw) {{
+                addLog('새 비밀번호가 일치하지 않습니다.', 'warning');
+                return;
+            }}
+            try {{
+                const response = await fetch('/api/auth/change-password', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    credentials: 'include',
+                    body: JSON.stringify({{ current_password: current, new_password: newPw }})
+                }});
+                const data = await response.json();
+                if (data.success) {{
+                    addLog('비밀번호가 변경되었습니다.', 'info');
+                    document.getElementById('profile_current_password').value = '';
+                    document.getElementById('profile_new_password').value = '';
+                    document.getElementById('profile_new_password_confirm').value = '';
+                }} else {{
+                    addLog(data.message || '비밀번호 변경 실패', 'error');
+                }}
+            }} catch (e) {{
+                addLog('비밀번호 변경 오류: ' + (e.message || ''), 'error');
+            }}
+        }}
+
         function closeUserMenu() {{
             const dd = document.getElementById('userDropdown');
             const av = document.getElementById('userAvatar');
@@ -2276,6 +2710,16 @@ def get_dashboard_html_mobile(username: str) -> str:
                 if (btn) btn.classList.toggle('active', s === name);
             }});
             updateSettingsSummaries();
+        }}
+
+        function showDocsSection(name) {{
+            const sections = ['overview', 'workflow', 'files', 'functions'];
+            sections.forEach(s => {{
+                const sec = document.getElementById(`doc-section-${{s}}`);
+                const btn = document.getElementById(`doc-subtab-${{s}}`);
+                if (sec) sec.classList.toggle('active', s === name);
+                if (btn) btn.classList.toggle('active', s === name);
+            }});
         }}
 
         function showPerformanceSection(name) {{
@@ -2442,6 +2886,7 @@ def get_dashboard_html_mobile(username: str) -> str:
         }}
 
         function updateStatus(data) {{
+            window._systemRunning = !!data.is_running;
             document.getElementById('status').textContent = data.is_running ? '실행 중' : '중지됨';
             document.getElementById('status').className = 'status ' + (data.is_running ? 'running' : 'stopped');
             document.getElementById('env').textContent = data.env_name || '-';
@@ -2488,6 +2933,8 @@ def get_dashboard_html_mobile(username: str) -> str:
                 if (el) el.value = data.buy_window_end_hhmm;
             }}
             renderSelectedStocks(data.selected_stock_info || data.selected_stocks || []);
+            window.__lastStockSelectionCriteria = data.stock_selection_criteria || null;
+            if (data.positions != null) updatePositions(data.positions);
             renderBuySkipStats(data.buy_skip_stats || null);
             if (data.enable_auto_rebalance != null) {{
                 const el = document.getElementById('enable_auto_rebalance');
@@ -2680,6 +3127,45 @@ def get_dashboard_html_mobile(username: str) -> str:
             container.innerHTML = `<div>${{chips}}</div>`;
         }}
 
+        function criteriaToHtml(criteria) {{
+            if (!criteria || typeof criteria !== 'object') {{
+                return '<p style="color: var(--muted);">저장된 선정 기준이 없습니다. 설정 탭에서 종목선정 조건을 저장하면 여기에 표시됩니다.</p>';
+            }}
+            const fmt = (v) => (v == null || v === '') ? '—' : String(v);
+            const pct = (v) => (v != null && v !== '') ? (Number(v) * 100).toFixed(1) + '%' : '—';
+            const num = (v) => (v != null && v !== '') ? Number(v).toLocaleString() : '—';
+            const sortLabels = {{ 'change': '등락률', 'trade_amount': '거래대금', 'prev_day_trade_value': '전일 거래대금' }};
+            const lines = [
+                ['등락률 범위', pct(criteria.min_price_change_ratio) + ' ~ ' + pct(criteria.max_price_change_ratio)],
+                ['가격 범위', num(criteria.min_price) + '원 ~ ' + num(criteria.max_price) + '원'],
+                ['최소 거래량', num(criteria.min_volume) + '주'],
+                ['최소 거래대금', (criteria.min_trade_amount && Number(criteria.min_trade_amount) > 0) ? num(criteria.min_trade_amount) + '원' : '미적용'],
+                ['최대 선정 종목 수', fmt(criteria.max_stocks)],
+                ['정렬 기준', sortLabels[criteria.sort_by] || fmt(criteria.sort_by)],
+                ['위험/경고 종목 제외', criteria.exclude_risk_stocks ? '예' : '아니오'],
+                ['장 시작 워밍업', fmt(criteria.warmup_minutes) + '분'],
+                ['장초 강화(early_strict)', criteria.early_strict ? '예' : '아니오'],
+                ['장초 최소 거래량', num(criteria.early_min_volume)],
+                ['장초 최소 거래대금', (criteria.early_min_trade_amount && Number(criteria.early_min_trade_amount) > 0) ? num(criteria.early_min_trade_amount) + '원' : '미적용'],
+                ['고점 대비 하락 제외', criteria.exclude_drawdown ? '예' : '아니오'],
+                ['코스피만', criteria.kospi_only ? '예' : '아니오'],
+            ];
+            return '<dl style="margin:0; padding:0;">' + lines.map(([label, value]) => `<dt style="margin:6px 0 2px 0; color: var(--muted); font-weight:600;">${{label}}</dt><dd style="margin:0 0 8px 0;">${{value}}</dd>`).join('') + '</dl>';
+        }}
+
+        function openCriteriaModal() {{
+            const body = document.getElementById('criteria_modal_body');
+            const overlay = document.getElementById('criteriaModalOverlay');
+            if (body) body.innerHTML = criteriaToHtml(window.__lastStockSelectionCriteria || null);
+            if (overlay) overlay.style.display = 'flex';
+        }}
+
+        function closeCriteriaModal(event) {{
+            if (event && event.target !== document.getElementById('criteriaModalOverlay')) return;
+            const overlay = document.getElementById('criteriaModalOverlay');
+            if (overlay) overlay.style.display = 'none';
+        }}
+
         function updatePositions(positions) {{
             const container = document.getElementById('positions');
             if (!positions || Object.keys(positions).length === 0) {{
@@ -2705,14 +3191,114 @@ def get_dashboard_html_mobile(username: str) -> str:
         function addTradeToHistory(trade) {{
             const tbody = document.getElementById('trade_history_body');
             const row = document.createElement('tr');
+            const reason = (trade.reason || '').toString().trim() || '-';
+            const pnl = trade.pnl != null ? formatNumber(trade.pnl) + '원' : '-';
             row.innerHTML = `
                 <td>${{new Date(trade.timestamp).toLocaleTimeString()}}</td>
                 <td>${{trade.stock_code}}</td>
                 <td>${{trade.order_type === 'buy' ? '매수' : '매도'}}</td>
                 <td>${{trade.quantity}}주</td>
                 <td>${{formatNumber(trade.price)}}원</td>
+                <td class="${{trade.pnl != null && trade.pnl < 0 ? 'negative' : (trade.pnl > 0 ? 'positive' : '')}}">${{pnl}}</td>
+                <td style="max-width:140px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${{reason}}">${{reason}}</td>
             `;
             tbody.insertBefore(row, tbody.firstChild);
+        }}
+
+        function showTradeSubtab(kind) {{
+            document.getElementById('btn-trades-system').classList.toggle('active', kind === 'system');
+            document.getElementById('btn-trades-account').classList.toggle('active', kind === 'account');
+            document.getElementById('trade-panel-system').style.display = kind === 'system' ? 'block' : 'none';
+            document.getElementById('trade-panel-account').style.display = kind === 'account' ? 'block' : 'none';
+            if (kind === 'system') {{
+                const today = new Date().toISOString().slice(0, 10);
+                const el = document.getElementById('trades_system_date');
+                if (el && !el.value) el.value = today;
+            }} else if (kind === 'account') {{
+                if (!document.getElementById('trades_account_date').value)
+                    document.getElementById('trades_account_date').value = new Date().toISOString().slice(0, 10);
+            }}
+        }}
+
+        async function fetchSystemTrades() {{
+            const dateEl = document.getElementById('trades_system_date');
+            const dateStr = dateEl ? dateEl.value.replace(/-/g, '') : new Date().toISOString().slice(0, 10).replace(/-/g, '');
+            try {{
+                const q = new URLSearchParams();
+                if (dateStr) {{ q.set('date_from', dateStr); q.set('date_to', dateStr); }}
+                const resp = await fetch('/api/trades/system?' + q.toString());
+                const data = await resp.json();
+                const tbody = document.getElementById('trade_history_body');
+                tbody.innerHTML = '';
+                if (Array.isArray(data) && data.length) {{
+                    data.forEach(t => {{
+                        const ts = t.timestamp || (t.date && t.time ? t.date.replace(/(\\d{{4}})(\\d{{2}})(\\d{{2}})/, '$1-$2-$3') + 'T' + (t.time || '000000').replace(/(\\d{{2}})(\\d{{2}})(\\d{{2}})/, '$1:$2:$3') : '');
+                        const reason = (t.reason || '').toString().trim() || '-';
+                        const pnl = t.pnl != null ? formatNumber(t.pnl) + '원' : '-';
+                        const row = document.createElement('tr');
+                        row.innerHTML = `
+                            <td>${{ts ? new Date(ts).toLocaleTimeString() : '-'}}</td>
+                            <td>${{t.stock_code || '-'}}</td>
+                            <td>${{(t.order_type || '').toLowerCase() === 'buy' ? '매수' : '매도'}}</td>
+                            <td>${{t.quantity != null ? t.quantity + '주' : '-'}}</td>
+                            <td>${{t.price != null ? formatNumber(t.price) + '원' : '-'}}</td>
+                            <td class="${{t.pnl != null && t.pnl < 0 ? 'negative' : (t.pnl > 0 ? 'positive' : '')}}">${{pnl}}</td>
+                            <td style="max-width:140px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${{reason}}">${{reason}}</td>
+                        `;
+                        tbody.appendChild(row);
+                    }});
+                }} else {{
+                    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color: var(--muted);">해당 기간 거래내역이 없습니다.</td></tr>';
+                }}
+            }} catch (e) {{
+                addLog('시스템 거래내역 조회 실패: ' + e, 'error');
+            }}
+        }}
+
+        async function fetchAccountTrades() {{
+            const dateEl = document.getElementById('trades_account_date');
+            const dateStr = dateEl ? dateEl.value.replace(/-/g, '') : new Date().toISOString().slice(0, 10).replace(/-/g, '');
+            try {{
+                const resp = await fetch('/api/trades/account?date=' + encodeURIComponent(dateStr));
+                const data = await resp.json();
+                const tbody = document.getElementById('account_trade_history_body');
+                tbody.innerHTML = '';
+                if (data.error && !data.rows) {{
+                    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color: var(--danger);">' + (data.error || '조회 실패') + '</td></tr>';
+                    return;
+                }}
+                const rows = data.rows || [];
+                const col = (r, ...keys) => {{ for (const k of keys) {{ const v = r[k] ?? r[k.toUpperCase()]; if (v !== undefined && v !== null && v !== '') return v; }} return ''; }};
+                if (rows.length) {{
+                    rows.forEach(r => {{
+                        const ordDt = col(r, 'ord_dt', 'ORD_DT') || '';
+                        const ordTmd = col(r, 'ord_tmd', 'ORD_TMD') || '';
+                        const sllBuy = col(r, 'sll_buy_dvsn_cd', 'SLL_BUY_DVSN_CD');
+                        const side = sllBuy === '02' || (String(sllBuy).toLowerCase() === '02') ? '매수' : (sllBuy === '01' ? '매도' : String(sllBuy));
+                        const pdno = col(r, 'pdno', 'PDNO') || '-';
+                        const prdtName = col(r, 'prdt_name', 'PRDT_NAME', 'hts_kor_isnm', 'HTS_KOR_ISNM', 'prd_name', 'PRD_NAME');
+                        const ordQty = col(r, 'ord_qty', 'ORD_QTY');
+                        const ccldQty = col(r, 'ccld_qty', 'CCLD_QTY', 'tot_ccld_qty', 'TOT_CCLD_QTY', 'ccld_qty_tot', 'CCLD_QTY_TOT') || ordQty;
+                        const avgPrc = col(r, 'avg_prvs', 'AVG_PRC', 'ccld_unpr', 'CCLD_UNPR', 'ord_unpr', 'ORD_UNPR');
+                        const row = document.createElement('tr');
+                        row.innerHTML = `
+                            <td>${{ordDt ? ordDt.replace(/(\\d{{4}})(\\d{{2}})(\\d{{2}})/, '$1-$2-$3') : '-'}}</td>
+                            <td>${{ordTmd ? (String(ordTmd).slice(0,2) + ':' + String(ordTmd).slice(2,4) + ':' + String(ordTmd).slice(4,6)) : '-'}}</td>
+                            <td>${{side}}</td>
+                            <td>${{pdno}}</td>
+                            <td style="max-width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${{prdtName || ''}}">${{prdtName || '-'}}</td>
+                            <td>${{ordQty != null && ordQty !== '' ? formatNumber(Number(ordQty)) : '-'}}</td>
+                            <td>${{ccldQty != null && ccldQty !== '' ? formatNumber(Number(ccldQty)) : (ordQty != null && ordQty !== '' ? formatNumber(Number(ordQty)) : '-')}}</td>
+                            <td>${{avgPrc != null && avgPrc !== '' ? formatNumber(Number(avgPrc)) + '원' : '-'}}</td>
+                        `;
+                        tbody.appendChild(row);
+                    }});
+                }} else {{
+                    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color: var(--muted);">' + (data.date || dateStr) + ' 거래내역이 없습니다.</td></tr>';
+                }}
+            }} catch (e) {{
+                addLog('계좌 거래내역 조회 실패: ' + e, 'error');
+            }}
         }}
 
         function addLog(message, level = 'info') {{
@@ -2815,10 +3401,15 @@ def get_dashboard_html_mobile(username: str) -> str:
 
         async function refreshData() {{
             try {{
-                const response = await fetch('/api/system/status');
+                const response = await fetch('/api/system/status?t=' + Date.now());
+                if (!response.ok) {{
+                    renderBuySkipStats(null);
+                    return;
+                }}
                 const data = await response.json();
                 updateStatus(data);
             }} catch (error) {{
+                renderBuySkipStats(null);
                 addLog('새로고침 오류: ' + error, 'error');
             }}
         }}
@@ -2883,8 +3474,11 @@ def get_dashboard_html_mobile(username: str) -> str:
                     if (risk.atr_lookback_ticks != null) document.getElementById('atr_lookback_ticks').value = risk.atr_lookback_ticks;
                 }}
                 if (strat) {{
-                    if (strat.short_ma_period != null) document.getElementById('short_ma_period').value = strat.short_ma_period;
-                    if (strat.long_ma_period != null) document.getElementById('long_ma_period').value = strat.long_ma_period;
+                    var shortMa = strat.short_ma_period;
+                    var longMa = strat.long_ma_period;
+                    if (shortMa !== undefined && shortMa !== null) document.getElementById('short_ma_period').value = String(Number(shortMa));
+                    if (longMa !== undefined && longMa !== null) document.getElementById('long_ma_period').value = String(Number(longMa));
+                    if (strat.min_hold_seconds != null) document.getElementById('min_hold_seconds').value = strat.min_hold_seconds;
                     if (strat.buy_window_start_hhmm != null) document.getElementById('buy_window_start_hhmm').value = strat.buy_window_start_hhmm;
                     if (strat.buy_window_end_hhmm != null) document.getElementById('buy_window_end_hhmm').value = strat.buy_window_end_hhmm;
                     if (strat.min_short_ma_slope_ratio != null) document.getElementById('min_short_ma_slope_pct').value = (strat.min_short_ma_slope_ratio * 100).toFixed(3);
@@ -3044,7 +3638,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                     trailing_activation_ratio: (parseFloat(document.getElementById('trailing_activation_pct').value) || 0) / 100,
                     partial_take_profit_ratio: (parseFloat(document.getElementById('partial_tp_pct').value) || 0) / 100,
                     partial_take_profit_fraction: (parseFloat(document.getElementById('partial_tp_fraction_pct').value) || 0) / 100,
-                    min_price_change_ratio: (function(){{ var el = document.getElementById('min_price_change_ratio_pct'); if (!el) return 0.01; var v = parseFloat(el.value); return Number.isNaN(v) ? 0.01 : v / 100; }})(),
+                    min_price_change_ratio: (function(){{ var el = document.getElementById('min_price_change_ratio_pct'); if (!el) return 0; var v = parseFloat(el.value); return Number.isNaN(v) ? 0 : v / 100; }})(),
                     use_atr_for_stop_take: !!document.getElementById('use_atr_for_stop_take')?.checked,
                     atr_stop_mult: parseFloat(document.getElementById('atr_stop_mult')?.value) || 1.5,
                     atr_take_mult: parseFloat(document.getElementById('atr_take_mult')?.value) || 2,
@@ -3070,6 +3664,7 @@ def get_dashboard_html_mobile(username: str) -> str:
                 const config = {{
                     short_ma_period: parseInt(document.getElementById('short_ma_period').value),
                     long_ma_period: parseInt(document.getElementById('long_ma_period').value),
+                    min_hold_seconds: parseInt(document.getElementById('min_hold_seconds').value) || 0,
                     buy_window_start_hhmm: (document.getElementById('buy_window_start_hhmm').value || '09:05').trim(),
                     buy_window_end_hhmm: (document.getElementById('buy_window_end_hhmm').value || '11:30').trim(),
                     min_short_ma_slope_ratio: (parseFloat(document.getElementById('min_short_ma_slope_pct').value) || 0) / 100,
@@ -3320,6 +3915,12 @@ def get_dashboard_html_mobile(username: str) -> str:
                 addLog('프리셋을 선택하세요', 'warning');
                 return;
             }}
+            if (presetId === 'custom') {{
+                addLog('커스텀: DB(quant_trading_user_settings) 저장값 불러오는 중...', 'info');
+                await loadUserSettings();
+                addLog('커스텀(DB 저장값) 적용 완료. 리스크·전략·종목선정·운영 설정이 DB 값으로 세팅되었습니다.', 'info');
+                return;
+            }}
             await applyScalpPresetWithOptions(presetId);
         }}
 
@@ -3361,9 +3962,11 @@ def get_dashboard_html_mobile(username: str) -> str:
             try {{
                 addLog(overrides.name + ' 프리셋 적용 중...', 'info');
 
-                // 리스크: Position size = risk / stop distance, dailyProfit ≥ dailyLoss, 슬리피지 20bps
+                // 리스크: Position size = risk / stop distance, dailyProfit ≥ dailyLoss, 슬리피지 20bps. 직전틱 1%는 급등만 허용되므로 단타 프리셋은 0(미적용)
                 document.getElementById('max_trade_amount').value = 1000000;
                 document.getElementById('min_order_quantity').value = 2;
+                const minPriceChgEl = document.getElementById('min_price_change_ratio_pct');
+                if (minPriceChgEl) minPriceChgEl.value = 0;
                 document.getElementById('stop_loss').value = overrides.stop_loss;
                 document.getElementById('take_profit').value = overrides.take_profit;
                 document.getElementById('daily_loss_limit').value = overrides.daily_loss_limit;
@@ -3394,9 +3997,11 @@ def get_dashboard_html_mobile(username: str) -> str:
                 document.getElementById('volatility_stop_mult').value = 1.0;
                 await updateRiskConfig();
 
-                // 전략(빠른 MA + 신규 매수 시간 제한)
+                // 전략(빠른 MA + 신규 매수 시간 제한 + 진입 후 최소 보유로 즉시 매도 방지)
                 document.getElementById('short_ma_period').value = 3;
                 document.getElementById('long_ma_period').value = 10;
+                const minHoldEl = document.getElementById('min_hold_seconds');
+                if (minHoldEl) minHoldEl.value = 30;
                 document.getElementById('buy_window_start_hhmm').value = '09:05';
                 document.getElementById('buy_window_end_hhmm').value = overrides.buy_window_end_hhmm;
                 document.getElementById('min_short_ma_slope_pct').value = 0.010;
@@ -3644,6 +4249,10 @@ def get_dashboard_html_mobile(username: str) -> str:
         }}
 
         async function logout() {{
+            if (window._systemRunning) {{
+                alert('거래가 실행 중입니다. 먼저 시스템을 중지한 뒤 Sign out 해 주세요.');
+                return;
+            }}
             try {{
                 await fetch('/api/auth/logout', {{ method: 'POST' }});
                 window.location.href = '/login';
@@ -3661,19 +4270,6 @@ def get_dashboard_html_mobile(username: str) -> str:
         (async () => {{
             await loadUserSettings();
             updateSettingsSummaries();
-            // 로그인 직후: 저장된 "종목 선정 기준"으로 1회 자동 선정해서 바로 보여주기
-            if (!window.__initial_auto_selection_done) {{
-                window.__initial_auto_selection_done = true;
-                addLog('저장된 설정으로 종목 자동 선정 중...', 'info');
-                const res = await selectStocks(true);
-                if (res && res.success) {{
-                    const stocks = (res.stocks || []);
-                    const suffix = (stocks && stocks.length) ? `: ${{stocks.join(', ')}}` : '';
-                    addLog('저장된 설정으로 종목 자동 선정 완료' + suffix, 'info');
-                }} else {{
-                    addLog('저장된 설정으로 종목 자동 선정 실패: ' + ((res && res.message) ? res.message : '알 수 없는 오류'), 'warning');
-                }}
-            }}
             await refreshData();
             await loadPendingSignals();
         setInterval(refreshData, 5000);

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""dashboard_html_mobile.py 패치:
+"""dashboard_html.py 패치:
    - 일별 성과 블록을 권장 설정 블록 바로 아래로 이동
    - 시작일/종료일을 <input type="date"> 로 변경
    - loadPerformanceDaily 에서 YYYY-MM-DD -> YYYYMMDD 변환
@@ -8,7 +8,7 @@
 import re
 import sys
 
-PATH = "dashboard_html_mobile.py"
+PATH = "dashboard_html.py"
 
 def main():
     with open(PATH, "r", encoding="utf-8") as f:

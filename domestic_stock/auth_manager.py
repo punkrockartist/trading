@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict
 import logging
 import os
+from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,23 @@ class SimpleUserStore:
     def get_user(self, username: str) -> Optional[Dict]:
         """사용자 정보 조회"""
         return self.users.get(username)
+
+    def update_user_profile(self, username: str, **profile_updates) -> bool:
+        """프로필 필드 업데이트 (인메모리)."""
+        if username not in self.users or not profile_updates:
+            return bool(profile_updates)
+        allowed = {"email", "real_cano", "real_acnt_no", "paper_cano", "paper_acnt_no"}
+        for k, v in profile_updates.items():
+            if k in allowed:
+                self.users[username][k] = v
+        return True
+
+    def update_password(self, username: str, password_hash: str) -> bool:
+        """비밀번호 해시로 갱신 (인메모리)."""
+        if username not in self.users:
+            return False
+        self.users[username]["password_hash"] = password_hash
+        return True
 
 # ============================================================================
 # DynamoDB 사용자 저장소 (프로덕션용)
@@ -266,7 +284,49 @@ try:
             except ClientError as e:
                 logger.error(f"DynamoDB 오류: {e}")
                 return None
-    
+
+        def update_user_profile(self, username: str, **profile_updates) -> bool:
+            """프로필 필드만 업데이트 (DynamoDB UpdateItem). 허용 키만 SET."""
+            if not profile_updates:
+                return True
+            allowed = {"email", "real_cano", "real_acnt_no", "paper_cano", "paper_acnt_no"}
+            updates = {k: v for k, v in profile_updates.items() if k in allowed}
+            if not updates:
+                return True
+            try:
+                set_parts = []
+                expr_names = {}
+                expr_values = {}
+                for i, (k, v) in enumerate(updates.items()):
+                    alias = f"#f{i}"
+                    val_alias = f":v{i}"
+                    set_parts.append(f"{alias} = {val_alias}")
+                    expr_names[alias] = k
+                    expr_values[val_alias] = v
+                self.table.update_item(
+                    Key={"username": username},
+                    UpdateExpression="SET " + ", ".join(set_parts),
+                    ExpressionAttributeNames=expr_names,
+                    ExpressionAttributeValues=expr_values,
+                )
+                return True
+            except ClientError as e:
+                logger.error(f"DynamoDB 프로필 업데이트 오류: {e}")
+                return False
+
+        def update_password(self, username: str, password_hash: str) -> bool:
+            """비밀번호 해시로 갱신 (DynamoDB UpdateItem)."""
+            try:
+                self.table.update_item(
+                    Key={"username": username},
+                    UpdateExpression="SET password_hash = :ph",
+                    ExpressionAttributeValues={":ph": password_hash},
+                )
+                return True
+            except ClientError as e:
+                logger.error(f"DynamoDB 비밀번호 업데이트 오류: {e}")
+                return False
+
     DYNAMODB_AVAILABLE = True
 except ImportError:
     DYNAMODB_AVAILABLE = False
@@ -359,6 +419,47 @@ class AuthManager:
     def get_user(self, username: str) -> Optional[Dict]:
         """사용자 정보 조회"""
         return self.user_store.get_user(username)
+
+    def get_user_profile(self, username: str) -> Optional[Dict]:
+        """프로필 조회 (password_hash 및 KIS/AWS 키 제외)."""
+        user = self.user_store.get_user(username)
+        if not user:
+            return None
+        exclude = {"password_hash", "kis_app_key", "kis_app_secret", "aws_access_key_id", "aws_secret_access_key"}
+        out = {k: v for k, v in user.items() if k not in exclude}
+
+        def _json_safe(val):
+            # DynamoDB는 숫자를 Decimal로 주는 경우가 있어 JSONResponse 직렬화가 실패할 수 있음
+            if isinstance(val, Decimal):
+                try:
+                    return int(val) if val % 1 == 0 else float(val)
+                except Exception:
+                    return float(val)
+            if isinstance(val, dict):
+                return {k: _json_safe(v) for k, v in val.items()}
+            if isinstance(val, (list, tuple)):
+                return [_json_safe(v) for v in val]
+            return val
+
+        return _json_safe(out)
+
+    def update_user_profile(self, username: str, **profile_updates) -> bool:
+        """프로필 일부 필드만 업데이트. 허용 필드: email, real_cano, real_acnt_no, paper_cano, paper_acnt_no (KIS/AWS 키는 보안상 프로필에서 제외). 빈 문자열로 필드 초기화 가능."""
+        allowed = {"email", "real_cano", "real_acnt_no", "paper_cano", "paper_acnt_no"}
+        updates = {k: v for k, v in profile_updates.items() if k in allowed}
+        if not updates:
+            return True
+        return self.user_store.update_user_profile(username, **updates)
+
+    def change_password(self, username: str, current_password: str, new_password: str) -> bool:
+        """비밀번호 변경. 현재 비밀번호 확인 후 새 해시로 갱신."""
+        if not self.user_store.verify_user(username, current_password):
+            return False
+        if not new_password or len(new_password) < 4:
+            return False
+        new_hash = hashlib.sha256(new_password.encode()).hexdigest()
+        return self.user_store.update_password(username, new_hash)
+
 
 # 전역 인증 관리자 설정
 # DynamoDB 설정을 사용하려면 dynamodb_config.py를 수정하거나

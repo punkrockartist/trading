@@ -116,7 +116,7 @@ class RiskManager:
         # 거래 제한
         self.max_trades_per_day = 5  # 하루 최대 거래 횟수 (매수+매도 = 1회)
         self.max_positions_count = 0  # 동시 보유 종목 수 상한. 0이면 제한 없음
-        self.min_price_change_ratio = 0.01  # 최소 1% 변동 시만 거래
+        self.min_price_change_ratio = 0.0  # 직전 틱 대비 최소 변동률. 0=미적용, 0.01=1% 이상 변동 시만 거래(급등 순간 위주)
         # 진입 변동성 상한: 틱 변동성(가격 대비)이 이 비율 초과면 매수 스킵. 0이면 미적용
         self.max_intraday_vol_pct = 0.0
         # ATR(분봉) 필터: ATR/현재가*100 > atr_ratio_max_pct 이면 매수 스킵. 0이면 미적용
@@ -642,9 +642,12 @@ class RiskManager:
                 take_mult = max(0.5, min(10.0, float(getattr(self, "atr_take_mult", 2.0) or 2.0)))
                 stop_price = effective_buy - stop_mult * atr_proxy
                 take_price = effective_buy + take_mult * atr_proxy
-                if float(current_price) <= stop_price:
+                # 진입 직후 변동성이 작으면 손절선이 매수가에 붙어 즉시 터지는 것 방지: 손절선이 매수가의 0.2% 미만 아래면 인정
+                min_stop_pct = 0.002
+                if stop_price < effective_buy * (1.0 - min_stop_pct) and float(current_price) <= stop_price:
                     return {"action": "sell", "quantity": qty, "reason": "손절(ATR)"}
-                if float(current_price) >= take_price:
+                min_take_pct = 0.002
+                if take_price > effective_buy * (1.0 + min_take_pct) and float(current_price) >= take_price:
                     return {"action": "sell", "quantity": qty, "reason": "익절(ATR)"}
             else:
                 use_atr = False
@@ -760,6 +763,7 @@ class QuantStrategy:
         self.short_ma_period = 3  # 단기 이동평균 (3틱)
         self.long_ma_period = 10  # 장기 이동평균 (10틱)
         self.min_history_length = self.long_ma_period  # 최소 히스토리 길이
+        self.min_hold_seconds = 0  # 진입 후 N초 이내 전략(데드크로스) 매도 방지. 0=미적용
         
     def update_price(self, stock_code: str, price: float):
         """가격 업데이트"""
@@ -836,8 +840,16 @@ class QuantStrategy:
             if stock_code not in self.risk_manager.positions:
                 return "buy"
         
-        # 데드크로스 (단기 < 장기): 매도 신호
+        # 데드크로스 (단기 < 장기): 매도 신호 (진입 후 최소 보유 시간 이내면 무시 → 매수 직후 즉시 매도 방지)
         if short_ma < long_ma and stock_code in self.risk_manager.positions:
+            min_hold = int(getattr(self, "min_hold_seconds", 0) or 0)
+            if min_hold > 0:
+                pos = self.risk_manager.positions.get(stock_code)
+                buy_time = pos.get("buy_time") if pos else None
+                if isinstance(buy_time, datetime):
+                    elapsed = (datetime.now() - buy_time).total_seconds()
+                    if elapsed < min_hold:
+                        return None
             return "sell"
         
         return None
@@ -1075,6 +1087,12 @@ def safe_execute_order(
         if quantity is None:
             base_qty = risk_mgr.calculate_quantity(price)
             quantity = risk_mgr.calculate_quantity_with_volatility(stock_code, price, fallback_quantity=base_qty)
+        # 최대 거래 금액 상한으로 수량 상한 적용 (계산/override 오류 시에도 주문 실패 방지)
+        max_amt = float(getattr(risk_mgr, "max_single_trade_amount", 0) or 0)
+        if price > 0 and max_amt > 0:
+            qty_cap = max(1, int(max_amt / price))
+            if quantity > qty_cap:
+                quantity = qty_cap
         details["quantity"] = int(quantity)
         
         # 거래 가능 여부 확인

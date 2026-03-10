@@ -35,8 +35,8 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 
 # 애플리케이션 실행
 # 방법 1: uvicorn 모듈로 실행
-CMD ["python", "-m", "uvicorn", "domestic_stock.quant_dashboard_mobile:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "uvicorn", "domestic_stock.quant_dashboard:app", "--host", "0.0.0.0", "--port", "8000"]
 
 # 방법 2: 직접 실행 (대안)
 # WORKDIR /app/domestic_stock
-# CMD ["python", "quant_dashboard_mobile.py"]
+# CMD ["python", "quant_dashboard.py"]

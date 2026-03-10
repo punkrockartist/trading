@@ -24,7 +24,7 @@ KIS API를 활용한 자동화된 퀀트 매매 시스템입니다.
 
 ```bash
 cd domestic_stock
-py -3.12 quant_dashboard_mobile.py
+py -3.12 quant_dashboard.py
 ```
 
 ### Docker 실행

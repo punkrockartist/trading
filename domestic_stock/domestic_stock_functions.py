@@ -4296,9 +4296,11 @@ def inquire_daily_ccld(
             ka.smart_sleep()  # 시스템 안정적 운영을 위한 지연
             return inquire_daily_ccld(
                 env_dv, pd_dv, cano, acnt_prdt_cd, inqr_strt_dt, inqr_end_dt,
-                sll_buy_dvsn_cd, pdno, ccld_dvsn, inqr_dvsn, inqr_dvsn_3,
-                ord_gno_brno, odno, inqr_dvsn_1, FK100, NK100, "N",
-                excg_id_dvsn_cd, dataframe1, dataframe2, depth + 1, max_depth
+                sll_buy_dvsn_cd, ccld_dvsn, inqr_dvsn, inqr_dvsn_3,
+                pdno=pdno, ord_gno_brno=ord_gno_brno, odno=odno, inqr_dvsn_1=inqr_dvsn_1,
+                FK100=FK100, NK100=NK100, tr_cont="N",
+                excg_id_dvsn_cd=excg_id_dvsn_cd, dataframe1=dataframe1, dataframe2=dataframe2,
+                depth=depth + 1, max_depth=max_depth
             )
         else:
             logging.info("Data fetch complete.")

@@ -1,27 +1,24 @@
 """
-퀀트 매매 시스템 웹 대시보드 (FastAPI)
+퀀트 매매 시스템 웹 대시보드 (FastAPI) - 모바일 최적화 + 로그인
 
 기능:
-1. 실시간 포지션 모니터링
-2. 거래 내역 조회
-3. 리스크 관리 설정 변경
-4. 종목 선정 기준 변경
-5. 수동 거래 실행
-6. 시스템 상태 모니터링
+1. 모바일 반응형 UI
+2. 로그인/회원가입
+3. JWT 토큰 기반 인증
+4. DynamoDB 또는 인메모리 사용자 저장소
+5. 실시간 모니터링
 """
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Request, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Request, status, Cookie
+from starlette.requests import Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.staticfiles import StaticFiles
 from typing import Dict, List, Optional
 import json
-import asyncio
 import logging
 from datetime import datetime
 from pydantic import BaseModel
 import uvicorn
-# from auth_manager import auth_manager, AuthManager  # 로그인 기능이 없는 버전이므로 주석 처리
 
 # 퀀트 매매 시스템 import
 import sys
@@ -34,6 +31,7 @@ from quant_trading_safe import (
 from stock_selector import StockSelector
 from domestic_stock_functions_ws import ccnl_krx
 from stock_selection_presets import PRESETS, get_preset, list_presets
+from auth_manager import auth_manager, AuthManager
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -41,6 +39,9 @@ logger = logging.getLogger(__name__)
 
 # FastAPI 앱 생성
 app = FastAPI(title="퀀트 매매 시스템 대시보드")
+
+# JWT 보안
+security = HTTPBearer(auto_error=False)
 
 # 전역 상태 관리
 class TradingState:
@@ -50,12 +51,23 @@ class TradingState:
         self.strategy: Optional[QuantStrategy] = None
         self.trenv = None
         self.is_paper_trading = True
+        self.manual_approval = True  # True: 승인대기 후 수동 처리, False: 신호 발생 시 자동 매수/매도
         self.is_running = False
         self.websocket_clients: List[WebSocket] = []
         self.trade_history: List[Dict] = []
+        self.consecutive_losses: int = 0  # 연속 손실 횟수 (매도 체결 시 갱신)
+        self.last_consecutive_loss_time: Optional[float] = None  # 마지막 손실 매도 시각 (time.time())
         self.current_positions: Dict[str, Dict] = {}
         self.selected_stocks: List[str] = []
         self.stock_selector: Optional[StockSelector] = None
+        self.pending_signals: Dict[str, Dict] = {}
+        self.engine_thread = None
+        self.engine_running = False
+        # 신규 매수 허용 시간(한국시간, HH:MM). 매도/청산은 항상 허용.
+        self.buy_window_start_hhmm: str = "09:05"
+        self.buy_window_end_hhmm: str = "11:30"
+        # 실시간 호가(스프레드) 캐시: {code: {"ask": float, "bid": float, "at": iso}}
+        self.latest_quotes: Dict[str, Dict] = {}
         
     async def broadcast(self, message: dict):
         """모든 WebSocket 클라이언트에 메시지 전송"""
@@ -66,30 +78,114 @@ class TradingState:
             except:
                 disconnected.append(client)
         
-        # 연결 끊어진 클라이언트 제거
         for client in disconnected:
             if client in self.websocket_clients:
                 self.websocket_clients.remove(client)
     
     def add_trade(self, trade_info: dict):
-        """거래 내역 추가"""
+        """거래 내역 추가 (메모리 + quant_trading_user_hist, 10일 보관)"""
+        import time as _time
         trade_info["timestamp"] = datetime.now().isoformat()
         self.trade_history.append(trade_info)
-        # 최근 100개만 유지
         if len(self.trade_history) > 100:
             self.trade_history = self.trade_history[-100:]
+        # DynamoDB quant_trading_user_hist 저장 (일자별 10일 보관, TTL)
+        try:
+            from user_hist_store import get_user_hist_store
+            store = get_user_hist_store()
+            u = getattr(self, "trading_username", None)
+            if not u:
+                logger.debug("user_hist: skip (trading_username not set — 시스템 시작 후 저장됨)")
+            elif not store.enabled:
+                logger.warning("user_hist: skip (store disabled). table=%s reason=%s", getattr(store, "table_name", ""), getattr(store, "init_error", "unknown"))
+            else:
+                if not store.put_trade(u, trade_info):
+                    logger.warning("user_hist: put_trade returned False for user=%s", u)
+        except Exception as e:
+            logger.warning("user_hist: save failed: %s", e, exc_info=True)
+        # 연속 손실 추적: 매도 체결 시 pnl 기준
+        if trade_info.get("order_type") == "sell" and trade_info.get("pnl") is not None:
+            try:
+                pnl = float(trade_info["pnl"])
+                if pnl < 0:
+                    self.consecutive_losses = getattr(self, "consecutive_losses", 0) + 1
+                    self.last_consecutive_loss_time = _time.time()
+                else:
+                    self.consecutive_losses = 0
+                    self.last_consecutive_loss_time = None
+            except (TypeError, ValueError):
+                pass
 
-# 전역 상태
 state = TradingState()
 
 # Pydantic 모델
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+    email: str = ""
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
 class RiskConfig(BaseModel):
     max_single_trade_amount: int
+    min_order_quantity: int = 1
     stop_loss_ratio: float
     take_profit_ratio: float
     daily_loss_limit: int
+    daily_profit_limit: int = 0  # 0이면 사용 안 함 (원). 도달 시 신규 매수 차단 + 전량매도 트리거에 사용 가능
+    daily_total_loss_limit: int = 0  # 0이면 사용 안 함 (원). (실현+미실현) 합산이 -한도 이하이면 전량매도 + 신규매수 차단
+    # 일일 손익 한도 기준(실현/실현+미실현)
+    daily_profit_limit_basis: str = "total"  # realized | total
+    daily_loss_limit_basis: str = "realized"  # realized | total
+    daily_loss_limit_calendar: bool = True  # True=캘린더일(자정 리셋), False=세션
+    daily_profit_limit_calendar: bool = True
+    monthly_loss_limit: int = 0  # 0=미적용. 월간 손실 한도(원)
+    cumulative_loss_limit: int = 0  # 0=미적용. 누적 손실 한도(원)
+    # 주문 실행 방식/재시도
+    buy_order_style: str = "market"  # market | best_limit
+    sell_order_style: str = "market"  # market | best_limit
+    order_retry_count: int = 0
+    order_retry_delay_ms: int = 300
+    order_retry_exponential_backoff: bool = True
+    order_retry_base_delay_ms: int = 1000
+    order_fallback_to_market: bool = True
+    # 변동성 기반 포지션 사이징 + 종목당 최대 손실액
+    enable_volatility_sizing: bool = False
+    volatility_lookback_ticks: int = 20
+    volatility_stop_mult: float = 1.0
+    max_loss_per_stock_krw: int = 0  # 0이면 사용 안 함
+    # 슬리피지·체결지연 보수 반영(bps). 손절/익절 판단 시 매수가 불리하게 체결된 것으로 가정
+    slippage_bps: int = 0
+    # 변동성 틱 부족 시 하한(가격 대비 비율, 예: 0.005=0.5%). 장 초반 사이징 완화
+    volatility_floor_ratio: float = 0.005
     max_trades_per_day: int
     max_position_size_ratio: float
+    max_positions_count: int = 0  # 동시 보유 종목 수 상한. 0=제한 없음
+    trailing_stop_ratio: float = 0.0
+    trailing_activation_ratio: float = 0.0
+    partial_take_profit_ratio: float = 0.0
+    partial_take_profit_fraction: float = 0.5
+    # ATR(틱 변동성) 배수 손절/익절
+    use_atr_for_stop_take: bool = False
+    atr_stop_mult: float = 1.5
+    atr_take_mult: float = 2.0
+    atr_lookback_ticks: int = 20
+    # 매수 허용 최소 가격 변동(0~10%). 직전 틱 대비 이 비율만큼 변동해야 주문 실행. 0=미적용(보통), 0.01=1% 이상이면 급등 순간만
+    min_price_change_ratio: float = 0.0
+    # 변동성 필터(계산 지표): API 미제공 → 분봉/틱으로 자체 계산
+    atr_filter_enabled: bool = False  # ATR(분봉) 비율 상한 초과 시 매수 스킵
+    atr_period: int = 14
+    atr_ratio_max_pct: float = 0.0  # 0=미적용. ATR/현재가*100 > 이 값이면 스킵 (예: 2.5)
+    sap_deviation_filter_enabled: bool = False  # 세션 평균가(SAP) 대비 이탈률 상한
+    sap_deviation_max_pct: float = 3.0  # |현재가-SAP|/SAP*100 > 이 값이면 스킵 (과열/과매도 구간)
 
 class StockSelectionConfig(BaseModel):
     min_price_change_ratio: float
@@ -97,891 +193,595 @@ class StockSelectionConfig(BaseModel):
     min_price: int
     max_price: int
     min_volume: int
-    min_trade_amount: int = 0  # 최소 거래대금 (선택)
+    min_trade_amount: int = 0
     max_stocks: int
     exclude_risk_stocks: bool
+    # 정렬 기준(최종 후보 중 무엇을 우선으로 뽑을지)
+    # - change: 등락률(기본, API 랭킹 그대로)
+    # - trade_amount: (가능할 때) 당일 누적 거래대금 우선
+    # - prev_day_trade_value: 전일 거래대금(또는 거래량*종가) 우선 (비용↑, 상위 pool만 조회)
+    sort_by: str = "change"
+    # prev_day_trade_value 정렬 시 조회할 후보 pool 크기 (비용 제한)
+    prev_day_rank_pool_size: int = 80
+    # 장초/장중 품질 개선 옵션 (기존 env 기반 옵션을 UI로 노출)
+    market_open_hhmm: str = "09:00"
+    warmup_minutes: int = 5
+    early_strict: bool = False
+    early_strict_minutes: int = 30
+    early_min_volume: int = 200000
+    early_min_trade_amount: int = 0
+    exclude_drawdown: bool = False
+    max_drawdown_from_high_ratio: float = 0.02
+    drawdown_filter_after_hhmm: str = "12:00"
+    kospi_only: bool = False  # True: 코스피만(코스닥 제외)
+
+
+class OperationalConfig(BaseModel):
+    """운영 옵션: 자동 리밸런싱, 성과 기반 자동 추천, WS 재연결·긴급 청산"""
+    enable_auto_rebalance: bool = False
+    auto_rebalance_interval_minutes: int = 30
+    enable_performance_auto_recommend: bool = False
+    performance_recommend_interval_minutes: int = 5
+    ws_reconnect_sleep_sec: int = 5  # WebSocket 끊김 후 재연결 대기(초)
+    emergency_liquidate_disconnect_minutes: int = 0  # 단절 N분 초과 시 전량 매도(0=미적용)
+    keep_previous_on_empty_selection: bool = True  # 종목 선정 결과 0건 시 이전 목록 유지
+
+
+class StrategyConfig(BaseModel):
+    short_ma_period: int
+    long_ma_period: int
+    min_hold_seconds: int = 0  # 진입 후 N초 이내 전략(데드크로스) 매도 방지. 0=미적용
+    buy_window_start_hhmm: str = "09:05"
+    buy_window_end_hhmm: str = "11:30"
+    min_short_ma_slope_ratio: float = 0.0
+    # 모멘텀(추가 진입 필터): lookback N틱 전 대비 상승률
+    momentum_lookback_ticks: int = 0
+    min_momentum_ratio: float = 0.0
+    # 진입 보강(2단): 추세 조건 + (아래 조건 중 N개 이상) 만족 시에만 매수
+    entry_confirm_enabled: bool = False
+    entry_confirm_min_count: int = 1
+    confirm_breakout_enabled: bool = False
+    breakout_lookback_ticks: int = 20
+    breakout_buffer_ratio: float = 0.0
+    confirm_volume_surge_enabled: bool = False
+    volume_surge_lookback_ticks: int = 20
+    volume_surge_ratio: float = 2.0
+    confirm_trade_value_surge_enabled: bool = False
+    trade_value_surge_lookback_ticks: int = 20
+    trade_value_surge_ratio: float = 2.0
+    # 변동성 정규화(보조): 평균 변동폭 대비 slope/range 기준을 추가로 적용
+    vol_norm_lookback_ticks: int = 20
+    slope_vs_vol_mult: float = 0.0
+    range_vs_vol_mult: float = 0.0
+    # 오전장 레짐 분기(초반/메인): 초반(예: 09:00~09:10)에는 다른 임계값 적용
+    enable_morning_regime_split: bool = False
+    morning_regime_early_end_hhmm: str = "09:10"
+    early_min_short_ma_slope_ratio: float = 0.0
+    early_momentum_lookback_ticks: int = 0
+    early_min_momentum_ratio: float = 0.0
+    early_buy_confirm_ticks: int = 1
+    early_max_spread_ratio: float = 0.0
+    early_range_lookback_ticks: int = 0
+    early_min_range_ratio: float = 0.0
+    # 진입 직전 추가 필터(피크 추격 완화/초단기 추세 유지)
+    avoid_chase_near_high_enabled: bool = False
+    near_high_lookback_minutes: int = 2
+    avoid_near_high_ratio: float = 0.003  # 0.003=0.3% 이내(고점에 너무 근접하면 스킵)
+    # 변동성 기반으로 고점근접 회피 임계값을 자동 상향(피크 추격 더 강하게 차단)
+    avoid_near_high_dynamic: bool = False
+    avoid_near_high_vs_vol_mult: float = 0.0
+    minute_trend_enabled: bool = False
+    minute_trend_lookback_bars: int = 2  # 1~2분봉 추세 유지(최근 N개)
+    minute_trend_min_green_bars: int = 2  # 최근 N개 중 양봉 최소 개수
+    minute_trend_mode: str = "green"  # green | higher_close | higher_low | hh_hl
+    minute_trend_early_only: bool = False
+    reentry_cooldown_seconds: int = 0
+    consecutive_loss_cooldown_enabled: bool = False
+    consecutive_loss_count_threshold: int = 2
+    consecutive_loss_cooldown_mult: float = 2.0
+    # 지수 MA 시장 레짐: 지수(코스닥 등)가 N일 MA 미만이면 매수 스킵
+    index_ma_filter_enabled: bool = False
+    index_ma_code: str = "1001"  # 1001:코스닥, 0001:코스피
+    index_ma_period: int = 20
+    # 상승 종목 비율 시장 레짐: 등락률 순위 API로 상승/하락 건수 비율, N% 미만이면 매수 스킵
+    advance_ratio_filter_enabled: bool = False
+    advance_ratio_market: str = "1001"  # 1001:코스닥, 0001:코스피
+    advance_ratio_min_pct: float = 40.0  # 상승 비율 하한(0~100%)
+    # 거래소 서킷브레이커(급락) 구간: 전일 대비 지수 하락률이 N% 이하이면 신규 매수 스킵 (KRX 1단계 서킷 ~-8% 직전)
+    circuit_breaker_filter_enabled: bool = True
+    circuit_breaker_market: str = "0001"  # 0001:코스피, 1001:코스닥
+    circuit_breaker_threshold_pct: float = -7.0  # 이 하락률 이하이면 스킵 (예: -7 = 7% 하락 시)
+    circuit_breaker_action: str = "skip_buy_only"  # skip_buy_only | liquidate_all | liquidate_partial | no_buy_rest_of_day
+    # 사이드카 구간: 지수 ±5%(코스피)/±6%(코스닥) 변동 시 N분간 신규 매수 스킵 (KRX 프로그램매매 5분 정지에 맞춤)
+    sidecar_filter_enabled: bool = True
+    sidecar_market: str = "0001"  # 0001:코스피, 1001:코스닥
+    sidecar_cooling_minutes: int = 5  # 냉각 분
+    sidecar_action: str = "skip_buy_only"  # skip_buy_only | liquidate_all | liquidate_partial | no_buy_rest_of_day
+    # VI(종목별 변동성완화장치) 발동 시 해당 종목 N분 매수 스킵
+    vi_filter_enabled: bool = True
+    vi_cooling_minutes: int = 5  # 해당 종목 냉각 분
+    # 거래대금 집중 시장 레짐: 상위 N종목 거래대금 비율이 X% 초과면 매수 스킵(좁은 시장)
+    trade_value_concentration_filter_enabled: bool = False
+    trade_value_concentration_market: str = "1001"  # 1001:코스닥, 0001:코스피
+    trade_value_concentration_top_n: int = 10
+    trade_value_concentration_denom_n: int = 30
+    trade_value_concentration_max_pct: float = 45.0  # 상위 top_n / 상위 denom_n 비율이 이 값 초과면 스킵
+    buy_confirm_ticks: int = 1
+    enable_time_liquidation: bool = False
+    liquidate_after_hhmm: str = "11:55"
+    # 스프레드/횡보장 필터(0이면 사용 안 함)
+    max_spread_ratio: float = 0.0  # 예: 0.001 = 0.1%
+    range_lookback_ticks: int = 0
+    min_range_ratio: float = 0.0  # 예: 0.003 = 0.3%
+    # 2. 진입 시 평균 대비 거래량/거래대금 하한 (0이면 미적용)
+    min_volume_ratio_for_entry: float = 0.0
+    min_trade_amount_ratio_for_entry: float = 0.0
+    # 3. 장 초반 N분 매수 스킵 (0이면 미적용)
+    skip_buy_first_minutes: int = 0
+    # 4. 지수 대비 상대 강도: 종목 > 지수 + margin일 때만 매수
+    relative_strength_filter_enabled: bool = False
+    relative_strength_index_code: str = "0001"  # 0001:코스피, 1001:코스닥
+    relative_strength_margin_pct: float = 0.0  # 종목 변동률 > 지수 변동률 + margin(%) 일 때만 매수
+    # 5. 장 마감 전 N분 신규 매수 스킵 (0이면 미적용)
+    last_minutes_no_buy: int = 0
+    # 6. 등락 비율 하락장 시 매수 스킵 강화: 상승 비율 < 50%이면 전량 스킵
+    advance_ratio_down_market_skip: bool = True
 
 class ManualOrder(BaseModel):
     stock_code: str
-    order_type: str  # "buy" or "sell"
+    order_type: str
     quantity: int
-    price: Optional[float] = None  # None이면 시장가
+    price: Optional[float] = None
 
 # ============================================================================
-# API 엔드포인트
+# 인증 의존성
+# ============================================================================
+
+async def get_current_user(
+    token: Optional[str] = Cookie(None),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+) -> str:
+    """현재 사용자 확인"""
+    # 쿠키에서 토큰 확인
+    if token:
+        username = auth_manager.verify_token(token)
+        if username:
+            return username
+    
+    # Authorization 헤더에서 토큰 확인
+    if credentials:
+        username = auth_manager.verify_token(credentials.credentials)
+        if username:
+            return username
+    
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="인증이 필요합니다",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+# ============================================================================
+# 로그인/회원가입 페이지
+# ============================================================================
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    """로그인 페이지"""
+    return get_login_html()
+
+@app.get("/register", response_class=HTMLResponse)
+async def register_page():
+    """회원가입 페이지"""
+    return get_register_html()
+
+@app.post("/api/auth/login")
+async def login(login_data: LoginRequest, response: JSONResponse):
+    """로그인"""
+    token = auth_manager.authenticate(login_data.username, login_data.password)
+    if not token:
+        raise HTTPException(status_code=401, detail="사용자명 또는 비밀번호가 잘못되었습니다")
+    
+    response = JSONResponse({"success": True, "token": token})
+    response.set_cookie(key="token", value=token, httponly=True, max_age=86400, samesite="lax")
+    return response
+
+@app.post("/api/auth/register")
+async def register(register_data: RegisterRequest):
+    """회원가입"""
+    success = auth_manager.register(register_data.username, register_data.password, register_data.email)
+    if not success:
+        raise HTTPException(status_code=400, detail="이미 존재하는 사용자명입니다")
+    return JSONResponse({"success": True, "message": "회원가입이 완료되었습니다"})
+
+@app.post("/api/auth/logout")
+async def logout():
+    """로그아웃"""
+    response = JSONResponse({"success": True})
+    response.delete_cookie(key="token")
+    return response
+
+
+@app.post("/api/auth/change-password")
+async def change_password(
+    body: ChangePasswordRequest,
+    current_user: str = Depends(get_current_user),
+):
+    """로그인 비밀번호 변경 (현재 비밀번호 확인 필요)."""
+    if not body.new_password or len(body.new_password) < 4:
+        return JSONResponse(
+            {"success": False, "message": "새 비밀번호는 4자 이상이어야 합니다."},
+            status_code=400,
+        )
+    ok = auth_manager.change_password(current_user, body.current_password, body.new_password)
+    if not ok:
+        return JSONResponse(
+            {"success": False, "message": "현재 비밀번호가 일치하지 않습니다."},
+            status_code=400,
+        )
+    return JSONResponse({"success": True, "message": "비밀번호가 변경되었습니다."})
+
+
+# ============================================================================
+# 대시보드 페이지 (인증 필요)
 # ============================================================================
 
 @app.get("/", response_class=HTMLResponse)
-async def get_dashboard():
-    """대시보드 HTML"""
-    html_content = """
+async def get_dashboard(request: Request):
+    """대시보드 HTML (모바일 최적화)"""
+    # 인증 확인
+    token = request.cookies.get("token")
+    if token:
+        username = auth_manager.verify_token(token)
+        if username:
+            from dashboard_html import get_dashboard_html
+            return get_dashboard_html(username)
+    
+    # 인증 실패 시 로그인 페이지로 리다이렉트
+    return RedirectResponse(url="/login", status_code=302)
+
+def get_login_html() -> str:
+    """로그인 페이지 HTML"""
+    return """
 <!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>퀀트 매매 시스템 대시보드</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <title>로그인 - 퀀트 매매 시스템</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: #333;
-            padding: 20px;
-        }
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-        .header {
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 20px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-        .header h1 {
-            color: #667eea;
-            margin-bottom: 10px;
-        }
-        .status {
-            display: inline-block;
-            padding: 5px 15px;
-            border-radius: 20px;
-            font-weight: bold;
-            margin-left: 10px;
-        }
-        .status.running { background: #4caf50; color: white; }
-        .status.stopped { background: #f44336; color: white; }
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
-            gap: 20px;
-            margin-bottom: 20px;
-        }
-        .card {
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-        .card h2 {
-            color: #667eea;
-            margin-bottom: 15px;
-            border-bottom: 2px solid #667eea;
-            padding-bottom: 10px;
-        }
-        .metric {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #f2f3f3;
+            min-height: 100vh;
             display: flex;
-            justify-content: space-between;
-            padding: 10px 0;
-            border-bottom: 1px solid #eee;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
         }
-        .metric:last-child { border-bottom: none; }
-        .metric-label { color: #666; }
-        .metric-value {
-            font-weight: bold;
-            color: #333;
-        }
-        .metric-value.positive { color: #4caf50; }
-        .metric-value.negative { color: #f44336; }
-        button {
-            background: #667eea;
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 14px;
-            margin: 5px;
-        }
-        button:hover { background: #5568d3; }
-        button.danger { background: #f44336; }
-        button.danger:hover { background: #d32f2f; }
-        input, select {
+        .login-container {
+            background: #ffffff;
+            color: #0f1b2d;
+            border-radius: 20px;
+            padding: 30px;
             width: 100%;
-            padding: 8px;
-            margin: 5px 0;
-            border: 1px solid #ddd;
-            border-radius: 5px;
+            max-width: 400px;
+            box-shadow: 0 18px 55px rgba(0,0,0,0.12);
+            border: 1px solid #d5dbdb;
+        }
+        .login-header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .login-header h1 {
+            color: #0f1b2d;
+            font-size: 28px;
+            margin-bottom: 10px;
+            letter-spacing: -0.2px;
+        }
+        .login-header p {
+            color: #5f6b7a;
+            font-size: 14px;
         }
         .form-group {
-            margin: 10px 0;
+            margin-bottom: 20px;
         }
         .form-group label {
             display: block;
-            margin-bottom: 5px;
-            color: #666;
-            font-weight: bold;
+            color: #5f6b7a;
+            font-weight: 600;
+            margin-bottom: 8px;
+            font-size: 14px;
         }
-        table {
+        .form-group input {
             width: 100%;
-            border-collapse: collapse;
+            padding: 14px;
+            background: #ffffff;
+            border: 1px solid #d5dbdb;
+            color: #0f1b2d;
+            border-radius: 10px;
+            font-size: 16px;
+            transition: border-color 0.25s, box-shadow 0.25s, background 0.25s;
+        }
+        .form-group input::placeholder { color: rgba(95, 107, 122, 0.75); }
+        .form-group input:focus {
+            outline: none;
+            border-color: #0972d3;
+            box-shadow: 0 0 0 4px rgba(9, 114, 211, 0.18);
+            background: #ffffff;
+        }
+        .btn {
+            width: 100%;
+            padding: 14px;
+            background: #0972d3;
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.08s, filter 0.25s;
             margin-top: 10px;
         }
-        th, td {
-            padding: 10px;
-            text-align: left;
-            border-bottom: 1px solid #eee;
+        .btn:hover { filter: brightness(0.95); }
+        .btn:active { transform: scale(0.98); }
+        .btn-secondary {
+            background: #6c757d;
         }
-        th {
-            background: #f5f5f5;
-            color: #667eea;
-            font-weight: bold;
+        .btn-secondary:hover { background: #5a6268; }
+        .error-message {
+            color: #d13212;
+            font-size: 14px;
+            margin-top: 10px;
+            text-align: center;
+            display: none;
         }
-        tr:hover { background: #f9f9f9; }
-        .log {
-            background: #1e1e1e;
-            color: #d4d4d4;
-            padding: 15px;
-            border-radius: 5px;
-            max-height: 400px;
-            overflow-y: auto;
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
+        .link {
+            text-align: center;
+            margin-top: 20px;
         }
-        .log-entry {
-            margin: 5px 0;
-            padding: 5px;
+        .link a {
+            color: #0972d3;
+            text-decoration: none;
+            font-size: 14px;
         }
-        .log-entry.info { color: #4ec9b0; }
-        .log-entry.warning { color: #dcdcaa; }
-        .log-entry.error { color: #f48771; }
+        @media (max-width: 480px) {
+            .login-container {
+                padding: 20px;
+                border-radius: 15px;
+            }
+            .login-header h1 {
+                font-size: 24px;
+            }
+        }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>퀀트 매매 시스템 대시보드 <span id="status" class="status stopped">중지됨</span></h1>
-            <p>실시간 모니터링 및 제어</p>
+    <div class="login-container">
+        <div class="login-header">
+            <h1>퀀트 매매 시스템</h1>
+            <p>로그인하여 시작하세요</p>
         </div>
-
-        <div class="grid">
-            <!-- 시스템 상태 -->
-            <div class="card">
-                <h2>시스템 상태</h2>
-                <div class="metric">
-                    <span class="metric-label">환경:</span>
-                    <span class="metric-value" id="env">-</span>
-                </div>
-                <div class="metric">
-                    <span class="metric-label">계좌 잔고:</span>
-                    <span class="metric-value" id="balance">-</span>
-                </div>
-                <div class="metric">
-                    <span class="metric-label">일일 손익:</span>
-                    <span class="metric-value" id="daily_pnl">-</span>
-                </div>
-                <div class="metric">
-                    <span class="metric-label">일일 거래 횟수:</span>
-                    <span class="metric-value" id="daily_trades">-</span>
-                </div>
-                <div style="margin-top: 15px;">
-                    <button onclick="startSystem()">시작</button>
-                    <button onclick="stopSystem()" class="danger">중지</button>
-                    <button onclick="refreshData()">새로고침</button>
-                </div>
+        <form id="loginForm">
+            <div class="form-group">
+                <label>사용자명</label>
+                <input type="text" id="username" required autocomplete="username">
             </div>
-
-            <!-- 현재 포지션 -->
-            <div class="card">
-                <h2>현재 포지션</h2>
-                <div id="positions">
-                    <p style="color: #999;">보유 종목이 없습니다.</p>
-                </div>
+            <div class="form-group">
+                <label>비밀번호</label>
+                <input type="password" id="password" required autocomplete="current-password">
             </div>
-
-            <!-- 리스크 설정 -->
-            <div class="card">
-                <h2>리스크 관리 설정</h2>
-                <div class="form-group">
-                    <label>최대 거래 금액 (원):</label>
-                    <input type="number" id="max_trade_amount" value="1000000">
-                </div>
-                <div class="form-group">
-                    <label>손절매 비율 (%):</label>
-                    <input type="number" id="stop_loss" value="2" step="0.1">
-                </div>
-                <div class="form-group">
-                    <label>익절매 비율 (%):</label>
-                    <input type="number" id="take_profit" value="5" step="0.1">
-                </div>
-                <div class="form-group">
-                    <label>일일 손실 한도 (원):</label>
-                    <input type="number" id="daily_loss_limit" value="500000">
-                </div>
-                <button onclick="updateRiskConfig()">설정 저장</button>
-            </div>
-
-            <!-- 종목 선정 기준 -->
-            <div class="card">
-                <h2>종목 선정 기준</h2>
-                <div class="form-group">
-                    <label>프리셋 선택:</label>
-                    <select id="preset_select" onchange="loadPreset()">
-                        <option value="">직접 설정</option>
-                        <option value="common">보편적 기준</option>
-                        <option value="conservative">보수적 기준</option>
-                        <option value="aggressive">공격적 기준</option>
-                        <option value="beginner">초보자용 기준</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label>최소 상승률 (%):</label>
-                    <input type="number" id="min_change" value="1" step="0.1">
-                </div>
-                <div class="form-group">
-                    <label>최대 상승률 (%):</label>
-                    <input type="number" id="max_change" value="15" step="0.1">
-                </div>
-                <div class="form-group">
-                    <label>최소 가격 (원):</label>
-                    <input type="number" id="min_price" value="1000">
-                </div>
-                <div class="form-group">
-                    <label>최대 가격 (원):</label>
-                    <input type="number" id="max_price" value="50000">
-                </div>
-                <div class="form-group">
-                    <label>최소 거래량 (주):</label>
-                    <input type="number" id="min_volume" value="50000">
-                </div>
-                <div class="form-group">
-                    <label>최소 거래대금 (원):</label>
-                    <input type="number" id="min_trade_amount" value="2000000000" placeholder="20억">
-                </div>
-                <div class="form-group">
-                    <label>최대 선정 종목 수:</label>
-                    <input type="number" id="max_stocks" value="5">
-                </div>
-                <button onclick="updateStockSelection()">설정 저장</button>
-                <button onclick="selectStocks()" style="margin-top: 10px;">종목 재선정</button>
-            </div>
-
-            <!-- 수동 주문 -->
-            <div class="card">
-                <h2>수동 주문</h2>
-                <div class="form-group">
-                    <label>종목코드:</label>
-                    <input type="text" id="order_stock_code" placeholder="005930">
-                </div>
-                <div class="form-group">
-                    <label>주문 유형:</label>
-                    <select id="order_type">
-                        <option value="buy">매수</option>
-                        <option value="sell">매도</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label>수량:</label>
-                    <input type="number" id="order_quantity" value="1">
-                </div>
-                <div class="form-group">
-                    <label>가격 (시장가는 0):</label>
-                    <input type="number" id="order_price" value="0" placeholder="0 = 시장가">
-                </div>
-                <button onclick="executeManualOrder()">주문 실행</button>
-            </div>
-
-            <!-- 거래 내역 -->
-            <div class="card">
-                <h2>거래 내역</h2>
-                <div id="trade_history" style="max-height: 300px; overflow-y: auto;">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>시간</th>
-                                <th>종목</th>
-                                <th>유형</th>
-                                <th>수량</th>
-                                <th>가격</th>
-                                <th>손익</th>
-                            </tr>
-                        </thead>
-                        <tbody id="trade_history_body">
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-
-        <!-- 시스템 로그 -->
-        <div class="card">
-            <h2>시스템 로그</h2>
-            <div class="log" id="log">
-                <div class="log-entry info">대시보드 연결 중...</div>
-            </div>
+            <div class="error-message" id="errorMessage"></div>
+            <button type="submit" class="btn">로그인</button>
+        </form>
+        <div class="link">
+            <!--
+            <a href="/register">계정이 없으신가요? 회원가입</a>
+            -->
         </div>
     </div>
-
     <script>
-        let ws = null;
-        let reconnectInterval = null;
-
-        function connectWebSocket() {
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${protocol}//${window.location.host}/ws`;
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            const errorMsg = document.getElementById('errorMessage');
             
-            ws = new WebSocket(wsUrl);
-            
-            ws.onopen = () => {
-                addLog('WebSocket 연결됨', 'info');
-                if (reconnectInterval) {
-                    clearInterval(reconnectInterval);
-                    reconnectInterval = null;
-                }
-            };
-            
-            ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                handleWebSocketMessage(data);
-            };
-            
-            ws.onclose = () => {
-                addLog('WebSocket 연결 끊김', 'warning');
-                if (!reconnectInterval) {
-                    reconnectInterval = setInterval(connectWebSocket, 3000);
-                }
-            };
-            
-            ws.onerror = (error) => {
-                addLog('WebSocket 오류: ' + error, 'error');
-            };
-        }
-
-        function handleWebSocketMessage(data) {
-            if (data.type === 'status') {
-                updateStatus(data.data);
-            } else if (data.type === 'position') {
-                updatePositions(data.data);
-            } else if (data.type === 'trade') {
-                addTradeToHistory(data.data);
-            } else if (data.type === 'log') {
-                addLog(data.message, data.level || 'info');
-            }
-        }
-
-        function updateStatus(data) {
-            document.getElementById('status').textContent = data.is_running ? '실행 중' : '중지됨';
-            document.getElementById('status').className = 'status ' + (data.is_running ? 'running' : 'stopped');
-            document.getElementById('env').textContent = data.env_name || '-';
-            document.getElementById('balance').textContent = formatNumber(data.account_balance) + '원';
-            document.getElementById('daily_pnl').textContent = formatNumber(data.daily_pnl) + '원';
-            document.getElementById('daily_pnl').className = 'metric-value ' + (data.daily_pnl >= 0 ? 'positive' : 'negative');
-            document.getElementById('daily_trades').textContent = data.daily_trades + '회';
-        }
-
-        function updatePositions(positions) {
-            const container = document.getElementById('positions');
-            if (!positions || Object.keys(positions).length === 0) {
-                container.innerHTML = '<p style="color: #999;">보유 종목이 없습니다.</p>';
-                return;
-            }
-            
-            let html = '<table><thead><tr><th>종목</th><th>수량</th><th>매수가</th><th>현재가</th><th>손익</th><th>손익률</th></tr></thead><tbody>';
-            for (const [code, pos] of Object.entries(positions)) {
-                const pnl = (pos.current_price - pos.buy_price) * pos.quantity;
-                const pnl_ratio = ((pos.current_price / pos.buy_price) - 1) * 100;
-                html += `<tr>
-                    <td>${code}</td>
-                    <td>${pos.quantity}주</td>
-                    <td>${formatNumber(pos.buy_price)}원</td>
-                    <td>${formatNumber(pos.current_price)}원</td>
-                    <td class="${pnl >= 0 ? 'positive' : 'negative'}">${formatNumber(pnl)}원</td>
-                    <td class="${pnl >= 0 ? 'positive' : 'negative'}">${pnl_ratio.toFixed(2)}%</td>
-                </tr>`;
-            }
-            html += '</tbody></table>';
-            container.innerHTML = html;
-        }
-
-        function addTradeToHistory(trade) {
-            const tbody = document.getElementById('trade_history_body');
-            const row = document.createElement('tr');
-            row.innerHTML = `
-                <td>${new Date(trade.timestamp).toLocaleTimeString()}</td>
-                <td>${trade.stock_code}</td>
-                <td>${trade.order_type === 'buy' ? '매수' : '매도'}</td>
-                <td>${trade.quantity}주</td>
-                <td>${formatNumber(trade.price)}원</td>
-                <td class="${trade.pnl >= 0 ? 'positive' : 'negative'}">${trade.pnl ? formatNumber(trade.pnl) + '원' : '-'}</td>
-            `;
-            tbody.insertBefore(row, tbody.firstChild);
-        }
-
-        function addLog(message, level = 'info') {
-            const log = document.getElementById('log');
-            const entry = document.createElement('div');
-            entry.className = 'log-entry ' + level;
-            entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
-            log.appendChild(entry);
-            log.scrollTop = log.scrollHeight;
-        }
-
-        function formatNumber(num) {
-            return new Intl.NumberFormat('ko-KR').format(num);
-        }
-
-        async function startSystem() {
             try {
-                const response = await fetch('/api/system/start', { method: 'POST' });
-                const data = await response.json();
-                if (data.success) {
-                    addLog('시스템 시작됨', 'info');
-                } else {
-                    addLog('시스템 시작 실패: ' + data.message, 'error');
-                }
-            } catch (error) {
-                addLog('오류: ' + error, 'error');
-            }
-        }
-
-        async function stopSystem() {
-            try {
-                const response = await fetch('/api/system/stop', { method: 'POST' });
-                const data = await response.json();
-                if (data.success) {
-                    addLog('시스템 중지됨', 'info');
-                } else {
-                    addLog('시스템 중지 실패: ' + data.message, 'error');
-                }
-            } catch (error) {
-                addLog('오류: ' + error, 'error');
-            }
-        }
-
-        async function refreshData() {
-            try {
-                const response = await fetch('/api/system/status');
-                const data = await response.json();
-                updateStatus(data);
-            } catch (error) {
-                addLog('새로고침 오류: ' + error, 'error');
-            }
-        }
-
-        async function updateRiskConfig() {
-            try {
-                const config = {
-                    max_single_trade_amount: parseInt(document.getElementById('max_trade_amount').value),
-                    stop_loss_ratio: parseFloat(document.getElementById('stop_loss').value) / 100,
-                    take_profit_ratio: parseFloat(document.getElementById('take_profit').value) / 100,
-                    daily_loss_limit: parseInt(document.getElementById('daily_loss_limit').value),
-                    max_trades_per_day: 5,
-                    max_position_size_ratio: 0.1
-                };
-                const response = await fetch('/api/config/risk', {
+                const response = await fetch('/api/auth/login', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(config)
+                    body: JSON.stringify({ username, password })
                 });
+                
                 const data = await response.json();
                 if (data.success) {
-                    addLog('리스크 설정 저장됨', 'info');
+                    window.location.href = '/';
                 } else {
-                    addLog('설정 저장 실패: ' + data.message, 'error');
+                    errorMsg.textContent = data.detail || '로그인 실패';
+                    errorMsg.style.display = 'block';
                 }
             } catch (error) {
-                addLog('오류: ' + error, 'error');
+                errorMsg.textContent = '로그인 중 오류가 발생했습니다';
+                errorMsg.style.display = 'block';
             }
-        }
-
-        async function loadPreset() {
-            const presetName = document.getElementById('preset_select').value;
-            if (!presetName) return;
-            
-            try {
-                const response = await fetch(`/api/config/preset/${presetName}`);
-                const data = await response.json();
-                if (data.success) {
-                    const preset = data.preset;
-                    document.getElementById('min_change').value = (preset.min_price_change_ratio * 100).toFixed(1);
-                    document.getElementById('max_change').value = (preset.max_price_change_ratio * 100).toFixed(1);
-                    document.getElementById('min_price').value = preset.min_price;
-                    document.getElementById('max_price').value = preset.max_price;
-                    document.getElementById('min_volume').value = preset.min_volume;
-                    document.getElementById('min_trade_amount').value = preset.min_trade_amount || 0;
-                    document.getElementById('max_stocks').value = preset.max_stocks;
-                    addLog(`프리셋 로드: ${preset.name}`, 'info');
-                }
-            } catch (error) {
-                addLog('프리셋 로드 오류: ' + error, 'error');
-            }
-        }
-
-        async function updateStockSelection() {
-            try {
-                const config = {
-                    min_price_change_ratio: parseFloat(document.getElementById('min_change').value) / 100,
-                    max_price_change_ratio: parseFloat(document.getElementById('max_change').value) / 100,
-                    min_price: parseInt(document.getElementById('min_price').value),
-                    max_price: parseInt(document.getElementById('max_price').value),
-                    min_volume: parseInt(document.getElementById('min_volume').value),
-                    min_trade_amount: parseInt(document.getElementById('min_trade_amount').value) || 0,
-                    max_stocks: parseInt(document.getElementById('max_stocks').value),
-                    exclude_risk_stocks: true
-                };
-                const response = await fetch('/api/config/stock-selection', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(config)
-                });
-                const data = await response.json();
-                if (data.success) {
-                    addLog('종목 선정 기준 저장됨', 'info');
-                } else {
-                    addLog('설정 저장 실패: ' + data.message, 'error');
-                }
-            } catch (error) {
-                addLog('오류: ' + error, 'error');
-            }
-        }
-
-        async function selectStocks() {
-            try {
-                addLog('종목 재선정 중...', 'info');
-                const response = await fetch('/api/stocks/select', { method: 'POST' });
-                const data = await response.json();
-                if (data.success) {
-                    addLog(`종목 선정 완료: ${data.stocks.join(', ')}`, 'info');
-                } else {
-                    addLog('종목 선정 실패: ' + data.message, 'error');
-                }
-            } catch (error) {
-                addLog('오류: ' + error, 'error');
-            }
-        }
-
-        async function executeManualOrder() {
-            try {
-                const order = {
-                    stock_code: document.getElementById('order_stock_code').value,
-                    order_type: document.getElementById('order_type').value,
-                    quantity: parseInt(document.getElementById('order_quantity').value),
-                    price: parseFloat(document.getElementById('order_price').value) || None
-                };
-                const response = await fetch('/api/order/manual', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(order)
-                });
-                const data = await response.json();
-                if (data.success) {
-                    addLog(`주문 실행: ${order.order_type} ${order.stock_code} ${order.quantity}주`, 'info');
-                } else {
-                    addLog('주문 실패: ' + data.message, 'error');
-                }
-            } catch (error) {
-                addLog('오류: ' + error, 'error');
-            }
-        }
-
-        // 초기화
-        connectWebSocket();
-        refreshData();
-        setInterval(refreshData, 5000); // 5초마다 상태 업데이트
+        });
     </script>
 </body>
 </html>
     """
-    return html_content
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket 연결"""
-    await websocket.accept()
-    state.websocket_clients.append(websocket)
-    
-    try:
-        # 초기 상태 전송
-        await send_status_update()
-        
-        while True:
-            # 클라이언트로부터 메시지 수신 (필요시)
-            data = await websocket.receive_text()
-            # 필요시 처리
-    except WebSocketDisconnect:
-        if websocket in state.websocket_clients:
-            state.websocket_clients.remove(websocket)
-
-async def send_status_update():
-    """상태 업데이트 전송"""
-    if state.risk_manager:
-        await state.broadcast({
-            "type": "status",
-            "data": {
-                "is_running": state.is_running,
-                "env_name": "모의투자" if state.is_paper_trading else "실전투자",
-                "account_balance": state.risk_manager.account_balance,
-                "daily_pnl": state.risk_manager.daily_pnl,
-                "daily_trades": state.risk_manager.daily_trades
-            }
-        })
-        
-        # 포지션 업데이트
-        positions = {}
-        for code, pos in state.risk_manager.positions.items():
-            positions[code] = {
-                "quantity": pos["quantity"],
-                "buy_price": pos["buy_price"],
-                "current_price": pos.get("current_price", pos["buy_price"]),
-                "buy_time": pos["buy_time"].isoformat() if isinstance(pos["buy_time"], datetime) else str(pos["buy_time"])
-            }
-        
-        await state.broadcast({
-            "type": "position",
-            "data": positions
-        })
-
-@app.get("/api/system/status")
-async def get_system_status():
-    """시스템 상태 조회"""
-    if not state.risk_manager:
-        return JSONResponse({
-            "is_running": False,
-            "env_name": "-",
-            "account_balance": 0,
-            "daily_pnl": 0,
-            "daily_trades": 0
-        })
-    
-    return JSONResponse({
-        "is_running": state.is_running,
-        "env_name": "모의투자" if state.is_paper_trading else "실전투자",
-        "account_balance": state.risk_manager.account_balance,
-        "daily_pnl": state.risk_manager.daily_pnl,
-        "daily_trades": state.risk_manager.daily_trades
-    })
-
-@app.post("/api/system/start")
-async def start_system():
-    """시스템 시작"""
-    try:
-        if state.is_running:
-            return JSONResponse({"success": False, "message": "이미 실행 중입니다."})
-        
-        # 시스템 초기화 (필요시)
-        # 실제로는 별도 스레드에서 실행되어야 함
-        state.is_running = True
-        await send_status_update()
-        
-        return JSONResponse({"success": True, "message": "시스템이 시작되었습니다."})
-    except Exception as e:
-        logger.error(f"시스템 시작 오류: {e}")
-        return JSONResponse({"success": False, "message": str(e)})
-
-@app.post("/api/system/stop")
-async def stop_system():
-    """시스템 중지"""
-    try:
-        state.is_running = False
-        await send_status_update()
-        return JSONResponse({"success": True, "message": "시스템이 중지되었습니다."})
-    except Exception as e:
-        logger.error(f"시스템 중지 오류: {e}")
-        return JSONResponse({"success": False, "message": str(e)})
-
-@app.get("/api/positions")
-async def get_positions():
-    """현재 포지션 조회"""
-    if not state.risk_manager:
-        return JSONResponse([])
-    
-    positions = []
-    for code, pos in state.risk_manager.positions.items():
-        positions.append({
-            "stock_code": code,
-            "quantity": pos["quantity"],
-            "buy_price": pos["buy_price"],
-            "buy_time": pos["buy_time"].isoformat() if isinstance(pos["buy_time"], datetime) else str(pos["buy_time"])
-        })
-    
-    return JSONResponse(positions)
-
-@app.get("/api/trades")
-async def get_trades(limit: int = 50):
-    """거래 내역 조회"""
-    return JSONResponse(state.trade_history[-limit:])
-
-@app.post("/api/config/risk")
-async def update_risk_config(config: RiskConfig):
-    """리스크 설정 업데이트"""
-    try:
-        if state.risk_manager:
-            state.risk_manager.max_single_trade_amount = config.max_single_trade_amount
-            state.risk_manager.stop_loss_ratio = config.stop_loss_ratio
-            state.risk_manager.take_profit_ratio = config.take_profit_ratio
-            state.risk_manager.daily_loss_limit = config.daily_loss_limit
-            state.risk_manager.max_trades_per_day = config.max_trades_per_day
-            state.risk_manager.max_position_size_ratio = config.max_position_size_ratio
-        
-        await state.broadcast({"type": "log", "message": "리스크 설정이 업데이트되었습니다.", "level": "info"})
-        return JSONResponse({"success": True})
-    except Exception as e:
-        logger.error(f"리스크 설정 업데이트 오류: {e}")
-        return JSONResponse({"success": False, "message": str(e)})
-
-@app.get("/api/config/preset/{preset_name}")
-async def get_preset(preset_name: str):
-    """프리셋 가져오기"""
-    try:
-        preset = get_preset(preset_name)
-        return JSONResponse({"success": True, "preset": preset})
-    except Exception as e:
-        logger.error(f"프리셋 가져오기 오류: {e}")
-        return JSONResponse({"success": False, "message": str(e)})
-
-@app.get("/api/config/presets")
-async def list_all_presets():
-    """모든 프리셋 목록"""
-    try:
-        presets = list_presets()
-        return JSONResponse({"success": True, "presets": presets})
-    except Exception as e:
-        logger.error(f"프리셋 목록 조회 오류: {e}")
-        return JSONResponse({"success": False, "message": str(e)})
-
-@app.post("/api/config/stock-selection")
-async def update_stock_selection_config(config: StockSelectionConfig):
-    """종목 선정 기준 업데이트"""
-    try:
-        state.stock_selector = StockSelector(
-            env_dv="demo" if state.is_paper_trading else "real",
-            min_price_change_ratio=config.min_price_change_ratio,
-            max_price_change_ratio=config.max_price_change_ratio,
-            min_price=config.min_price,
-            max_price=config.max_price,
-            min_volume=config.min_volume,
-            max_stocks=config.max_stocks,
-            exclude_risk_stocks=config.exclude_risk_stocks
-        )
-        
-        await state.broadcast({"type": "log", "message": "종목 선정 기준이 업데이트되었습니다.", "level": "info"})
-        return JSONResponse({"success": True})
-    except Exception as e:
-        logger.error(f"종목 선정 기준 업데이트 오류: {e}")
-        return JSONResponse({"success": False, "message": str(e)})
-
-@app.post("/api/stocks/select")
-async def select_stocks():
-    """종목 재선정"""
-    try:
-        if not state.stock_selector:
-            return JSONResponse({"success": False, "message": "종목 선정기가 초기화되지 않았습니다."})
-        
-        selected = state.stock_selector.select_stocks_by_fluctuation()
-        state.selected_stocks = selected
-        
-        await state.broadcast({
-            "type": "log",
-            "message": f"종목 재선정 완료: {', '.join(selected)}",
-            "level": "info"
-        })
-        
-        return JSONResponse({"success": True, "stocks": selected})
-    except Exception as e:
-        logger.error(f"종목 선정 오류: {e}")
-        return JSONResponse({"success": False, "message": str(e)})
-
-@app.post("/api/order/manual")
-async def execute_manual_order(order: ManualOrder):
-    """수동 주문 실행"""
-    try:
-        if not state.strategy or not state.trenv:
-            return JSONResponse({"success": False, "message": "시스템이 초기화되지 않았습니다."})
-        
-        # 주문 실행 (실제로는 별도 스레드에서 실행)
-        # 여기서는 시뮬레이션
-        result = safe_execute_order(
-            signal=order.order_type,
-            stock_code=order.stock_code,
-            price=order.price or 0,  # 시장가
-            strategy=state.strategy,
-            trenv=state.trenv,
-            is_paper_trading=state.is_paper_trading,
-            manual_approval=False  # 대시보드에서 승인했으므로
-        )
-        
-        if result:
-            trade_info = {
-                "stock_code": order.stock_code,
-                "order_type": order.order_type,
-                "quantity": order.quantity,
-                "price": order.price or 0,
-                "pnl": None
-            }
-            state.add_trade(trade_info)
-            await state.broadcast({"type": "trade", "data": trade_info})
-            await send_status_update()
+def get_register_html() -> str:
+    """회원가입 페이지 HTML"""
+    return """
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>회원가입 - 퀀트 매매 시스템</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .register-container {
+            background: white;
+            border-radius: 20px;
+            padding: 30px;
+            width: 100%;
+            max-width: 400px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+        }
+        .register-header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .register-header h1 {
+            color: #667eea;
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        .form-group label {
+            display: block;
+            color: #333;
+            font-weight: 600;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        .form-group input {
+            width: 100%;
+            padding: 14px;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            font-size: 16px;
+        }
+        .form-group input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .btn {
+            width: 100%;
+            padding: 14px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        .btn:hover { background: #5568d3; }
+        .error-message {
+            color: #f44336;
+            font-size: 14px;
+            margin-top: 10px;
+            text-align: center;
+            display: none;
+        }
+        .link {
+            text-align: center;
+            margin-top: 20px;
+        }
+        .link a {
+            color: #667eea;
+            text-decoration: none;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="register-container">
+        <div class="register-header">
+            <h1>회원가입</h1>
+        </div>
+        <form id="registerForm">
+            <div class="form-group">
+                <label>사용자명</label>
+                <input type="text" id="username" required autocomplete="username">
+            </div>
+            <div class="form-group">
+                <label>비밀번호</label>
+                <input type="password" id="password" required autocomplete="new-password">
+            </div>
+            <div class="form-group">
+                <label>이메일 (선택)</label>
+                <input type="email" id="email" autocomplete="email">
+            </div>
+            <div class="error-message" id="errorMessage"></div>
+            <button type="submit" class="btn">회원가입</button>
+        </form>
+        <div class="link">
+            <a href="/login">이미 계정이 있으신가요? 로그인</a>
+        </div>
+    </div>
+    <script>
+        document.getElementById('registerForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            const email = document.getElementById('email').value;
+            const errorMsg = document.getElementById('errorMessage');
             
-            return JSONResponse({"success": True, "message": "주문이 실행되었습니다."})
-        else:
-            return JSONResponse({"success": False, "message": "주문 실행에 실패했습니다."})
-    except Exception as e:
-        logger.error(f"수동 주문 오류: {e}")
-        return JSONResponse({"success": False, "message": str(e)})
+            try {
+                const response = await fetch('/api/auth/register', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password, email })
+                });
+                
+                const data = await response.json();
+                if (data.success) {
+                    alert('회원가입이 완료되었습니다. 로그인해주세요.');
+                    window.location.href = '/login';
+                } else {
+                    errorMsg.textContent = data.detail || '회원가입 실패';
+                    errorMsg.style.display = 'block';
+                }
+            } catch (error) {
+                errorMsg.textContent = '회원가입 중 오류가 발생했습니다';
+                errorMsg.style.display = 'block';
+            }
+        });
+    </script>
+</body>
+</html>
+    """
 
-# ============================================================================
-# 시스템 초기화 함수
-# ============================================================================
+def get_dashboard_html(username: str) -> str:
+    """대시보드 HTML (반응형)"""
+    from dashboard_html import get_dashboard_html as _get_html
+    return _get_html(username)
 
-def initialize_trading_system(
-    account_balance: float = 100000,
-    is_paper_trading: bool = True
-):
-    """거래 시스템 초기화"""
-    try:
-        # KIS API 인증
-        svr = "vps" if is_paper_trading else "prod"
-        ka.changeTREnv(None, svr=svr, product="01")
-        ka.auth()
-        ka.auth_ws()
-        trenv = ka.getTREnv()
-        
-        # 리스크 관리자 및 전략 초기화
-        risk_manager = RiskManager(account_balance=account_balance)
-        strategy = QuantStrategy(risk_manager)
-        
-        # 종목 선정기 초기화
-        stock_selector = StockSelector(
-            env_dv="demo" if is_paper_trading else "real",
-            min_price_change_ratio=0.01,
-            max_price_change_ratio=0.15,
-            min_price=1000,
-            max_price=50000,
-            min_volume=50000,
-            max_stocks=5,
-            exclude_risk_stocks=True
-        )
-        
-        # 상태 업데이트
-        state.risk_manager = risk_manager
-        state.strategy = strategy
-        state.trenv = trenv
-        state.is_paper_trading = is_paper_trading
-        state.stock_selector = stock_selector
-        
-        logger.info("거래 시스템 초기화 완료")
-        return True
-    except Exception as e:
-        logger.error(f"시스템 초기화 오류: {e}")
-        return False
+# API 엔드포인트 로드
+from quant_dashboard_api import *
 
 # ============================================================================
 # 메인 실행
 # ============================================================================
 
 if __name__ == "__main__":
-    import uvicorn
+    from quant_dashboard_api import initialize_trading_system
     
     # 시스템 초기화
     initialize_trading_system(account_balance=100000, is_paper_trading=True)
     
-    # 서버 시작
     print("=" * 80)
-    print("퀀트 매매 시스템 대시보드 시작")
+    print("퀀트 매매 시스템 대시보드 (모바일 최적화) 시작")
     print("=" * 80)
     print("웹 브라우저에서 http://localhost:8000 접속")
+    print("기본 계정: admin / admin123")
     print("종료하려면 Ctrl+C를 누르세요")
     print("=" * 80)
     
