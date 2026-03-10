@@ -2267,12 +2267,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
     <!-- 프로필 모달 (quant_trading_users 조회/수정) -->
     <div id="profileModalOverlay" class="modal-overlay" style="display:none;" onclick="closeProfileModal(event)">
         <div class="modal" onclick="event.stopPropagation()" style="max-width: 520px;">
-            <div class="modal-header" style="display:flex; justify-content:space-between; align-items:center;">
-                <span>프로필</span>
-                <button type="button" class="btn" style="padding: 3px 10px; font-size: 11px; min-width: auto;" onclick="closeProfileModal()">닫기</button>
-            </div>
             <div class="modal-body" id="profile_modal_body">
-                <p style="color: var(--muted); margin-bottom: 12px;">개인정보 및 실전/모의 계좌 정보는 quant_trading_users 테이블에 저장됩니다.</p>
                 <div class="profile-form">
                     <div class="profile-section">
                         <div class="profile-section-title">계정</div>
