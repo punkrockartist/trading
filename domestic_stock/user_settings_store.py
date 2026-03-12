@@ -42,9 +42,11 @@ class DynamoDBUserSettingsStore:
         - strategy_config_json
         - stock_selection_config_json
         - operational_config_json
+        - custom_slots_json (optional)  # {"1": {"name": "Custom 1", "risk_config": {...}, ...}, ...} 1~10
         - updated_at (ISO8601)
         - schema_version (int)
     """
+    NUM_CUSTOM_SLOTS = 10
 
     def __init__(
         self,
@@ -190,6 +192,25 @@ class DynamoDBUserSettingsStore:
                         out[key] = json.loads(raw)
                     except Exception:
                         continue
+            raw_slots = item.get("custom_slots_json")
+            if isinstance(raw_slots, str) and raw_slots.strip():
+                try:
+                    out["custom_slots"] = json.loads(raw_slots)
+                except Exception:
+                    out["custom_slots"] = {}
+            else:
+                out["custom_slots"] = {}
+            # 보장: "1".."10" 키 존재, 값은 { name, risk_config?, strategy_config?, ... }
+            slots = out.get("custom_slots") or {}
+            if not isinstance(slots, dict):
+                slots = {}
+            for i in range(1, self.NUM_CUSTOM_SLOTS + 1):
+                k = str(i)
+                if k not in slots or not isinstance(slots[k], dict):
+                    slots[k] = {"name": f"Custom {i}"}
+                elif "name" not in slots[k] or not slots[k]["name"]:
+                    slots[k]["name"] = f"Custom {i}"
+            out["custom_slots"] = slots
             return out
         except Exception as e:
             logger.warning(f"User settings load failed ({username}): {e}")
@@ -203,6 +224,7 @@ class DynamoDBUserSettingsStore:
         strategy_config: Optional[Dict[str, Any]] = None,
         stock_selection_config: Optional[Dict[str, Any]] = None,
         operational_config: Optional[Dict[str, Any]] = None,
+        custom_slots: Optional[Dict[str, Any]] = None,
     ) -> bool:
         if not self.enabled:
             return False
@@ -221,6 +243,9 @@ class DynamoDBUserSettingsStore:
             if operational_config is not None:
                 sets.append("operational_config_json=:oper")
                 values[":oper"] = json.dumps(operational_config, ensure_ascii=False)
+            if custom_slots is not None:
+                sets.append("custom_slots_json=:slots")
+                values[":slots"] = json.dumps(custom_slots, ensure_ascii=False)
 
             now = datetime.now(timezone.utc).isoformat()
             sets.append("updated_at=:u")
@@ -237,5 +262,56 @@ class DynamoDBUserSettingsStore:
             return True
         except Exception as e:
             logger.warning(f"User settings save failed ({username}): {e}", exc_info=True)
+            return False
+
+    def save_custom_slot(
+        self,
+        username: str,
+        slot_id: int,
+        name: str,
+        risk_config: Optional[Dict[str, Any]] = None,
+        strategy_config: Optional[Dict[str, Any]] = None,
+        stock_selection_config: Optional[Dict[str, Any]] = None,
+        operational_config: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """커스텀 슬롯 하나(1~10) 저장. 기존 custom_slots를 읽어 해당 슬롯만 갱신 후 저장. 동시에 메인 설정(risk/strategy 등)도 이 슬롯 값으로 덮어씀."""
+        if not self.enabled:
+            return False
+        slot_id = max(1, min(self.NUM_CUSTOM_SLOTS, int(slot_id)))
+        name = (name or f"Custom {slot_id}").strip() or f"Custom {slot_id}"
+        try:
+            res = self._table.get_item(Key={"username": username}, ConsistentRead=True)
+            item = res.get("Item") or {}
+            raw = item.get("custom_slots_json")
+            slots: Dict[str, Any] = {}
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    slots = json.loads(raw)
+                except Exception:
+                    pass
+            if not isinstance(slots, dict):
+                slots = {}
+            for i in range(1, self.NUM_CUSTOM_SLOTS + 1):
+                k = str(i)
+                if k not in slots or not isinstance(slots[k], dict):
+                    slots[k] = {"name": f"Custom {i}"}
+            slots[str(slot_id)] = {
+                "name": name,
+                "risk_config": risk_config,
+                "strategy_config": strategy_config,
+                "stock_selection_config": stock_selection_config,
+                "operational_config": operational_config,
+            }
+            # 메인 설정도 이 슬롯으로 덮어쓰기 (DB 한 벌 = 현재 적용값)
+            return self.save(
+                username,
+                risk_config=risk_config,
+                strategy_config=strategy_config,
+                stock_selection_config=stock_selection_config,
+                operational_config=operational_config,
+                custom_slots=slots,
+            )
+        except Exception as e:
+            logger.warning(f"Custom slot save failed ({username} slot={slot_id}): {e}", exc_info=True)
             return False
 

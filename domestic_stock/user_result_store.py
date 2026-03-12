@@ -196,9 +196,9 @@ class DynamoDBUserResultStore:
             if losses is not None:
                 item["losses"] = losses
             if gross_profit is not None:
-                item["gross_profit"] = round(gross_profit, 2)
+                item["gross_profit"] = self._to_decimal(gross_profit, 2)
             if gross_loss is not None:
-                item["gross_loss"] = round(gross_loss, 2)
+                item["gross_loss"] = self._to_decimal(gross_loss, 2)
             self._table.put_item(Item=item)
             return True
         except Exception as e:
@@ -248,5 +248,5 @@ class DynamoDBUserResultStore:
                 out.append(row)
             return out
         except Exception as e:
-            logger.warning(f"User result query failed ({username} {date_from}~{date_to}): {e}")
+            logger.warning(f"User result query failed ({username} {date_from}~{date_to}): {e}", exc_info=True)
             return []

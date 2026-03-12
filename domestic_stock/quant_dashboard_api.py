@@ -29,6 +29,7 @@ from stock_selection_presets import get_preset, list_presets
 from quant_trading_safe import safe_execute_order
 from audit_log import audit_log, audit_get
 from notifier import send_alert
+from system_log import system_log_append
 
 logger = logging.getLogger(__name__)
 pending_signals_lock = threading.Lock()
@@ -724,11 +725,8 @@ def _reconcile_pending_orders_sync(max_per_run: int = 5, min_check_interval_sec:
             pnl = None
             try:
                 if side == "buy":
-                    if stock_code in getattr(rm, "positions", {}):
-                        # 이미 반영된 케이스면 pending만 제거
-                        pass
-                    else:
-                        rm.update_position(stock_code, exec_px, exec_qty, "buy")
+                    # 추가 매수(동일 종목 누적)도 반영해야 MTS 잔고와 일치함
+                    rm.update_position(stock_code, exec_px, exec_qty, "buy")
                 else:
                     if stock_code in getattr(rm, "positions", {}):
                         pnl = rm.update_position(stock_code, exec_px, exec_qty, "sell")
@@ -795,6 +793,8 @@ def _check_balance_vs_positions_sync() -> Optional[str]:
         if df1 is None or getattr(df1, "empty", True):
             pos_codes = set(getattr(rm, "positions", {}).keys())
             if pos_codes:
+                if getattr(state, "is_paper_trading", True):
+                    return f"모의투자: 잔고 API 0건, 시스템 포지션 {len(pos_codes)}건 유지(API 반영 지연 가능)"
                 return f"포지션 vs 잔고 불일치 가능: 잔고 조회 0건, 시스템 포지션 {len(pos_codes)}건"
             return None
         codes_from_balance = set()
@@ -808,6 +808,10 @@ def _check_balance_vs_positions_sync() -> Optional[str]:
         only_balance = codes_from_balance - pos_codes
         only_pos = pos_codes - codes_from_balance
         if only_balance or only_pos:
+            if getattr(state, "is_paper_trading", True) and only_pos and not only_balance:
+                return (
+                    f"모의투자: 잔고에 없음/포지션만 있음 {sorted(only_pos)[:5]}{'…' if len(only_pos) > 5 else ''} (API 지연 가능)"
+                )
             return (
                 f"포지션 vs 잔고 불일치: 잔고만 있음 {sorted(only_balance)[:5]}{'…' if len(only_balance) > 5 else ''} "
                 f"/ 포지션만 있음 {sorted(only_pos)[:5]}{'…' if len(only_pos) > 5 else ''}"
@@ -927,6 +931,7 @@ async def _pending_order_reconciler_loop():
                             "price": px,
                             "pnl": pnl,
                             "reason": "체결확인",
+                            "order_status": "filled",
                         }
                         state.add_trade(trade_info)
                         await state.broadcast({"type": "trade", "data": trade_info})
@@ -1152,6 +1157,16 @@ def _apply_operational_config_dict_to_state(d: dict) -> None:
             state.emergency_liquidate_disconnect_minutes = max(0, min(120, int(d.get("emergency_liquidate_disconnect_minutes") or 0)))
         if "keep_previous_on_empty_selection" in d:
             state.keep_previous_on_empty_selection = bool(d.get("keep_previous_on_empty_selection", True))
+        if "auto_schedule_enabled" in d:
+            state.auto_schedule_enabled = bool(d.get("auto_schedule_enabled", False))
+        if "auto_start_hhmm" in d:
+            state.auto_start_hhmm = str(d.get("auto_start_hhmm", "09:30") or "09:30").strip()[:5]
+        if "auto_stop_hhmm" in d:
+            state.auto_stop_hhmm = str(d.get("auto_stop_hhmm", "12:00") or "12:00").strip()[:5]
+        if "liquidate_on_auto_stop" in d:
+            state.liquidate_on_auto_stop = bool(d.get("liquidate_on_auto_stop", True))
+        if "auto_schedule_username" in d:
+            state.auto_schedule_username = str(d.get("auto_schedule_username", "") or "").strip()
     except Exception as e:
         logger.warning(f"저장된 운영 옵션 적용 중 오류(무시): {e}")
 
@@ -1160,20 +1175,67 @@ def _apply_strategy_config_dict_to_state(d: dict) -> None:
     """DB에서 불러온 strategy_config를 state에 반영. /api/system/status가 DB값을 반환해 refreshData()가 폼을 덮어쓰지 않도록 함."""
     if not d or not isinstance(d, dict):
         return
-    if not getattr(state, "strategy", None):
+    try:
+        if getattr(state, "strategy", None):
+            short_p = d.get("short_ma_period")
+            long_p = d.get("long_ma_period")
+            if short_p is not None and long_p is not None:
+                short_period = int(short_p)
+                long_period = int(long_p)
+                if short_period >= 2 and long_period >= 3 and short_period < long_period:
+                    state.strategy.short_ma_period = short_period
+                    state.strategy.long_ma_period = long_period
+                    state.strategy.min_history_length = long_period
+            min_hold = d.get("min_hold_seconds")
+            if min_hold is not None:
+                state.strategy.min_hold_seconds = max(0, int(min_hold))
+        # 재진입 쿨다운: DB에 저장된 값이 있으면 state·risk_manager에 반영 (시작/설정 로드 시 적용)
+        reentry = d.get("reentry_cooldown_seconds")
+        if reentry is not None:
+            state.reentry_cooldown_seconds = max(0, int(reentry))
+            if getattr(state, "risk_manager", None):
+                state.risk_manager.reentry_cooldown_seconds = state.reentry_cooldown_seconds
+        below_high = d.get("skip_buy_below_high_pct")
+        if below_high is not None:
+            state.skip_buy_below_high_pct = max(0.0, min(0.20, float(below_high)))
+    except Exception as e:
+        logger.warning(f"저장된 전략 설정 적용 중 오류(무시): {e}")
+
+
+def _apply_stock_selection_config_dict_to_state(d: dict) -> None:
+    """DB에서 불러온 stock_selection_config를 state.stock_selector에 반영. 시작 시 저장된 기준으로 종목 선정하기 위함."""
+    if not d or not isinstance(d, dict):
         return
     try:
-        short_p = d.get("short_ma_period")
-        long_p = d.get("long_ma_period")
-        if short_p is not None and long_p is not None:
-            short_period = int(short_p)
-            long_period = int(long_p)
-            if short_period >= 2 and long_period >= 3 and short_period < long_period:
-                state.strategy.short_ma_period = short_period
-                state.strategy.long_ma_period = long_period
-                state.strategy.min_history_length = long_period
+        config = StockSelectionConfig.model_validate(d)
+    except Exception:
+        return
+    try:
+        state.stock_selector = StockSelector(
+            env_dv="demo" if getattr(state, "is_paper_trading", True) else "real",
+            min_price_change_ratio=config.min_price_change_ratio,
+            max_price_change_ratio=config.max_price_change_ratio,
+            min_price=config.min_price,
+            max_price=config.max_price,
+            min_volume=config.min_volume,
+            min_trade_amount=config.min_trade_amount,
+            max_stocks=config.max_stocks,
+            exclude_risk_stocks=config.exclude_risk_stocks,
+            sort_by=str(getattr(config, "sort_by", "change") or "change"),
+            prev_day_rank_pool_size=int(getattr(config, "prev_day_rank_pool_size", 80) or 80),
+            market_open_hhmm=getattr(config, "market_open_hhmm", "09:00"),
+            warmup_minutes=int(getattr(config, "warmup_minutes", 5) or 5),
+            early_strict=bool(getattr(config, "early_strict", False)),
+            early_strict_minutes=int(getattr(config, "early_strict_minutes", 30) or 30),
+            early_min_volume=int(getattr(config, "early_min_volume", 200000) or 200000),
+            early_min_trade_amount=int(getattr(config, "early_min_trade_amount", 0) or 0),
+            exclude_drawdown=bool(getattr(config, "exclude_drawdown", False)),
+            max_drawdown_from_high_ratio=float(getattr(config, "max_drawdown_from_high_ratio", 0.02) or 0.02),
+            drawdown_filter_after_hhmm=getattr(config, "drawdown_filter_after_hhmm", "12:00"),
+            kospi_only=bool(getattr(config, "kospi_only", False)),
+        )
     except Exception as e:
-        logger.warning(f"저장된 전략 설정(이동평균) 적용 중 오류(무시): {e}")
+        logger.warning(f"저장된 종목선정 설정 적용 중 오류(무시): {e}")
 
 
 def _get_user_settings_store():
@@ -1428,6 +1490,206 @@ def _refresh_kis_account_balance_sync() -> int:
         return 0
 
 
+def _sync_positions_from_balance_sync() -> int:
+    """KIS 잔고조회(df1) 기준으로 risk_manager.positions를 강제 동기화. 반환: 반영된 보유 종목 수.
+    모의환경에서는 조회구분(INQR_DVSN) 등에 따라 df1이 비어 나오는 경우가 있어 몇 가지 조합으로 재시도한다.
+    """
+    try:
+        rm = getattr(state, "risk_manager", None)
+        trenv = getattr(state, "trenv", None)
+        if not rm or not trenv:
+            return 0
+        cano = getattr(trenv, "my_acct", "") or ""
+        acnt_prdt_cd = getattr(trenv, "my_prod", "") or ""
+        if not cano or not acnt_prdt_cd:
+            return 0
+
+        from domestic_stock_functions import inquire_balance
+
+        env_dv = "demo" if getattr(state, "is_paper_trading", True) else "real"
+        # 모의/일부 환경에서 INQR_DVSN=01이 비어 나오는 경우가 있어 02(종목별) 등으로 재시도
+        df1 = None
+        attempts = [
+            ("N", "01", "00"),
+            ("N", "02", "00"),
+            ("N", "01", "01"),
+            ("N", "02", "01"),
+        ]
+        for afhr_flpr_yn, inqr_dvsn, prcs_dvsn in attempts:
+            try:
+                cand1, _ = inquire_balance(
+                    env_dv=env_dv,
+                    cano=cano,
+                    acnt_prdt_cd=acnt_prdt_cd,
+                    afhr_flpr_yn=afhr_flpr_yn,
+                    inqr_dvsn=inqr_dvsn,
+                    unpr_dvsn="01",
+                    fund_sttl_icld_yn="N",
+                    fncg_amt_auto_rdpt_yn="N",
+                    prcs_dvsn=prcs_dvsn,
+                )
+                if cand1 is not None and getattr(cand1, "empty", True) is False:
+                    df1 = cand1
+                    # 진단용 기록
+                    state._last_positions_sync_attempt = {
+                        "env_dv": env_dv,
+                        "afhr_flpr_yn": afhr_flpr_yn,
+                        "inqr_dvsn": inqr_dvsn,
+                        "prcs_dvsn": prcs_dvsn,
+                        "rows": int(len(cand1)),
+                        "columns": list(getattr(cand1, "columns", [])),
+                    }
+                    break
+            except Exception:
+                continue
+
+        if df1 is None or getattr(df1, "empty", True):
+            if hasattr(rm, "positions"):
+                rm.positions = {}
+            state._last_positions_sync_attempt = {
+                "env_dv": env_dv,
+                "attempts": [{"afhr_flpr_yn": a, "inqr_dvsn": b, "prcs_dvsn": c} for (a, b, c) in attempts],
+                "rows": 0,
+            }
+            return 0
+
+        existing = getattr(rm, "positions", {}) or {}
+        last_prices = getattr(rm, "last_prices", {}) or {}
+        new_positions = {}
+        skipped = 0
+        sample_row = None
+
+        def _normalize_price_scale(px: float) -> float:
+            """KIS 잔고/체결 데이터에서 간헐적으로 가격 스케일이 100/1000배로 들어오는 케이스 보정."""
+            try:
+                v = float(px or 0)
+            except Exception:
+                return 0.0
+            if v <= 0:
+                return 0.0
+            # 정상 주가 범위(대략): 100 ~ 2,000,000원
+            if 100.0 <= v <= 2_000_000.0:
+                return v
+            # 100배/1000배로 들어온 경우를 보정
+            if v > 2_000_000.0:
+                v1 = v / 1000.0
+                if 100.0 <= v1 <= 2_000_000.0:
+                    return v1
+                v2 = v / 100.0
+                if 100.0 <= v2 <= 2_000_000.0:
+                    return v2
+                v3 = v / 10.0
+                if 100.0 <= v3 <= 2_000_000.0:
+                    return v3
+            return v
+
+        def _pick_qty_from_row(r: dict) -> int:
+            # 우선순위 키
+            qty_raw = _pick_first(r, [
+                "HOLD_QTY", "hold_qty",
+                "HLDG_QTY", "hldg_qty",
+                "HLDG_QTY1", "hldg_qty1",
+                "ORD_PSBL_QTY", "ord_psbl_qty",
+                "ORD_PSBL_QTY1", "ord_psbl_qty1",
+                "RMN_QTY", "rmn_qty",
+            ])
+            q = _to_int(qty_raw, 0)
+            if q > 0:
+                return q
+            # 휴리스틱: qty로 끝나고 hold/hld가 포함된 키의 최대값
+            best = 0
+            for k, v in (r or {}).items():
+                kk = str(k).lower()
+                if "qty" not in kk:
+                    continue
+                if not any(tok in kk for tok in ("hold", "hld", "hldg", "psbl", "rmn")):
+                    continue
+                iv = _to_int(v, 0)
+                if iv > best:
+                    best = iv
+            return int(best)
+
+        for _, row in df1.iterrows():
+            rdict = {}
+            try:
+                rdict = row.to_dict() if hasattr(row, "to_dict") else dict(row)
+            except Exception:
+                rdict = {}
+            if sample_row is None:
+                # 일부 컬럼만 샘플로 남김(진단용)
+                sample_row = {k: rdict.get(k) for k in list(rdict.keys())[:20]}
+
+            code = str(rdict.get("PDNO") or rdict.get("pdno") or rdict.get("MKSC_SHRN_ISCD") or rdict.get("mksc_shrn_iscd") or "").strip().zfill(6)
+            if not code:
+                skipped += 1
+                continue
+            qty = _pick_qty_from_row(rdict)
+            if qty <= 0:
+                skipped += 1
+                continue
+            buy_price = 0.0
+            try:
+                buy_price = _to_float(
+                    rdict.get("PCHS_AVG_PRIC")
+                    or rdict.get("pchs_avg_pric")
+                    or rdict.get("PCHS_AVG_PRIC1")
+                    or rdict.get("pchs_avg_pric1")
+                    or 0,
+                    0.0,
+                ) or 0.0
+            except Exception:
+                buy_price = 0.0
+            buy_price = _normalize_price_scale(buy_price)
+            # 국내주식 호가 단위는 원 단위이므로 평균단가는 정수로 반올림(표시/손익 계산 안정화)
+            try:
+                if buy_price > 0:
+                    buy_price = float(round(buy_price))
+            except Exception:
+                pass
+            if buy_price <= 0 and code in existing:
+                try:
+                    buy_price = float(existing[code].get("buy_price") or 0) or 0.0
+                except Exception:
+                    buy_price = 0.0
+            try:
+                # 잔고조회 응답에 현재가(prpr)가 있으면 우선 사용
+                prpr = _to_float(rdict.get("PRPR") or rdict.get("prpr") or 0, 0.0)
+                if prpr and prpr > 0:
+                    cur_price = _normalize_price_scale(float(prpr))
+                else:
+                    cur_price = _normalize_price_scale(float(last_prices.get(code) or buy_price or 0))
+            except Exception:
+                cur_price = float(buy_price or 0)
+            stock_name = (rdict.get("PRDT_NAME") or rdict.get("prdt_name") or "").strip()
+            new_positions[code] = {
+                "buy_price": buy_price,
+                "quantity": qty,
+                "current_price": cur_price,
+                "buy_time": existing[code].get("buy_time") if code in existing else datetime.now(),
+                "partial_taken": existing[code].get("partial_taken", False) if code in existing else False,
+            }
+            if stock_name:
+                new_positions[code]["stock_name"] = stock_name
+
+        if hasattr(rm, "positions"):
+            rm.positions = new_positions
+        # 진단 정보 갱신
+        try:
+            if isinstance(getattr(state, "_last_positions_sync_attempt", None), dict):
+                state._last_positions_sync_attempt = {
+                    **state._last_positions_sync_attempt,
+                    "synced": int(len(new_positions)),
+                    "skipped_rows": int(skipped),
+                    "sample_row": sample_row or {},
+                }
+        except Exception:
+            pass
+        return len(new_positions)
+    except Exception as e:
+        logger.warning("포지션 잔고 동기화 실패: %s", e)
+        return 0
+
+
 async def _refresh_kis_account_balance(force: bool = False, ttl_sec: int = 60) -> int:
     """비동기 컨텍스트에서 TTL 기반으로 KIS 잔고를 갱신."""
     try:
@@ -1576,17 +1838,27 @@ def _create_or_replace_pending_signal(signal_data: dict) -> Optional[dict]:
 
 
 def _build_positions_message():
-    """리스크 매니저 포지션을 브로드캐스트용 dict로 변환"""
+    """리스크 매니저 포지션을 브로드캐스트용 dict로 변환. 종목명은 selected_stock_info에서 조회해 포함."""
     if not state.risk_manager:
         return {}
+    info_list = getattr(state, "selected_stock_info", None) or []
+    code_to_name = {}
+    for item in info_list:
+        c = str(item.get("code") or "").strip()
+        if c:
+            code_to_name[c] = str(item.get("name") or "").strip()
     positions = {}
     for code, pos in state.risk_manager.positions.items():
-        positions[code] = {
+        out = {
             "quantity": pos["quantity"],
             "buy_price": pos["buy_price"],
             "current_price": pos.get("current_price", pos["buy_price"]),
             "buy_time": pos["buy_time"].isoformat() if isinstance(pos.get("buy_time"), datetime) else str(pos.get("buy_time", ""))
         }
+        name = code_to_name.get(code) or (pos.get("stock_name") or pos.get("name") or "")
+        if name:
+            out["stock_name"] = name
+        positions[code] = out
     return positions
 
 
@@ -1605,7 +1877,7 @@ def _handle_signal(stock_code: str, signal: str, price: float, reason: str, sugg
         min_hold = int(getattr(state.strategy, "min_hold_seconds", 0) or 0)
         if min_hold > 0:
             r = (reason or "")
-            bypass = "시간기반" in r or "시간 청산" in r or "일일 이익 한도" in r or "일일 손실 한도" in r or "긴급 청산" in r or "서킷브레이커" in r or "사이드카" in r
+            bypass = "시간기반" in r or "시간 청산" in r or "일일 이익 한도" in r or "일일 손실 한도" in r or "긴급 청산" in r or "서킷브레이커" in r or "사이드카" in r or "수동 청산" in r
             if not bypass:
                 pos = state.risk_manager.positions.get(stock_code)
                 buy_time = pos.get("buy_time") if pos else None
@@ -1626,8 +1898,44 @@ def _handle_signal(stock_code: str, signal: str, price: float, reason: str, sugg
         quantity_override=suggested_qty_override,
     )
     if not result:
-        _run_async_broadcast({"type": "log", "message": _format_order_log(details), "level": "error"})
         reason = details.get("reason") or ""
+        rej_msg = (details.get("rejection_message") or "").strip()
+        # 반복 로그 억제: 일일 거래 횟수 초과, 모의투자 잔고내역 없음 등은 5분에 한 번만
+        skip_log = False
+        if reason == "일일 거래 횟수 초과":
+            last_log = getattr(state, "_last_daily_trade_limit_log_time", 0) or 0
+            if time.time() - last_log < 300:
+                skip_log = True
+            else:
+                state._last_daily_trade_limit_log_time = time.time()
+        elif "모의투자 잔고내역이 없습니다" in reason or "모의투자 잔고내역이 없습니다" in rej_msg:
+            last_log = getattr(state, "_last_no_balance_log_time", 0) or 0
+            if time.time() - last_log < 300:
+                skip_log = True
+            else:
+                state._last_no_balance_log_time = time.time()
+            # 서버 잔고 기준 동기화: 매도 실패 시 KIS가 해당 종목 잔고 없음으로 본 것이므로 포지션에서 제거
+            if signal == "sell" and stock_code and getattr(state, "risk_manager", None):
+                pos = getattr(state.risk_manager, "positions", None) or {}
+                if stock_code in pos:
+                    try:
+                        state.risk_manager.positions = {k: v for k, v in pos.items() if k != stock_code}
+                        _run_async_broadcast({"type": "position", "data": _build_positions_message()})
+                        _run_async_broadcast({"type": "log", "level": "warning", "message": f"모의 잔고 없음: {stock_code} 포지션 제거(서버 기준 동기화)"})
+                    except Exception as e:
+                        logger.warning("잔고 없음 포지션 제거 실패 %s: %s", stock_code, e)
+        elif reason in ("pending_sell_order", "pending_buy_order"):
+            # 이미 접수(대기) 중인 동일 방향 주문이 있어 중복 요청 무시 — 로그 스팸 방지
+            pending_key = f"_last_pending_order_log_{stock_code}_{(details.get('signal') or '').upper()}"
+            last_pending = getattr(state, pending_key, 0) or 0
+            if time.time() - last_pending < 30:
+                skip_log = True
+            else:
+                setattr(state, pending_key, time.time())
+                _run_async_broadcast({"type": "log", "message": f"중복 주문 무시(이미 접수됨) | {(details.get('signal') or '').upper()} {stock_code}", "level": "info"})
+                skip_log = True
+        if not skip_log:
+            _run_async_broadcast({"type": "log", "message": _format_order_log(details), "level": "error"})
         if reason and ("월간 손실 한도" in reason or "누적 손실 한도" in reason):
             try:
                 tz = timezone(timedelta(hours=9))
@@ -1664,7 +1972,27 @@ def _handle_signal(stock_code: str, signal: str, price: float, reason: str, sugg
     level = "info" if filled else "warning"
     _run_async_broadcast({"type": "log", "message": _format_order_log(details), "level": level})
     if not filled:
-        # 주문 접수는 되었으나 체결 미확정/미체결 상태면, 포지션/거래내역 반영은 보류
+        # 주문 접수는 되었으나 체결 미확정/미체결 상태도 거래내역에 남겨, "접수(대기)"와 "체결"을 구분 가능하게 함
+        try:
+            qty = 0
+            try:
+                qty = int(details.get("quantity") or 0)
+            except Exception:
+                qty = 0
+            trade_info = {
+                "stock_code": stock_code,
+                "order_type": signal,
+                "quantity": qty,
+                "price": price,
+                "pnl": None,
+                "reason": reason or "",
+                "order_status": str(details.get("status") or "accepted_pending"),
+            }
+            state.add_trade(trade_info)
+            _run_async_broadcast({"type": "trade", "data": trade_info})
+        except Exception:
+            pass
+        # 포지션/거래내역 손익 반영은 체결 확인 시점에 수행
         return
     # 부분매도(부분익절 등) 체결 시: 잔여 수량을 함께 로깅
     try:
@@ -1688,13 +2016,20 @@ def _handle_signal(stock_code: str, signal: str, price: float, reason: str, sugg
         suggested_qty = int(details.get("quantity") or 0)
     except Exception:
         suggested_qty = 0
+    pnl_val = details.get("pnl")
+    if pnl_val is not None:
+        try:
+            pnl_val = float(pnl_val)
+        except (TypeError, ValueError):
+            pnl_val = None
     trade_info = {
         "stock_code": stock_code,
         "order_type": signal,
         "quantity": suggested_qty,
         "price": price,
-        "pnl": None,
+        "pnl": pnl_val,
         "reason": reason or "",
+        "order_status": str(details.get("status") or "filled"),
     }
     state.add_trade(trade_info)
     _run_async_broadcast({"type": "trade", "data": trade_info})
@@ -1706,62 +2041,6 @@ def _start_trading_engine_thread():
     """실시간 체결 수신 -> 신호 생성 -> 승인 대기 등록."""
     if state.engine_running:
         return
-
-    def _sync_positions_from_balance_sync() -> None:
-        """잔고 조회 결과로 risk_manager.positions 동기화 (WS 재연결 후 등)."""
-        try:
-            rm = getattr(state, "risk_manager", None)
-            trenv = getattr(state, "trenv", None)
-            if not rm or not trenv:
-                return
-            from domestic_stock_functions import inquire_balance
-            env_dv = "demo" if getattr(state, "is_paper_trading", True) else "real"
-            cano = getattr(trenv, "my_acct", "") or ""
-            acnt_prdt_cd = getattr(trenv, "my_prod", "") or ""
-            if not cano or not acnt_prdt_cd:
-                return
-            df1, _ = inquire_balance(
-                env_dv=env_dv,
-                cano=cano,
-                acnt_prdt_cd=acnt_prdt_cd,
-                afhr_flpr_yn="N",
-                inqr_dvsn="01",
-                unpr_dvsn="01",
-                fund_sttl_icld_yn="N",
-                fncg_amt_auto_rdpt_yn="N",
-                prcs_dvsn="00",
-            )
-            if df1 is None or getattr(df1, "empty", True):
-                return
-            existing = getattr(rm, "positions", {}) or {}
-            last_prices = getattr(rm, "last_prices", {}) or {}
-            new_positions = {}
-            for _, row in df1.iterrows():
-                code = str(row.get("PDNO") or row.get("pdno") or "").strip().zfill(6)
-                if not code:
-                    continue
-                qty = _to_int(row.get("HOLD_QTY") or row.get("hold_qty") or row.get("ORD_PSBL_QTY"), 0)
-                if qty <= 0:
-                    continue
-                buy_price = 0.0
-                try:
-                    buy_price = float(row.get("PCHS_AVG_PRIC") or row.get("pchs_avg_pric") or 0) or 0.0
-                except Exception:
-                    pass
-                if buy_price <= 0 and code in existing:
-                    buy_price = float(existing[code].get("buy_price") or 0) or 0.0
-                cur_price = float(last_prices.get(code) or buy_price or 0)
-                new_positions[code] = {
-                    "buy_price": buy_price,
-                    "quantity": qty,
-                    "current_price": cur_price,
-                    "buy_time": existing[code].get("buy_time") if code in existing else datetime.now(),
-                    "partial_taken": existing[code].get("partial_taken", False) if code in existing else False,
-                }
-            if hasattr(rm, "positions"):
-                rm.positions = new_positions
-        except Exception as e:
-            logger.warning("WS 재연결 후 포지션 동기화 실패: %s", e)
 
     def _sync_state_after_ws_reconnect():
         """WebSocket 재연결 후 잔고/포지션 동기화"""
@@ -2152,7 +2431,17 @@ def _start_trading_engine_thread():
                                     and short_ma is not None
                                     and long_ma is not None
                                 ):
-                                    if short_ma > long_ma and current_price > short_ma and stock_code not in state.risk_manager.positions:
+                                    if short_ma > long_ma and current_price > short_ma and stock_code not in state.risk_manager.positions and stock_code in (state.selected_stocks or []):
+                                        # 선정 종목에 있을 때만 매수. 포지션에만 있고 선정에 없는 종목(전일 잔여 등)은 매도만 허용·매수 스킵
+                                        # (0-0) 재진입 쿨다운: 직전 매도 직후 같은 종목 재매수 방지(횡보장 와입 방지) — 가장 먼저 검사
+                                        try:
+                                            if getattr(state.risk_manager, "reentry_cooldown_seconds", 0) and getattr(state.risk_manager, "is_in_reentry_cooldown", None):
+                                                if state.risk_manager.is_in_reentry_cooldown(stock_code):
+                                                    _record_buy_skip(stock_code, "cooldown")
+                                                    _throttled_skip_log(stock_code, f"재진입 쿨다운({getattr(state.risk_manager, 'reentry_cooldown_seconds', 0)}s)")
+                                                    continue
+                                        except Exception:
+                                            pass
                                         # (0-0a) 거래소 서킷브레이커(급락) 구간: 전일 대비 지수 하락률이 N% 이하이면 신규 매수 스킵
                                         try:
                                             if bool(getattr(state, "circuit_breaker_filter_enabled", True)):
@@ -2561,6 +2850,27 @@ def _start_trading_engine_thread():
                                         except Exception:
                                             pass
 
+                                        # (2-1-1b) 당일 고점 대비 N% 이상 하락 시 매수 스킵 (고점 꺾인 후 하락추세 진입 방지)
+                                        try:
+                                            below_high_pct = float(getattr(state, "skip_buy_below_high_pct", 0.0) or 0.0)
+                                            if below_high_pct > 0:
+                                                prices = (state.strategy.price_history.get(stock_code) or [])
+                                                min_bars = 20
+                                                if len(prices) >= min_bars:
+                                                    session_high = max(float(p) for p in prices)
+                                                    if session_high > 0:
+                                                        drawdown = (session_high - float(current_price)) / session_high
+                                                        if drawdown >= below_high_pct:
+                                                            _record_buy_skip(stock_code, "below_high")
+                                                            _throttled_skip_log(
+                                                                stock_code,
+                                                                f"고점 대비 하락({drawdown*100:.2f}% >= {below_high_pct*100:.2f}%) 매수 스킵",
+                                                                ttl_sec=10,
+                                                            )
+                                                            continue
+                                        except Exception:
+                                            pass
+
                                         # (2-1-2) 진입 직전 추가 필터: 1~2분봉 추세 유지
                                         try:
                                             if bool(getattr(state, "minute_trend_enabled", False)):
@@ -2783,7 +3093,11 @@ def _start_trading_engine_thread():
                                                         continue
                                         except Exception:
                                             pass
-                                    _handle_signal(stock_code, signal_type, current_price, "이동평균 크로스 조건 충족")
+                                    # 선정에 없는 종목(전일 잔여 등)은 매도만 허용·매수 무시
+                                    if signal_type == "buy" and stock_code not in (state.selected_stocks or []):
+                                        signal_type = None
+                                    if signal_type:
+                                        _handle_signal(stock_code, signal_type, current_price, "이동평균 크로스 조건 충족")
                             except Exception:
                                 continue
 
@@ -2913,19 +3227,57 @@ def _get_stock_selection_criteria(current_user: str):
 _STATUS_NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate"}
 
 
+def _load_today_daily_stats(current_user: str) -> tuple:
+    """당일 일일 손익·거래 횟수를 user_result 또는 user_hist에서 조회. (daily_pnl, daily_trades) 또는 (None, None)."""
+    if not current_user:
+        return (None, None)
+    tz = timezone(timedelta(hours=9))
+    today = datetime.now(tz).strftime("%Y%m%d")
+    try:
+        store = _get_user_result_store()
+        if store and store.enabled:
+            row = store.get(current_user, today)
+            if row is not None:
+                pnl = float(row.get("pnl") or 0)
+                cnt = int(row.get("trade_count") or 0)
+                return (pnl, cnt)
+    except Exception:
+        pass
+    try:
+        from user_hist_store import get_user_hist_store
+        hist = get_user_hist_store()
+        if hist and getattr(hist, "enabled", False):
+            rows = hist.get_trades(current_user, today, today)
+            if rows:
+                daily_pnl = sum(float(t.get("pnl") or 0) for t in rows if (t.get("order_type") or "").strip().lower() == "sell" and t.get("pnl") is not None)
+                daily_trades = sum(1 for t in rows if (t.get("order_type") or "").strip().lower() == "buy")
+                return (daily_pnl, daily_trades)
+    except Exception:
+        pass
+    return (None, None)
+
+
 @app.get("/api/system/status")
 async def get_system_status(current_user: str = Depends(get_current_user)):
     """시스템 상태 조회"""
     criteria = _get_stock_selection_criteria(current_user)
     if not state.risk_manager:
+        # 시스템 중지 상태에서도 DB( user_result / user_hist ) 기준 당일 손익·거래 횟수 표시
+        daily_pnl, daily_trades = 0, 0
+        try:
+            pnl, cnt = _load_today_daily_stats(current_user)
+            if pnl is not None and cnt is not None:
+                daily_pnl, daily_trades = float(pnl), int(cnt)
+        except Exception:
+            pass
         return JSONResponse({
             "is_running": False,
             "is_paper_trading": getattr(state, "is_paper_trading", True),
             "manual_approval": getattr(state, "manual_approval", True),
             "env_name": "-",
             "account_balance": 0,
-            "daily_pnl": 0,
-            "daily_trades": 0,
+            "daily_pnl": daily_pnl,
+            "daily_trades": daily_trades,
             "selected_stocks": getattr(state, "selected_stocks", []) or [],
             "selected_stock_info": getattr(state, "selected_stock_info", []) or [],
             "stock_selection_criteria": criteria,
@@ -2948,17 +3300,40 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
             "auto_rebalance_interval_minutes": int(getattr(state, "auto_rebalance_interval_minutes", 30) or 30),
             "enable_performance_auto_recommend": getattr(state, "enable_performance_auto_recommend", False),
             "performance_recommend_interval_minutes": int(getattr(state, "performance_recommend_interval_minutes", 5) or 5),
+            "auto_schedule_enabled": getattr(state, "auto_schedule_enabled", False),
+            "auto_start_hhmm": getattr(state, "auto_start_hhmm", "09:30") or "09:30",
+            "auto_stop_hhmm": getattr(state, "auto_stop_hhmm", "12:00") or "12:00",
+            "liquidate_on_auto_stop": getattr(state, "liquidate_on_auto_stop", True),
+            "auto_schedule_username": getattr(state, "auto_schedule_username", "") or "",
             "stock_selection_criteria": criteria,
             "positions": {},
         }, headers=_STATUS_NO_CACHE)
     
     await _refresh_kis_account_balance(force=False, ttl_sec=60)
+    # 재시작 후 접속 시 당일 손익·거래 횟수 0이면 DB에서 복원
+    try:
+        rm = state.risk_manager
+        if (float(getattr(rm, "daily_pnl", 0) or 0) == 0 and (int(getattr(rm, "daily_trades", 0) or 0) == 0)):
+            pnl, cnt = _load_today_daily_stats(current_user)
+            if pnl is not None and cnt is not None:
+                rm.daily_pnl = float(pnl)
+                rm.daily_trades = int(cnt)
+                if getattr(state, "is_paper_trading", True):
+                    kis_bal = int(getattr(state, "kis_account_balance", 0) or 0)
+                    if kis_bal > 0:
+                        state.session_start_balance = float(kis_bal) - float(pnl)
+    except Exception:
+        pass
+    kis_balance = int(getattr(state, "kis_account_balance", 0) or 0)
+    kis_balance_ok = bool(getattr(state, "kis_account_balance_ok", False))
     return JSONResponse({
         "is_running": state.is_running,
         "is_paper_trading": state.is_paper_trading,
         "manual_approval": getattr(state, "manual_approval", True),
         "env_name": "모의투자" if state.is_paper_trading else "실전투자",
         "account_balance": _get_display_account_balance(),
+        "kis_account_balance": kis_balance,
+        "kis_account_balance_ok": kis_balance_ok,
         "daily_pnl": state.risk_manager.daily_pnl,
         "daily_trades": state.risk_manager.daily_trades,
         "selected_stocks": state.selected_stocks,
@@ -2982,6 +3357,11 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
         "auto_rebalance_interval_minutes": int(getattr(state, "auto_rebalance_interval_minutes", 30) or 30),
         "enable_performance_auto_recommend": getattr(state, "enable_performance_auto_recommend", False),
         "performance_recommend_interval_minutes": int(getattr(state, "performance_recommend_interval_minutes", 5) or 5),
+        "auto_schedule_enabled": getattr(state, "auto_schedule_enabled", False),
+        "auto_start_hhmm": getattr(state, "auto_start_hhmm", "09:30") or "09:30",
+        "auto_stop_hhmm": getattr(state, "auto_stop_hhmm", "12:00") or "12:00",
+        "liquidate_on_auto_stop": getattr(state, "liquidate_on_auto_stop", True),
+        "auto_schedule_username": getattr(state, "auto_schedule_username", "") or "",
         "stock_selection_criteria": criteria,
         "positions": _build_positions_message(),
     }, headers=_STATUS_NO_CACHE)
@@ -3088,12 +3468,11 @@ async def get_account_status(current_user: str = Depends(get_current_user)):
         logger.error(f"계좌 상태 확인 오류: {e}")
         return JSONResponse({"success": False, "message": str(e)})
 
-@app.post("/api/system/start")
-async def start_system(current_user: str = Depends(get_current_user)):
-    """시스템 시작"""
+async def _do_start_system(username: str) -> tuple:
+    """시스템 시작 내부 로직. (success: bool, message: str) 반환."""
     try:
         if state.is_running:
-            return JSONResponse({"success": False, "message": "이미 실행 중입니다."})
+            return False, "이미 실행 중입니다."
 
         if not state.strategy or not state.trenv or not state.risk_manager:
             ok = _ensure_initialized()
@@ -3102,32 +3481,77 @@ async def start_system(current_user: str = Depends(get_current_user)):
                 msg = "시스템 초기화 실패: KIS 설정(.env/kis_devlp.yaml), 네트워크, 계정 설정을 확인하세요."
                 if detail:
                     msg = f"{msg} (detail: {detail})"
-                return JSONResponse({"success": False, "message": msg})
+                return False, msg
 
-        # 시작 전 DB에 저장된 설정을 state에 반영 (리스크·운영 등이 DB와 일치하도록)
         store = _get_user_settings_store()
         if store and getattr(store, "enabled", False):
             try:
-                saved = store.load(current_user) or {}
+                saved = store.load(username) or {}
                 _apply_risk_config_dict_to_state(saved.get("risk_config"))
                 _apply_operational_config_dict_to_state(saved.get("operational_config"))
+                _apply_strategy_config_dict_to_state(saved.get("strategy_config"))
+                _apply_stock_selection_config_dict_to_state(saved.get("stock_selection_config"))
+                try:
+                    # 시작 시 실제 반영된 핵심값을 시스템 로그에 남김 (커스텀(DB 저장값) 적용 확인용)
+                    sp = getattr(state.strategy, "short_ma_period", None)
+                    lp = getattr(state.strategy, "long_ma_period", None)
+                    mtd = getattr(state.risk_manager, "max_trades_per_day", None) if getattr(state, "risk_manager", None) else None
+                    system_log_append("info", f"시작 시 DB 저장 설정 적용: user={username} short_ma_period={sp} long_ma_period={lp} max_trades_per_day={mtd}")
+                except Exception:
+                    pass
             except Exception as e:
                 logger.warning(f"시작 시 저장 설정 적용 실패(무시): {e}")
 
+        # 저장된 종목선정 설정으로 1회 자동 선정 (선정 결과가 있으면 사용, 없으면 이전 유지 또는 디폴트)
+        if getattr(state, "stock_selector", None):
+            try:
+                selected = state.stock_selector.select_stocks_by_fluctuation()
+                if selected:
+                    state.selected_stocks = selected
+                    state.selected_stock_info = getattr(
+                        state.stock_selector,
+                        "last_selected_stock_info",
+                        [{"code": c, "name": c} for c in selected],
+                    )
+                    logger.info("시작 시 종목 선정 완료: %s", ", ".join(selected))
+                else:
+                    keep_prev = bool(getattr(state, "keep_previous_on_empty_selection", True))
+                    if not keep_prev or not getattr(state, "selected_stocks", None):
+                        state.selected_stocks = ["005930", "000660"]
+                        state.selected_stock_info = DEFAULT_STOCK_INFO.copy()
+                        logger.info("시작 시 종목 선정 결과 없음 → 디폴트 종목 적용")
+                    else:
+                        logger.info("시작 시 종목 선정 결과 없음 → 이전 목록 유지")
+            except Exception as e:
+                logger.warning(f"시작 시 종목 선정 실패(무시): {e}")
         if not state.selected_stocks:
             state.selected_stocks = ["005930", "000660"]
         if not getattr(state, "selected_stock_info", None):
             state.selected_stock_info = DEFAULT_STOCK_INFO.copy()
 
-        state.is_running = True
-        state.trading_username = current_user  # 거래 내역 저장(quant_trading_user_hist)용
-        logger.info("시스템 시작: trading_username=%s (quant_trading_user_hist 저장 대상)", current_user)
+        # 시작 시 당일 손익·거래 횟수 복원(초기화로 0이 된 값은 DB/거래내역 기준으로 합산 유지)
         try:
-            state.session_start_balance = float(_get_display_account_balance() or getattr(state.risk_manager, "account_balance", 0) or 0)
+            pnl, cnt = _load_today_daily_stats(username)
+            if pnl is not None and cnt is not None:
+                state.risk_manager.daily_pnl = float(pnl)
+                state.risk_manager.daily_trades = int(cnt)
+                if getattr(state, "is_paper_trading", True):
+                    kis_bal = int(getattr(state, "kis_account_balance", 0) or 0)
+                    if kis_bal > 0:
+                        state.session_start_balance = float(kis_bal) - float(pnl)
         except Exception:
-            state.session_start_balance = float(getattr(state.risk_manager, "account_balance", 0) or 0)
+            pass
+
+        state.is_running = True
+        state.trading_username = username
+        logger.info("시스템 시작: trading_username=%s (quant_trading_user_hist 저장 대상)", username)
+        try:
+            if getattr(state, "session_start_balance", None) is None:
+                state.session_start_balance = float(_get_display_account_balance() or getattr(state.risk_manager, "account_balance", 0) or 0)
+        except Exception:
+            if getattr(state, "session_start_balance", None) is None:
+                state.session_start_balance = float(getattr(state.risk_manager, "account_balance", 0) or 0)
         _start_trading_engine_thread()
-        # pending 주문 체결 확인 루프 시작(중복 방지)
         try:
             t = getattr(state, "pending_order_reconciler_task", None)
             if t is None or getattr(t, "done", lambda: True)():
@@ -3138,11 +3562,17 @@ async def start_system(current_user: str = Depends(get_current_user)):
             except Exception:
                 pass
         await send_status_update()
-
-        return JSONResponse({"success": True, "message": f"시스템 시작 (감시 종목: {', '.join(state.selected_stocks)})"})
+        return True, f"시스템 시작 (감시 종목: {', '.join(state.selected_stocks)})"
     except Exception as e:
         logger.error(f"시스템 시작 오류: {e}")
-        return JSONResponse({"success": False, "message": str(e)})
+        return False, str(e)
+
+
+@app.post("/api/system/start")
+async def start_system(current_user: str = Depends(get_current_user)):
+    """시스템 시작"""
+    success, message = await _do_start_system(current_user)
+    return JSONResponse({"success": success, "message": message})
 
 @app.post("/api/system/set-env")
 async def set_trading_env(
@@ -3194,15 +3624,10 @@ async def set_trade_mode(
         return JSONResponse({"success": False, "message": str(e)})
 
 
-@app.post("/api/system/stop")
-async def stop_system(
-    liquidate: bool = Query(False),
-    current_user: str = Depends(get_current_user)
-):
-    """시스템 중지"""
+async def _do_stop_system(username: str, liquidate: bool) -> tuple:
+    """시스템 중지 내부 로직. (success: bool, message: str) 반환."""
     try:
         state.is_running = False
-        # pending 주문 reconcile 루프 중지
         try:
             t = getattr(state, "pending_order_reconciler_task", None)
             if t is not None and hasattr(t, "cancel"):
@@ -3212,7 +3637,6 @@ async def stop_system(
             pass
         with pending_signals_lock:
             state.pending_signals = {}
-        # pending 주문도 초기화(재시작 시 매수/매도 막힘 방지)
         try:
             if getattr(state, "risk_manager", None) and hasattr(state.risk_manager, "_pending_orders"):
                 state.risk_manager._pending_orders = {}
@@ -3226,16 +3650,13 @@ async def stop_system(
                 "message": f"청산 시작: {len(positions_snapshot)}개 포지션",
                 "level": "warning"
             })
-
             for code, pos in positions_snapshot:
                 qty = int(pos.get("quantity", 0) or 0)
                 if qty <= 0:
                     continue
-
                 current_price = state.risk_manager.last_prices.get(code, pos.get("buy_price", 0)) if hasattr(state.risk_manager, "last_prices") else pos.get("buy_price", 0)
                 if not current_price:
                     current_price = pos.get("buy_price", 0) or 0
-
                 result = await asyncio.to_thread(
                     safe_execute_order,
                     "sell",
@@ -3246,7 +3667,6 @@ async def stop_system(
                     state.is_paper_trading,
                     False
                 )
-
                 if result:
                     pnl = None
                     try:
@@ -3254,35 +3674,21 @@ async def stop_system(
                         pnl = (float(current_price) - buy_price) * qty
                     except Exception:
                         pnl = None
-
                     trade_info = {
                         "stock_code": code,
                         "order_type": "sell",
                         "quantity": qty,
                         "price": float(current_price) if current_price else 0,
                         "pnl": pnl,
-                        "reason": "시간기반 청산",
+                        "reason": "자동종료 청산" if liquidate else "시간기반 청산",
                     }
                     state.add_trade(trade_info)
                     await state.broadcast({"type": "trade", "data": trade_info})
-
             await state.broadcast({"type": "log", "message": "청산 완료", "level": "info"})
 
-        # 일별 성과 저장 (quant_trading_user_result): 종료 시 항상 당일 성과 저장. 기존 row 있으면 통합.
         try:
             store = _get_user_result_store()
-            if not store:
-                logger.warning("종료 시 일별 성과 미저장: user_result_store 로드 실패")
-            elif not store.enabled:
-                logger.warning(
-                    "종료 시 일별 성과 미저장: store 비활성 (table=%s region=%s reason=%s)",
-                    getattr(store, "table_name", ""),
-                    getattr(store, "region", ""),
-                    getattr(store, "init_error", "unknown"),
-                )
-            elif not state.risk_manager:
-                logger.warning("종료 시 일별 성과 미저장: risk_manager 없음")
-            else:
+            if store and store.enabled and state.risk_manager:
                 tz = timezone(timedelta(hours=9))
                 today = datetime.now(tz).strftime("%Y%m%d")
                 today_ymd = today[:4] + "-" + today[4:6] + "-" + today[6:8]
@@ -3306,24 +3712,72 @@ async def stop_system(
                     losses = sum(1 for p in today_pnls if p < 0)
                     gross_profit = sum(p for p in today_pnls if p > 0)
                     gross_loss = sum(p for p in today_pnls if p < 0)
-                ok = store.save_daily_result(
-                    current_user, today, equity_end, trade_count, equity_start=equity_start,
+                store.save_daily_result(
+                    username, today, equity_end, trade_count, equity_start=equity_start,
                     wins=wins, losses=losses, gross_profit=gross_profit, gross_loss=gross_loss,
                 )
-                if ok:
-                    logger.info("종료 시 일별 성과 저장됨: user=%s date=%s equity_end=%s trade_count=%s", current_user, today, equity_end, trade_count)
-                    await state.broadcast({"type": "log", "message": f"일별 성과 저장됨: {today}", "level": "info"})
-                else:
-                    logger.warning("종료 시 일별 성과 save_daily_result 반환 False: user=%s date=%s", current_user, today)
+                await state.broadcast({"type": "log", "message": f"일별 성과 저장됨: {today}", "level": "info"})
         except Exception as e:
             logger.warning("일별 성과 저장 실패(무시): %s", e, exc_info=True)
 
         await send_status_update()
         await state.broadcast({"type": "signal_snapshot", "data": []})
-        return JSONResponse({"success": True, "message": "시스템이 중지되었습니다."})
+        return True, "시스템이 중지되었습니다."
     except Exception as e:
         logger.error(f"시스템 중지 오류: {e}")
-        return JSONResponse({"success": False, "message": str(e)})
+        return False, str(e)
+
+
+@app.post("/api/system/stop")
+async def stop_system(
+    liquidate: bool = Query(False),
+    current_user: str = Depends(get_current_user)
+):
+    """시스템 중지"""
+    success, message = await _do_stop_system(current_user, liquidate)
+    return JSONResponse({"success": success, "message": message})
+
+
+async def _auto_schedule_loop():
+    """매일 지정 시각(KST)에 자동 시작/종료. 60초마다 확인."""
+    kst = timezone(timedelta(hours=9))
+    while True:
+        await asyncio.sleep(60)
+        if not getattr(state, "auto_schedule_enabled", False):
+            continue
+        now = datetime.now(kst)
+        today = now.strftime("%Y-%m-%d")
+        hhmm = now.strftime("%H:%M")
+        start_hhmm = (getattr(state, "auto_start_hhmm", None) or "09:30").strip()[:5]
+        stop_hhmm = (getattr(state, "auto_stop_hhmm", None) or "12:00").strip()[:5]
+        liquidate = getattr(state, "liquidate_on_auto_stop", True)
+        username = (getattr(state, "auto_schedule_username", None) or "").strip() or "admin"
+        if hhmm == start_hhmm and getattr(state, "_last_auto_start_date", None) != today:
+            state._last_auto_start_date = today
+            try:
+                ok, msg = await _do_start_system(username)
+                logger.info("자동 시작: %s %s", ok, msg)
+                await state.broadcast({"type": "log", "message": f"자동 시작: {msg}", "level": "info" if ok else "error"})
+            except Exception as e:
+                logger.exception("자동 시작 예외")
+                await state.broadcast({"type": "log", "message": f"자동 시작 실패: {e}", "level": "error"})
+        if hhmm == stop_hhmm and getattr(state, "_last_auto_stop_date", None) != today:
+            state._last_auto_stop_date = today
+            try:
+                ok, msg = await _do_stop_system(username, liquidate)
+                logger.info("자동 종료: %s %s (청산=%s)", ok, msg, liquidate)
+                await state.broadcast({"type": "log", "message": f"자동 종료: {msg}", "level": "info" if ok else "error"})
+            except Exception as e:
+                logger.exception("자동 종료 예외")
+                await state.broadcast({"type": "log", "message": f"자동 종료 실패: {e}", "level": "error"})
+
+
+@app.on_event("startup")
+async def _start_auto_schedule():
+    """앱 기동 시 자동 스케줄 루프 시작."""
+    asyncio.create_task(_auto_schedule_loop())
+    logger.info("자동 스케줄 루프 시작 (매일 auto_start_hhmm/auto_stop_hhmm 적용)")
+
 
 @app.get("/api/positions")
 async def get_positions(current_user: str = Depends(get_current_user)):
@@ -3396,6 +3850,63 @@ async def get_trades_system(
     except Exception as e:
         logger.warning("get_trades_system failed: %s", e)
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/positions/sync-from-balance")
+async def sync_positions_from_balance(current_user: str = Depends(get_current_user)):
+    """계좌 잔고 기준으로 포지션을 강제 동기화 (MTS 잔고와 불일치 시 복구용)."""
+    try:
+        if not state.strategy or not state.trenv or not state.risk_manager:
+            ok = _ensure_initialized()
+            if not ok or not state.trenv or not state.risk_manager:
+                detail = getattr(state, "last_init_error", None)
+                msg = "시스템 초기화 실패: KIS 설정(.env/kis_devlp.yaml), 네트워크, 계정 설정을 확인하세요."
+                if detail:
+                    msg = f"{msg} (detail: {detail})"
+                return JSONResponse({"success": False, "message": msg}, status_code=400)
+
+        n = await asyncio.to_thread(_sync_positions_from_balance_sync)
+        attempt = getattr(state, "_last_positions_sync_attempt", None)
+        await state.broadcast({"type": "position", "data": _build_positions_message()})
+        await send_status_update()
+        msg = f"{n}종목 동기화"
+        if n == 0 and isinstance(attempt, dict):
+            msg = f"0종목 동기화(잔고조회 결과 비어있음). attempt={attempt}"
+        await state.broadcast({"type": "log", "level": "info" if n > 0 else "warning", "message": f"잔고 기반 포지션 동기화: {msg}"})
+        return JSONResponse({"success": True, "message": msg, "count": n, "attempt": attempt})
+    except Exception as e:
+        logger.warning("positions sync-from-balance failed: %s", e, exc_info=True)
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.post("/api/positions/liquidate")
+async def liquidate_position(body: Optional[dict] = None, current_user: str = Depends(get_current_user)):
+    """해당 종목 전량 매도 신호 생성(수동 청산). 수동 모드면 승인대기, 자동 모드면 즉시 주문."""
+    stock_code = (body or {}).get("stock_code", "").strip().zfill(6)
+    if not stock_code:
+        return JSONResponse({"success": False, "message": "stock_code 필드가 필요합니다."}, status_code=400)
+    rm = getattr(state, "risk_manager", None)
+    if not rm or not getattr(rm, "positions", None):
+        return JSONResponse({"success": False, "message": "포지션 정보가 없습니다."}, status_code=400)
+    if stock_code not in rm.positions:
+        return JSONResponse({"success": False, "message": f"보유 중인 종목이 아닙니다: {stock_code}"}, status_code=400)
+    pos = rm.positions[stock_code]
+    qty = int(pos.get("quantity", 0) or 0)
+    if qty <= 0:
+        return JSONResponse({"success": False, "message": "보유 수량이 없습니다."}, status_code=400)
+    price = float(pos.get("current_price") or rm.last_prices.get(stock_code) or pos.get("buy_price") or 0)
+    if price <= 0:
+        price = float(pos.get("buy_price") or 0)
+    if price <= 0:
+        return JSONResponse({"success": False, "message": "유효한 가격을 알 수 없습니다. 잠시 후 다시 시도하세요."}, status_code=400)
+    try:
+        await asyncio.to_thread(_handle_signal, stock_code, "sell", price, "수동 청산", suggested_qty_override=qty)
+        await state.broadcast({"type": "position", "data": _build_positions_message()})
+        await send_status_update()
+        return JSONResponse({"success": True, "message": f"{stock_code} 전량 매도 신호 처리됨(수동 청산)"})
+    except Exception as e:
+        logger.warning("liquidate_position failed: %s", e)
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
 
 @app.get("/api/trades/account")
@@ -3475,26 +3986,8 @@ async def get_trades_account(
         return JSONResponse({"error": str(e), "rows": []}, status_code=500)
 
 
-def _performance_summary_from_trades() -> dict:
-    """trade_history 기반 일일·세션 성과 및 권장 설정 추천."""
-    tz = timezone(timedelta(hours=9))
-    today_str = datetime.now(tz).strftime("%Y-%m-%d")
-    history = getattr(state, "trade_history", []) or []
-    today_trades = []
-    for t in history:
-        ts = t.get("timestamp") or ""
-        if isinstance(ts, str) and ts.startswith(today_str):
-            today_trades.append(t)
-        elif isinstance(ts, str) and "T" in ts:
-            try:
-                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone(timedelta(hours=9)))
-                if dt.strftime("%Y-%m-%d") == today_str:
-                    today_trades.append(t)
-            except Exception:
-                pass
-
+def _compute_summary_from_trade_list(today_trades: list, today_str: str) -> dict:
+    """당일 거래 리스트로 일일·세션 성과 및 권장 설정 계산. (공통 로직)"""
     total_pnl = 0.0
     wins = 0
     losses = 0
@@ -3584,15 +4077,235 @@ def _performance_summary_from_trades() -> dict:
     }
 
 
+def _performance_summary_from_trades() -> dict:
+    """trade_history 기반 당일 거래만 필터 후 _compute_summary_from_trade_list 호출."""
+    tz = timezone(timedelta(hours=9))
+    today_str = datetime.now(tz).strftime("%Y-%m-%d")
+    today_ymd = today_str
+    history = getattr(state, "trade_history", []) or []
+    today_trades = []
+    for t in history:
+        ts = t.get("timestamp") or ""
+        if isinstance(ts, str) and ts.startswith(today_str):
+            today_trades.append(t)
+        elif isinstance(ts, str) and "T" in ts:
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone(timedelta(hours=9)))
+                if dt.strftime("%Y-%m-%d") == today_ymd:
+                    today_trades.append(t)
+            except Exception:
+                pass
+    return _compute_summary_from_trade_list(today_trades, today_str)
+
+
+def _today_trades_from_user_hist(current_user: str) -> list:
+    """당일 거래를 user_hist에서 로드."""
+    if not current_user:
+        return []
+    try:
+        from user_hist_store import get_user_hist_store
+        hist = get_user_hist_store()
+        if not hist or not getattr(hist, "enabled", False):
+            return []
+        tz = timezone(timedelta(hours=9))
+        today_yyyymmdd = datetime.now(tz).strftime("%Y%m%d")
+        rows = hist.get_trades(current_user, today_yyyymmdd, today_yyyymmdd)
+        if not rows:
+            return []
+        today_trades = []
+        for r in rows:
+            ts = r.get("timestamp")
+            if not ts and r.get("date") and r.get("time"):
+                d, tm = r["date"], r["time"]
+                ts = f"{d[:4]}-{d[4:6]}-{d[6:8]}T{tm[:2]}:{tm[2:4]}:{tm[4:6]}"
+            today_trades.append({"timestamp": ts or "", "pnl": r.get("pnl")})
+        return today_trades
+    except Exception:
+        return []
+
+
+def _get_today_daily_row(current_user: str) -> Optional[dict]:
+    """일별 성과 API와 동일한 방식으로 '오늘' 일별 행 1건 반환. (user_result → 보정 → user_hist 집계 순)."""
+    if not current_user:
+        return None
+    tz = timezone(timedelta(hours=9))
+    today_yyyymmdd = datetime.now(tz).strftime("%Y%m%d")
+
+    def _get_num(r: dict, *keys: str):
+        for k in keys:
+            v = r.get(k)
+            if v is None:
+                continue
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    rows = []
+    store = _get_user_result_store()
+    if store and store.enabled:
+        rows = store.query_range(current_user, today_yyyymmdd, today_yyyymmdd)
+    if not rows:
+        rows = _daily_rows_from_user_hist(current_user, today_yyyymmdd, today_yyyymmdd)
+    if not rows:
+        return None
+    r = rows[0]
+    try:
+        from decimal import Decimal
+        for key in list(r.keys()):
+            if isinstance(r[key], Decimal):
+                r[key] = float(r[key])
+    except Exception:
+        pass
+    es, ee = _get_num(r, "equity_start", "Equity_Start"), _get_num(r, "equity_end", "Equity_End")
+    if es is not None and ee is not None:
+        pnl_val = ee - es
+        r["pnl"] = round(pnl_val, 0)
+        r["return_pct"] = round((pnl_val / es * 100.0), 4) if es and es != 0 else 0.0
+    if (r.get("pnl") == 0 or r.get("pnl") is None) and es is not None and ee is not None and es == ee:
+        gp, gl = _get_num(r, "gross_profit"), _get_num(r, "gross_loss")
+        if gp is not None or gl is not None:
+            gross_pnl = (gp or 0) + (gl or 0)
+            r["pnl"] = round(gross_pnl, 0)
+            r["return_pct"] = round((gross_pnl / es * 100.0), 4) if es and es != 0 else 0.0
+    return r
+
+
 @app.get("/api/performance/summary")
 async def get_performance_summary(current_user: str = Depends(get_current_user)):
-    """일일·세션 성과 요약 및 성과 기반 권장 설정."""
+    """일일·세션 성과 요약. 당일은 일별 성과 '오늘' 행과 동일한 값(실현손익·거래횟수)으로 표시."""
     try:
-        summary = _performance_summary_from_trades()
+        tz = timezone(timedelta(hours=9))
+        today_str = datetime.now(tz).strftime("%Y-%m-%d")
+        # 당일 일별 행이 있으면 그대로 사용 → 일별 성과 3/12와 동일 값
+        today_row = _get_today_daily_row(current_user)
+        if today_row is not None:
+            pnl = today_row.get("pnl")
+            tc = int(today_row.get("trade_count") or 0)
+            wins = int(today_row.get("wins") or 0)
+            losses = int(today_row.get("losses") or 0)
+            gp = float(today_row.get("gross_profit") or 0)
+            gl = float(today_row.get("gross_loss") or 0)
+            total_wl = wins + losses
+            win_rate = round(wins / total_wl * 100.0, 1) if total_wl else 0.0
+            avg_win = round(gp / wins, 0) if wins else 0.0
+            avg_loss = round(gl / losses, 0) if losses else 0.0
+            pf = (gp / abs(gl)) if gl and abs(gl) > 0 else (float(gp) if gp else None)
+            summary = {
+                "date": today_str,
+                "trade_count": tc,
+                "wins": wins,
+                "losses": losses,
+                "total_pnl": round(float(pnl or 0), 0),
+                "win_rate_pct": win_rate,
+                "profit_factor": round(pf, 2) if pf is not None else None,
+                "avg_win": avg_win,
+                "avg_loss": avg_loss,
+                "session_max_drawdown": 0,
+                "session_max_drawdown_pct": 0.0,
+                "recommendations": _compute_summary_from_trade_list([], today_str).get("recommendations", []),
+            }
+            return JSONResponse({"success": True, "summary": summary})
+        # 일별 행 없으면 거래 리스트로 집계(메모리 → user_hist)
+        today_trades = _today_trades_from_user_hist(current_user)
+        if not today_trades:
+            history = getattr(state, "trade_history", []) or []
+            today_ymd = today_str.replace("-", "")[:8]
+            for t in history:
+                ts = t.get("timestamp") or ""
+                if isinstance(ts, str) and (ts.startswith(today_str) or ts.replace("-", "")[:8] == today_ymd):
+                    today_trades.append(t)
+                elif isinstance(ts, str) and "T" in ts:
+                    try:
+                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=tz)
+                        if dt.strftime("%Y-%m-%d") == today_str:
+                            today_trades.append(t)
+                    except Exception:
+                        pass
+        summary = _compute_summary_from_trade_list(today_trades, today_str)
         return JSONResponse({"success": True, "summary": summary})
     except Exception as e:
         logger.exception(e)
         return JSONResponse({"success": False, "message": str(e)})
+
+
+@app.get("/api/performance/store-status")
+async def get_performance_store_status(current_user: str = Depends(get_current_user)):
+    """일별 성과 저장소(quant_trading_user_result) 상태. 조회 시 사용하는 사용자명·테이블·연동 여부 확인용."""
+    store = _get_user_result_store()
+    if not store:
+        return JSONResponse({
+            "enabled": False,
+            "message": "성과 저장소 초기화 실패(모듈/환경 확인)",
+            "current_user": current_user,
+        })
+    return JSONResponse({
+        "enabled": bool(store.enabled),
+        "table_name": getattr(store, "table_name", ""),
+        "region": getattr(store, "region", ""),
+        "init_error": getattr(store, "init_error", None),
+        "current_user": current_user,
+        "message": "조회 시 current_user를 DynamoDB 파티션 키(username)로 사용합니다. 테이블에 해당 username으로 저장된 데이터가 있어야 일별 성과에 표시됩니다.",
+    })
+
+
+def _daily_rows_from_user_hist(username: str, date_from: str, date_to: str) -> list:
+    """quant_trading_user_hist를 일자별로 집계해 일별 성과 형태의 리스트 반환. (user_result 비었을 때 보강용)"""
+    try:
+        from user_hist_store import get_user_hist_store
+        hist = get_user_hist_store()
+        if not hist or not getattr(hist, "enabled", False):
+            return []
+        all_rows = hist.get_trades(username, date_from, date_to)
+        if not all_rows:
+            return []
+        # 일자별로 그룹화: pnl(매도만), trade_count(매수 건수), wins, losses, gross_profit, gross_loss
+        by_date = {}
+        for r in all_rows:
+            d = (r.get("date") or "").strip()
+            if len(d) != 8:
+                continue
+            if d not in by_date:
+                by_date[d] = {"pnls": [], "buys": 0}
+            ot = (r.get("order_type") or "").strip().lower()
+            if ot == "sell" and r.get("pnl") is not None:
+                try:
+                    by_date[d]["pnls"].append(float(r["pnl"]))
+                except (TypeError, ValueError):
+                    pass
+            elif ot == "buy":
+                by_date[d]["buys"] += 1
+        rows = []
+        for d in sorted(by_date.keys()):
+            pnls = by_date[d]["pnls"]
+            buys = by_date[d]["buys"]
+            trade_count = buys
+            pnl = sum(pnls)
+            wins = sum(1 for p in pnls if p > 0)
+            losses = sum(1 for p in pnls if p < 0)
+            gross_profit = sum(p for p in pnls if p > 0)
+            gross_loss = sum(p for p in pnls if p < 0)
+            rows.append({
+                "date": d,
+                "equity_start": 0,
+                "equity_end": 0,
+                "pnl": round(pnl, 0),
+                "return_pct": 0.0,
+                "trade_count": trade_count,
+                "wins": wins,
+                "losses": losses,
+                "gross_profit": round(gross_profit, 0),
+                "gross_loss": round(gross_loss, 0),
+            })
+        return rows
+    except Exception as e:
+        logger.debug("_daily_rows_from_user_hist: %s", e)
+        return []
 
 
 @app.get("/api/performance/daily")
@@ -3601,22 +4314,85 @@ async def get_performance_daily(
     date_to: str = Query(..., description="종료일 YYYYMMDD"),
     current_user: str = Depends(get_current_user),
 ):
-    """일별 성과 조회 (quant_trading_user_result). from~to 구간."""
+    """일별 성과 조회 (quant_trading_user_result). 비었으면 quant_trading_user_hist 기준 일별 집계로 보강."""
     try:
-        store = _get_user_result_store()
-        if not store or not store.enabled:
-            return JSONResponse({
-                "success": False,
-                "message": "성과 저장소를 사용할 수 없습니다. (DynamoDB quant_trading_user_result 테이블·자격 확인)",
-            })
         if len(date_from) != 8 or len(date_to) != 8 or not date_from.isdigit() or not date_to.isdigit():
             return JSONResponse({"success": False, "message": "date_from, date_to는 YYYYMMDD 8자리여야 합니다."})
         if date_from > date_to:
             date_from, date_to = date_to, date_from
-        rows = store.query_range(current_user, date_from, date_to)
-        return JSONResponse({"success": True, "rows": rows})
+
+        store = _get_user_result_store()
+        rows = []
+        source = "user_result"
+        if store and store.enabled:
+            rows = store.query_range(current_user, date_from, date_to)
+        if not rows:
+            rows = _daily_rows_from_user_hist(current_user, date_from, date_to)
+            if rows:
+                source = "user_hist"
+        # Decimal 등 JSON 비호환 타입 제거 + equity 기준 pnl/return_pct 보정(대시보드 0 표시 방지)
+        def _get_num(r: dict, *keys: str):
+            for k in keys:
+                v = r.get(k)
+                if v is None:
+                    continue
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+            return None
+
+        try:
+            from decimal import Decimal
+            for r in rows:
+                for key in list(r.keys()):
+                    v = r[key]
+                    if isinstance(v, Decimal):
+                        r[key] = float(v)
+                es = _get_num(r, "equity_start", "Equity_Start", "EQUITY_START")
+                ee = _get_num(r, "equity_end", "Equity_End", "EQUITY_END")
+                if es is not None and ee is not None:
+                    pnl_val = ee - es
+                    r["pnl"] = round(pnl_val, 0)
+                    r["return_pct"] = round((pnl_val / es * 100.0), 4) if es and es != 0 else 0.0
+                # equity가 동일해 손익 0인 경우: gross_profit + gross_loss 로 실현손익 표시(DB 저장 오류/다른 리전 등 보정)
+                if (r.get("pnl") == 0 or r.get("pnl") is None) and (es is not None and ee is not None and es == ee):
+                    gp = _get_num(r, "gross_profit")
+                    gl = _get_num(r, "gross_loss")
+                    if gp is not None or gl is not None:
+                        gross_pnl = (gp or 0) + (gl or 0)
+                        r["pnl"] = round(gross_pnl, 0)
+                        r["return_pct"] = round((gross_pnl / es * 100.0), 4) if es and es != 0 else 0.0
+        except Exception:
+            pass
+        # 최신일자 순 내림차순 정렬
+        rows = sorted(rows, key=lambda r: (r.get("date") or ""), reverse=True)
+        out = {"success": True, "rows": rows, "queried_user": current_user, "date_from": date_from, "date_to": date_to, "source": source}
+        if not rows:
+            out["hint"] = f"조회 사용자: {current_user}. 구간: {date_from}~{date_to}. user_result와 user_hist 모두 해당 기간 데이터가 없습니다."
+            if not (store and store.enabled):
+                out["hint"] = f"일별 성과 저장소(quant_trading_user_result) 미연동. 거래내역(quant_trading_user_hist)에도 해당 기간 데이터가 없습니다. /api/performance/store-status 로 저장소 상태 확인."
+        try:
+            attempt_parts = [f"{current_user} {date_from}~{date_to} → {len(rows)}건 ({source})"]
+            if rows:
+                r0 = rows[0]
+                # 반환값 샘플(손익 0 원인 확인용): date, pnl, equity_start, equity_end, keys
+                sample = (
+                    f"date={r0.get('date')} pnl={r0.get('pnl')} return_pct={r0.get('return_pct')} "
+                    f"equity_start={r0.get('equity_start')} equity_end={r0.get('equity_end')} "
+                    f"gross_profit={r0.get('gross_profit')} gross_loss={r0.get('gross_loss')}"
+                )
+                attempt_parts.append(sample)
+            system_log_append("info", f"일별 성과 조회: {' | '.join(attempt_parts)}")
+        except Exception:
+            pass
+        return JSONResponse(out)
     except Exception as e:
         logger.exception(e)
+        try:
+            system_log_append("error", f"일별 성과 조회 실패: {current_user} {date_from or '-'}~{date_to or '-'} — {e}")
+        except Exception:
+            pass
         return JSONResponse({"success": False, "message": str(e)})
 
 
@@ -3779,20 +4555,19 @@ async def get_performance_period_stats(
     months: int = Query(1, ge=1, le=24, description="기간(월 수)"),
     current_user: str = Depends(get_current_user),
 ):
-    """기간 성과: 월간 수익률·기간 최대낙폭 (일별 저장 데이터 기준)."""
+    """기간 성과: 월간 수익률·기간 최대낙폭 (일별 저장 또는 user_hist 집계 기준)."""
     try:
-        store = _get_user_result_store()
-        if not store or not store.enabled:
-            return JSONResponse({
-                "success": False,
-                "message": "성과 저장소를 사용할 수 없습니다.",
-            })
         tz = timezone(timedelta(hours=9))
         end_dt = datetime.now(tz)
         start_dt = end_dt - timedelta(days=months * 31)
         date_from = start_dt.strftime("%Y%m%d")
         date_to = end_dt.strftime("%Y%m%d")
-        rows = store.query_range(current_user, date_from, date_to)
+        rows = []
+        store = _get_user_result_store()
+        if store and store.enabled:
+            rows = store.query_range(current_user, date_from, date_to)
+        if not rows:
+            rows = _daily_rows_from_user_hist(current_user, date_from, date_to)
         stats = _period_stats_from_daily_rows(rows, date_from, date_to)
         return JSONResponse({"success": True, "period_stats": stats})
     except Exception as e:
@@ -4223,6 +4998,7 @@ async def update_strategy_config(config: StrategyConfig, current_user: str = Dep
         state.relative_strength_margin_pct = float(getattr(config, "relative_strength_margin_pct", 0.0) or 0.0)
         state.last_minutes_no_buy = max(0, min(60, int(getattr(config, "last_minutes_no_buy", 0) or 0)))
         state.advance_ratio_down_market_skip = bool(getattr(config, "advance_ratio_down_market_skip", True))
+        state.skip_buy_below_high_pct = max(0.0, min(0.20, float(getattr(config, "skip_buy_below_high_pct", 0.0) or 0.0)))
 
         store = _get_user_settings_store()
         persisted = False
@@ -4344,6 +5120,11 @@ async def update_operational_config(config: OperationalConfig, current_user: str
         state.ws_reconnect_sleep_sec = max(3, min(60, int(getattr(config, "ws_reconnect_sleep_sec", 5) or 5)))
         state.emergency_liquidate_disconnect_minutes = max(0, min(120, int(getattr(config, "emergency_liquidate_disconnect_minutes", 0) or 0)))
         state.keep_previous_on_empty_selection = bool(getattr(config, "keep_previous_on_empty_selection", True))
+        state.auto_schedule_enabled = bool(getattr(config, "auto_schedule_enabled", False))
+        state.auto_start_hhmm = str(getattr(config, "auto_start_hhmm", "09:30") or "09:30").strip()[:5]
+        state.auto_stop_hhmm = str(getattr(config, "auto_stop_hhmm", "12:00") or "12:00").strip()[:5]
+        state.liquidate_on_auto_stop = bool(getattr(config, "liquidate_on_auto_stop", True))
+        state.auto_schedule_username = str(getattr(config, "auto_schedule_username", "") or "").strip()
         store = _get_user_settings_store()
         persisted = False
         if store and getattr(store, "enabled", False):
@@ -4397,7 +5178,115 @@ async def get_user_settings(current_user: str = Depends(get_current_user)):
     _apply_risk_config_dict_to_state(settings.get("risk_config"))
     _apply_operational_config_dict_to_state(settings.get("operational_config"))
     _apply_strategy_config_dict_to_state(settings.get("strategy_config"))
+    if settings.get("stock_selection_config") and state.stock_selector is None:
+        try:
+            _apply_stock_selection_config_dict_to_state(settings.get("stock_selection_config"))
+        except Exception:
+            pass
     return JSONResponse({"success": True, "settings": settings, "loaded_for_username": current_user})
+
+
+@app.post("/api/config/custom-slots/save")
+async def save_custom_slot(
+    current_user: str = Depends(get_current_user),
+    body: dict = Body(..., embed=False),
+):
+    """커스텀 슬롯(1~10) 하나에 현재 설정 저장. slot_id, name, risk_config, strategy_config, stock_selection_config, operational_config."""
+    store = _get_user_settings_store()
+    if not store or not getattr(store, "enabled", False):
+        return JSONResponse({"success": False, "message": "DynamoDB 설정 저장소를 사용할 수 없습니다."})
+    try:
+        slot_id = max(1, min(getattr(store, "NUM_CUSTOM_SLOTS", 10), int(body.get("slot_id", 1))))
+        name = (str(body.get("name") or "").strip()) or f"Custom {slot_id}"
+        risk_config = body.get("risk_config") if isinstance(body.get("risk_config"), dict) else None
+        strategy_config = body.get("strategy_config") if isinstance(body.get("strategy_config"), dict) else None
+        stock_selection_config = body.get("stock_selection_config") if isinstance(body.get("stock_selection_config"), dict) else None
+        operational_config = body.get("operational_config") if isinstance(body.get("operational_config"), dict) else None
+        # 요청에 설정이 없으면 DB에 저장된 현재 메인 설정을 슬롯에 복사 (프론트에서 먼저 각 탭 저장 후 호출하는 경우)
+        if not any((risk_config, strategy_config, stock_selection_config, operational_config)):
+            loaded = store.load(current_user) or {}
+            risk_config = loaded.get("risk_config")
+            strategy_config = loaded.get("strategy_config")
+            stock_selection_config = loaded.get("stock_selection_config")
+            operational_config = loaded.get("operational_config")
+        if not any((risk_config, strategy_config, stock_selection_config, operational_config)):
+            return JSONResponse({"success": False, "message": "저장할 설정이 없습니다. 리스크/전략/종목선정/운영 탭에서 먼저 저장한 뒤 슬롯 저장을 하거나, 폼 값을 그대로 슬롯에 저장하려면 저장하기를 사용하세요."})
+        ok = store.save_custom_slot(
+            current_user,
+            slot_id=slot_id,
+            name=name,
+            risk_config=risk_config,
+            strategy_config=strategy_config,
+            stock_selection_config=stock_selection_config,
+            operational_config=operational_config,
+        )
+        if not ok:
+            return JSONResponse({"success": False, "message": "커스텀 슬롯 저장 실패."})
+        # state에 반영 (저장한 슬롯 = 현재 적용값)
+        if risk_config:
+            _apply_risk_config_dict_to_state(risk_config)
+        if operational_config:
+            _apply_operational_config_dict_to_state(operational_config)
+        if strategy_config:
+            _apply_strategy_config_dict_to_state(strategy_config)
+        if stock_selection_config and getattr(state, "stock_selector", None):
+            try:
+                _apply_stock_selection_config_dict_to_state(stock_selection_config)
+            except Exception:
+                pass
+        try:
+            audit_log(current_user, "config_save", {"section": "custom_slot", "slot_id": slot_id})
+        except Exception:
+            pass
+        return JSONResponse({
+            "success": True,
+            "message": f"커스텀 슬롯 {slot_id}({name})에 저장했습니다.",
+            "slot_id": slot_id,
+            "name": name,
+        })
+    except Exception as e:
+        logger.exception("Custom slot save error")
+        return JSONResponse({"success": False, "message": str(e)})
+
+
+@app.post("/api/config/custom-slots/load")
+async def load_custom_slot_to_main(
+    current_user: str = Depends(get_current_user),
+    body: dict = Body(..., embed=False),
+):
+    """커스텀 슬롯(1~5) 내용을 메인 설정으로 불러오기. slot_id 필수."""
+    store = _get_user_settings_store()
+    if not store or not getattr(store, "enabled", False):
+        return JSONResponse({"success": False, "message": "DynamoDB 설정 저장소를 사용할 수 없습니다."})
+    try:
+        slot_id = max(1, min(5, int(body.get("slot_id", 1))))
+        loaded = store.load(current_user) or {}
+        slots = loaded.get("custom_slots") or {}
+        slot = slots.get(str(slot_id)) if isinstance(slots.get(str(slot_id)), dict) else None
+        if not slot or not any((slot.get("risk_config"), slot.get("strategy_config"), slot.get("stock_selection_config"), slot.get("operational_config"))):
+            return JSONResponse({"success": False, "message": f"슬롯 {slot_id}에 저장된 설정이 없습니다."})
+        r = slot.get("risk_config")
+        s = slot.get("strategy_config")
+        st = slot.get("stock_selection_config")
+        o = slot.get("operational_config")
+        ok = store.save(current_user, risk_config=r, strategy_config=s, stock_selection_config=st, operational_config=o)
+        if not ok:
+            return JSONResponse({"success": False, "message": "메인 설정 저장 실패."})
+        if r:
+            _apply_risk_config_dict_to_state(r)
+        if o:
+            _apply_operational_config_dict_to_state(o)
+        if s:
+            _apply_strategy_config_dict_to_state(s)
+        if st and getattr(state, "stock_selector", None):
+            try:
+                _apply_stock_selection_config_dict_to_state(st)
+            except Exception:
+                pass
+        return JSONResponse({"success": True, "message": f"커스텀 슬롯 {slot_id}을(를) 메인 설정으로 불러왔습니다.", "slot_id": slot_id})
+    except Exception as e:
+        logger.exception("Custom slot load error")
+        return JSONResponse({"success": False, "message": str(e)})
 
 
 @app.get("/api/profile")
@@ -4663,6 +5552,11 @@ def initialize_trading_system(
         state.risk_manager = risk_manager
         state.strategy = strategy
         state.trenv = trenv
+        # 동시 보유 종목 수로 매수 거절 직전에 체결 확인 1회 실행(접수대기→체결 반영 지연 보정)
+        try:
+            state.risk_manager.on_before_max_positions_reject = lambda: _reconcile_pending_orders_sync(10, 0.0)
+        except Exception:
+            pass
         state.is_paper_trading = is_paper_trading
         if not getattr(state, "buy_window_start_hhmm", None):
             state.buy_window_start_hhmm = "09:05"

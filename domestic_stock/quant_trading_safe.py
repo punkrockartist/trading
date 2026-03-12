@@ -241,10 +241,17 @@ class RiskManager:
         if trade_amount > max_position_value:
             return False, f"포지션 크기 초과 (최대: {max_position_value:,.0f}원, 계좌의 {self.max_position_size_ratio*100}%)"
         
-        # 4-1. 동시 보유 종목 수 상한 (0이면 미적용)
+        # 4-1. 동시 보유 종목 수 상한 (0이면 미적용). 거절 직전에 체결 확인 훅 실행 후 재검사(접수대기→체결 반영 지연 보정)
         max_pos = int(getattr(self, "max_positions_count", 0) or 0)
         if max_pos > 0 and len(self.positions) >= max_pos:
-            return False, f"동시 보유 종목 수 상한 도달 (최대 {max_pos}종목)"
+            try:
+                hook = getattr(self, "on_before_max_positions_reject", None)
+                if callable(hook):
+                    hook()
+            except Exception:
+                pass
+            if len(self.positions) >= max_pos:
+                return False, f"동시 보유 종목 수 상한 도달 (최대 {max_pos}종목)"
         
         # 5. 기존 포지션 체크 (중복 매수 방지)
         if stock_code in self.positions:
@@ -487,16 +494,51 @@ class RiskManager:
 
     def _update_position_impl(self, stock_code: str, price: float, quantity: int, action: str):
         if action == "buy":
-            self.positions[stock_code] = {
-                "buy_price": price,
-                "quantity": quantity,
-                "buy_time": datetime.now(),
-                "partial_taken": False,
-                "current_price": float(price),
-            }
-            self.daily_trades += 1  # 매수 시 거래 횟수 증가
-            self.last_prices[stock_code] = price
-            self._highest_price[stock_code] = float(price)
+            # 추가 매수 지원: 기존 포지션이 있으면 수량 누적 + 평단 갱신
+            now_dt = datetime.now()
+            try:
+                px = float(price)
+            except Exception:
+                px = float(price or 0)
+            try:
+                q = int(quantity or 0)
+            except Exception:
+                q = 0
+            if q <= 0 or px <= 0:
+                return 0.0
+            if stock_code in self.positions:
+                pos = self.positions[stock_code]
+                old_qty = int(pos.get("quantity") or 0)
+                old_px = float(pos.get("buy_price") or 0)
+                new_qty = old_qty + q
+                if new_qty > 0:
+                    # 가중평균 평단
+                    avg_px = ((old_px * old_qty) + (px * q)) / float(new_qty) if old_qty > 0 and old_px > 0 else px
+                    pos["buy_price"] = float(avg_px)
+                    pos["quantity"] = int(new_qty)
+                    # buy_time은 최초 진입 시각 유지(옵션). 이미 없으면 설정.
+                    if not pos.get("buy_time"):
+                        pos["buy_time"] = now_dt
+                    pos["current_price"] = float(px)
+                    pos["partial_taken"] = bool(pos.get("partial_taken", False))
+                # 최고가 추적은 최신가/기존 최고가 중 큰 값
+                try:
+                    prev_high = float(self._highest_price.get(stock_code) or 0.0)
+                except Exception:
+                    prev_high = 0.0
+                self._highest_price[stock_code] = max(prev_high, float(px))
+            else:
+                self.positions[stock_code] = {
+                    "buy_price": float(px),
+                    "quantity": int(q),
+                    "buy_time": now_dt,
+                    "partial_taken": False,
+                    "current_price": float(px),
+                }
+                self._highest_price[stock_code] = float(px)
+            # 매수 시 거래 횟수 증가(일일 매수 횟수 제한용)
+            self.daily_trades += 1
+            self.last_prices[stock_code] = float(px)
         elif action == "sell":
             if stock_code in self.positions:
                 pos = self.positions[stock_code]

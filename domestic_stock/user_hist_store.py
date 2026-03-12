@@ -164,6 +164,12 @@ class DynamoDBUserHistStore:
             reason = trade_info.get("reason")
             if reason is not None:
                 item["reason"] = str(reason)
+            stock_name = trade_info.get("stock_name")
+            if stock_name not in (None, ""):
+                item["stock_name"] = str(stock_name).strip()[:80]
+            order_status = trade_info.get("order_status")
+            if order_status not in (None, ""):
+                item["order_status"] = str(order_status).strip()[:40]
 
             self._table.put_item(Item=item)
             return True
@@ -208,6 +214,8 @@ class DynamoDBUserHistStore:
                     "date": it.get("date"),
                     "time": it.get("time"),
                     "stock_code": it.get("stock_code"),
+                    "stock_name": it.get("stock_name") or "",
+                    "order_status": it.get("order_status") or "",
                     "order_type": it.get("order_type"),
                     "quantity": int(it.get("quantity") or 0),
                     "price": float(it.get("price") or 0),

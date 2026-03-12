@@ -70,7 +70,13 @@ class TradingState:
         self.latest_quotes: Dict[str, Dict] = {}
         
     async def broadcast(self, message: dict):
-        """모든 WebSocket 클라이언트에 메시지 전송"""
+        """모든 WebSocket 클라이언트에 메시지 전송. type=log 시 시스템 로그 파일에도 기록."""
+        if isinstance(message, dict) and message.get("type") == "log":
+            try:
+                from system_log import system_log_append
+                system_log_append(message.get("level", "info"), message.get("message", ""))
+            except Exception:
+                pass
         disconnected = []
         for client in self.websocket_clients:
             try:
@@ -85,6 +91,14 @@ class TradingState:
     def add_trade(self, trade_info: dict):
         """거래 내역 추가 (메모리 + quant_trading_user_hist, 10일 보관)"""
         import time as _time
+        if trade_info.get("stock_code") and "stock_name" not in trade_info:
+            code = str(trade_info["stock_code"]).strip().zfill(6)
+            for item in (getattr(self, "selected_stock_info", None) or []):
+                if str(item.get("code", "")).strip().zfill(6) == code:
+                    trade_info["stock_name"] = str(item.get("name", "")).strip()
+                    break
+            else:
+                trade_info["stock_name"] = ""
         trade_info["timestamp"] = datetime.now().isoformat()
         self.trade_history.append(trade_info)
         if len(self.trade_history) > 100:
@@ -217,7 +231,7 @@ class StockSelectionConfig(BaseModel):
 
 
 class OperationalConfig(BaseModel):
-    """운영 옵션: 자동 리밸런싱, 성과 기반 자동 추천, WS 재연결·긴급 청산"""
+    """운영 옵션: 자동 리밸런싱, 성과 기반 자동 추천, WS 재연결·긴급 청산, 매일 자동 시작/종료"""
     enable_auto_rebalance: bool = False
     auto_rebalance_interval_minutes: int = 30
     enable_performance_auto_recommend: bool = False
@@ -225,6 +239,12 @@ class OperationalConfig(BaseModel):
     ws_reconnect_sleep_sec: int = 5  # WebSocket 끊김 후 재연결 대기(초)
     emergency_liquidate_disconnect_minutes: int = 0  # 단절 N분 초과 시 전량 매도(0=미적용)
     keep_previous_on_empty_selection: bool = True  # 종목 선정 결과 0건 시 이전 목록 유지
+    # 매일 자동 시작/종료 (KST)
+    auto_schedule_enabled: bool = False
+    auto_start_hhmm: str = "09:30"
+    auto_stop_hhmm: str = "12:00"
+    liquidate_on_auto_stop: bool = True  # 자동 종료 시 보유 종목 청산 여부
+    auto_schedule_username: str = ""  # 비면 admin 사용
 
 
 class StrategyConfig(BaseModel):
@@ -324,6 +344,8 @@ class StrategyConfig(BaseModel):
     relative_strength_margin_pct: float = 0.0  # 종목 변동률 > 지수 변동률 + margin(%) 일 때만 매수
     # 5. 장 마감 전 N분 신규 매수 스킵 (0이면 미적용)
     last_minutes_no_buy: int = 0
+    # 5-1. 당일(세션) 고점 대비 N% 이상 하락 시 매수 스킵 (하락추세 진입 방지). 0=미적용
+    skip_buy_below_high_pct: float = 0.0
     # 6. 등락 비율 하락장 시 매수 스킵 강화: 상승 비율 < 50%이면 전량 스킵
     advance_ratio_down_market_skip: bool = True
 
@@ -772,8 +794,15 @@ from quant_dashboard_api import *
 # ============================================================================
 
 if __name__ == "__main__":
+    import sys
+    # Windows 기본 ProactorEventLoop는 Ctrl+C 종료 시 __del__에서 _ssock None → AttributeError가
+    # "Exception ignored in BaseEventLoop.__del__"로 남는 경우가 있음. SelectorEventLoop로 바꿔 해당 경로 회피.
+    if sys.platform == "win32":
+        import asyncio
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     from quant_dashboard_api import initialize_trading_system
-    
+
     # 시스템 초기화
     initialize_trading_system(account_balance=100000, is_paper_trading=True)
     
@@ -784,5 +813,9 @@ if __name__ == "__main__":
     print("기본 계정: admin / admin123")
     print("종료하려면 Ctrl+C를 누르세요")
     print("=" * 80)
-    
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    except KeyboardInterrupt:
+        print("\n종료합니다.")
+    # Windows에서 Ctrl+C 후 "Exception ignored in: BaseEventLoop.__del__" / "'NoneType' object has no attribute 'close'"
+    # 는 asyncio ProactorEventLoop 정리 순서 이슈로, 동작에는 영향 없음. (Python 이슈)
