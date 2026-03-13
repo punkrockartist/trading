@@ -2760,6 +2760,7 @@ def _start_trading_engine_thread():
                                                         _record_buy_skip(stock_code, "sap_deviation")
                                                         _throttled_skip_log(stock_code, "SAP 데이터 부족(분봉 2개 미만) → 매수 스킵")
                                                         continue
+                                                    # 기본 이탈 상한: 평균가에서 너무 멀리 벗어나면 스킵
                                                     if abs(result[1]) > max_dev_pct:
                                                         _record_buy_skip(stock_code, "sap_deviation")
                                                         _throttled_skip_log(
@@ -2767,6 +2768,24 @@ def _start_trading_engine_thread():
                                                             f"SAP 이탈 과대(|{result[1]:.2f}%| > {max_dev_pct}%)",
                                                         )
                                                         continue
+                                                    # 선택적 SAP 풀백 진입 모드: 평균가 대비 하단 특정 구간에서만 신규 매수 허용
+                                                    try:
+                                                        if bool(getattr(state, "use_sap_revert_entry", False)):
+                                                            entry_from = float(getattr(state, "sap_revert_entry_from_pct", -2.5) or -2.5)
+                                                            entry_to = float(getattr(state, "sap_revert_entry_to_pct", -1.0) or -1.0)
+                                                            low = min(entry_from, entry_to)
+                                                            high = max(entry_from, entry_to)
+                                                            dev = float(result[1])
+                                                            # dev는 음수(하단)일 때만 의미 있게 사용. 범위 밖이면 매수 스킵.
+                                                            if not (low <= dev <= high):
+                                                                _record_buy_skip(stock_code, "sap_revert_window")
+                                                                _throttled_skip_log(
+                                                                    stock_code,
+                                                                    f"SAP 풀백 범위 밖으로 신규 매수 스킵(dev={dev:.2f}% not in [{low:.1f}%,{high:.1f}%])",
+                                                                )
+                                                                continue
+                                                    except Exception:
+                                                        pass
                                         except Exception:
                                             pass
 
@@ -5054,6 +5073,10 @@ async def update_strategy_config(config: StrategyConfig, current_user: str = Dep
         state.max_spread_ratio = float(getattr(config, "max_spread_ratio", getattr(state, "max_spread_ratio", 0.0)) or 0.0)
         state.range_lookback_ticks = int(getattr(config, "range_lookback_ticks", getattr(state, "range_lookback_ticks", 0)) or 0)
         state.min_range_ratio = float(getattr(config, "min_range_ratio", getattr(state, "min_range_ratio", 0.0)) or 0.0)
+        # SAP 기반 풀백 진입 보조 (평균가 대비 하단 구간에서만 매수 허용)
+        state.use_sap_revert_entry = bool(getattr(config, "use_sap_revert_entry", getattr(state, "use_sap_revert_entry", False)))
+        state.sap_revert_entry_from_pct = float(getattr(config, "sap_revert_entry_from_pct", getattr(state, "sap_revert_entry_from_pct", -2.5)) or -2.5)
+        state.sap_revert_entry_to_pct = float(getattr(config, "sap_revert_entry_to_pct", getattr(state, "sap_revert_entry_to_pct", -1.0)) or -1.0)
         # 2~6번: 진입 거래량/거래대금 하한, 장초 N분 스킵, 지수 상대강도, 마감 전 N분 스킵, 하락장 스킵 강화
         state.min_volume_ratio_for_entry = max(0.0, min(5.0, float(getattr(config, "min_volume_ratio_for_entry", 0.0) or 0.0)))
         state.min_trade_amount_ratio_for_entry = max(0.0, min(5.0, float(getattr(config, "min_trade_amount_ratio_for_entry", 0.0) or 0.0)))

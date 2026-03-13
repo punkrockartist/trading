@@ -349,6 +349,11 @@ class StrategyConfig(BaseModel):
     skip_buy_below_high_pct: float = 0.0
     # 6. 등락 비율 하락장 시 매수 스킵 강화: 상승 비율 < 50%이면 전량 스킵
     advance_ratio_down_market_skip: bool = True
+    # SAP 기반 풀백/역추세 진입 보조: 당일 세션 평균가(SAP) 대비 하단 구간에서만 매수 허용
+    use_sap_revert_entry: bool = False
+    # 예: -2.5~-1.0 구간에서만 진입 (평균가보다 1~2.5% 아래에서만 진입)
+    sap_revert_entry_from_pct: float = -2.5
+    sap_revert_entry_to_pct: float = -1.0
 
 class ManualOrder(BaseModel):
     stock_code: str

@@ -1567,6 +1567,22 @@ def get_dashboard_html(username: str) -> str:
                             <input type="number" id="min_range_pct" value="0" step="0.01" min="0" max="20">
                         </div>
                         <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="use_sap_revert_entry">
+                                SAP 풀백 진입 보조 사용 <code class="setting-var">use_sap_revert_entry</code>
+                            </label>
+                            <div class="hint">당일 세션 평균가(SAP) 대비 특정 하단 구간(%)에서만 신규 매수 허용. MA 크로스+필터가 모두 통과해도 SAP 범위를 벗어나면 매수 스킵.</div>
+                        </div>
+                        <div class="form-group">
+                            <label>SAP 풀백 진입 구간(%): <code class="setting-var">sap_revert_entry_from_pct</code> ~ <code class="setting-var">sap_revert_entry_to_pct</code></label>
+                            <div style="display:flex; align-items:center; gap:6px;">
+                                <input type="number" id="sap_revert_entry_from_pct" value="-2.5" step="0.1" min="-20" max="0">
+                                <span>~</span>
+                                <input type="number" id="sap_revert_entry_to_pct" value="-1.0" step="0.1" min="-20" max="0">
+                            </div>
+                            <div class="hint">예: -2.5 ~ -1.0 → SAP보다 1~2.5% 아래 구간에서만 신규 매수 허용.</div>
+                        </div>
+                        <div class="form-group">
                             <label>진입 거래량 하한(평균 대비 배수, 0=미적용):</label>
                             <input type="number" id="min_volume_ratio_for_entry" value="0" step="0.1" min="0" max="5">
                         </div>
@@ -3939,6 +3955,9 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     if (strat.relative_strength_index_code != null) {{ const el = document.getElementById('relative_strength_index_code'); if (el) el.value = strat.relative_strength_index_code; }}
                     if (strat.relative_strength_margin_pct != null) document.getElementById('relative_strength_margin_pct').value = strat.relative_strength_margin_pct;
                     if (strat.advance_ratio_down_market_skip != null) document.getElementById('advance_ratio_down_market_skip').checked = !!strat.advance_ratio_down_market_skip;
+                    if (strat.use_sap_revert_entry != null) document.getElementById('use_sap_revert_entry').checked = !!strat.use_sap_revert_entry;
+                    if (strat.sap_revert_entry_from_pct != null) document.getElementById('sap_revert_entry_from_pct').value = strat.sap_revert_entry_from_pct;
+                    if (strat.sap_revert_entry_to_pct != null) document.getElementById('sap_revert_entry_to_pct').value = strat.sap_revert_entry_to_pct;
                 }}
                 if (stocksel) {{
                     const preset = document.getElementById('preset_select');
@@ -4177,6 +4196,9 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     relative_strength_index_code: (document.getElementById('relative_strength_index_code')?.value || '0001').trim(),
                     relative_strength_margin_pct: parseFloat(document.getElementById('relative_strength_margin_pct')?.value) || 0,
                     advance_ratio_down_market_skip: !!document.getElementById('advance_ratio_down_market_skip')?.checked,
+                    use_sap_revert_entry: !!document.getElementById('use_sap_revert_entry')?.checked,
+                    sap_revert_entry_from_pct: parseFloat(document.getElementById('sap_revert_entry_from_pct')?.value) || -2.5,
+                    sap_revert_entry_to_pct: parseFloat(document.getElementById('sap_revert_entry_to_pct')?.value) || -1.0,
                 }};
                 const response = await fetch('/api/config/strategy', {{
                     method: 'POST',
