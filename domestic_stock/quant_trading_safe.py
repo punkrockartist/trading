@@ -115,6 +115,7 @@ class RiskManager:
         
         # 거래 제한
         self.max_trades_per_day = 5  # 하루 최대 거래 횟수 (매수+매도 = 1회)
+        self.max_trades_per_stock_per_day = 0  # 종목당 하루 최대 거래 횟수. 0=미적용
         self.max_positions_count = 0  # 동시 보유 종목 수 상한. 0이면 제한 없음
         self.min_price_change_ratio = 0.0  # 직전 틱 대비 최소 변동률. 0=미적용, 0.01=1% 이상 변동 시만 거래(급등 순간 위주)
         # 진입 변동성 상한: 틱 변동성(가격 대비)이 이 비율 초과면 매수 스킵. 0이면 미적용
@@ -130,6 +131,7 @@ class RiskManager:
         # 현재 상태 추적
         self.daily_trades = 0  # 거래 횟수 (매수+매도 = 1회)
         self.daily_pnl = 0.0
+        self._daily_trades_per_stock: Dict[str, int] = {}  # 종목별 당일 매수(거래) 횟수, 날짜 바뀌면 리셋
         self.positions: Dict[str, Dict] = {}  # {종목코드: {매수가, 수량, 시간}}
         self.last_prices: Dict[str, float] = {}  # 가격 변동 추적용
         self._price_history: Dict[str, list] = {}  # 변동성 계산용(최근 N틱 가격)
@@ -171,6 +173,7 @@ class RiskManager:
                 self._daily_limit_date = today_key
                 self.daily_trades = 0
                 self.daily_pnl = 0.0
+                self._daily_trades_per_stock = {}
             if ym_key and getattr(self, "_monthly_pnl_reset_ym", "") != ym_key:
                 self._monthly_pnl_reset_ym = ym_key
                 self._monthly_pnl = 0.0
@@ -185,9 +188,17 @@ class RiskManager:
         except Exception:
             pass
 
-        # 1. 일일 거래 횟수 체크
+        # 1. 일일 거래 횟수 체크 (전역)
         if self.daily_trades >= self.max_trades_per_day:
             return False, "일일 거래 횟수 초과"
+
+        # 1-1. 종목별 일일 거래 횟수 체크
+        max_per_stock = int(getattr(self, "max_trades_per_stock_per_day", 0) or 0)
+        if max_per_stock > 0:
+            per_stock = getattr(self, "_daily_trades_per_stock", None) or {}
+            cnt = int(per_stock.get(stock_code, 0) or 0)
+            if cnt >= max_per_stock:
+                return False, "종목별 일일 거래 횟수 초과"
         
         # 2. 일일 손익 한도 체크 (실현/합산 옵션)
         try:
@@ -538,6 +549,11 @@ class RiskManager:
                 self._highest_price[stock_code] = float(px)
             # 매수 시 거래 횟수 증가(일일 매수 횟수 제한용)
             self.daily_trades += 1
+            per_stock = getattr(self, "_daily_trades_per_stock", None)
+            if per_stock is None:
+                self._daily_trades_per_stock = {}
+                per_stock = self._daily_trades_per_stock
+            per_stock[stock_code] = per_stock.get(stock_code, 0) + 1
             self.last_prices[stock_code] = float(px)
         elif action == "sell":
             if stock_code in self.positions:

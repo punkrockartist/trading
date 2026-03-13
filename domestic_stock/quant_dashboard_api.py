@@ -43,6 +43,8 @@ _user_settings_store_init_error: Optional[str] = None
 _user_result_store = None
 _signal_skip_log_last_at: Dict[str, float] = {}
 _signal_skip_log_lock = threading.Lock()
+_last_atr_log_ts: Dict[str, float] = {}  # ATR 필터 로그 throttle (종목별 5분)
+_last_sap_log_ts: Dict[str, float] = {}  # SAP 필터 로그 throttle (종목별 5분)
 _skip_stats_lock = threading.Lock()
 
 # 지수 MA 시장 레짐 캐시: (key -> (current, ma, ts))
@@ -302,8 +304,9 @@ _FLUCT_DEFAULT = {
 
 def _get_advance_ratio(market_code: str) -> Optional[float]:
     """
-    등락률 순위 API(fluctuation)로 상승/하락 1페이지씩 조회해 상승 비율 반환.
-    market_code: 1001=코스닥, 0001=코스피. 반환값 0~1 또는 None(오류 시).
+    등락률 순위 API(fluctuation)로 상승/하락 각각 연속 조회해 전체 건수로 상승 비율 반환.
+    상승 비율 = 상승 종목 수 / (상승 종목 수 + 하락 종목 수). 0~1 또는 None(오류 시).
+    market_code: 1001=코스닥, 0001=코스피. 캐시 5분.
     """
     if not market_code or market_code not in ("1001", "0001"):
         return None
@@ -327,6 +330,7 @@ def _get_advance_ratio(market_code: str) -> Optional[float]:
             fid_div_cls_code="2",  # 하락만
             **_FLUCT_DEFAULT,
         )
+        # 연속 조회로 반환된 전체 상승/하락 종목 수 사용 (fluctuation 내부 연속 조회)
         up_cnt = len(up_df) if up_df is not None and not up_df.empty else 0
         down_cnt = len(down_df) if down_df is not None and not down_df.empty else 0
         total = up_cnt + down_cnt
@@ -334,6 +338,7 @@ def _get_advance_ratio(market_code: str) -> Optional[float]:
             ratio = 0.5
         else:
             ratio = float(up_cnt) / float(total)
+        logger.debug("advance_ratio %s: up=%d down=%d total=%d ratio=%.2f%%", market_code, up_cnt, down_cnt, total, ratio * 100.0)
         with _advance_ratio_cache_lock:
             _advance_ratio_cache[key] = (ratio, time.time())
         return ratio
@@ -438,7 +443,8 @@ def _get_trade_value_concentration_ok(
 
 def _get_atr_ratio_from_minute_bars(bars: list, current_price: float, period: int = 14) -> Optional[float]:
     """
-    분봉 리스트에서 ATR(14) 계산 후 현재가 대비 비율 반환. bars는 [{"m", "o","h","l","c"}, ...] 시간순.
+    분봉 리스트에서 ATR(period) 계산 후 현재가 대비 비율 반환. bars는 [{"m", "o","h","l","c"}, ...] 시간순.
+    봉이 period개 미만이면 None(데이터 부족). None이면 필터에서 매수 스킵 권장.
     반환: ATR/current_price (비율) 또는 None.
     """
     if not bars or period < 2 or current_price <= 0:
@@ -465,10 +471,15 @@ def _get_atr_ratio_from_minute_bars(bars: list, current_price: float, period: in
         return None
 
 
-def _get_sap_deviation_pct_from_minute_bars(bars: list, current_price: float) -> Optional[float]:
+# SAP: 1봉만 있으면 '세션 평균' 의미가 약하므로 최소 2봉부터 사용. 미달 시 None → 필터에서 매수 스킵
+MIN_SAP_BARS = 2
+
+
+def _get_sap_deviation_pct_from_minute_bars(bars: list, current_price: float) -> Optional[tuple]:
     """
     분봉으로 세션 평균가(SAP) 계산: (h+l+c)/3 의 평균. 이탈률 = (current - SAP) / SAP * 100.
-    반환: 이탈률(%) 또는 None.
+    봉이 MIN_SAP_BARS개 미만이면 None. None이면 필터에서 매수 스킵 권장.
+    반환: (sap, 이탈률(%)) 또는 None.
     """
     if not bars or current_price <= 0:
         return None
@@ -480,12 +491,13 @@ def _get_sap_deviation_pct_from_minute_bars(bars: list, current_price: float) ->
             c = float(b.get("c") or 0)
             if h > 0 or l_ > 0 or c > 0:
                 typicals.append((h + l_ + c) / 3.0)
-        if not typicals:
+        if not typicals or len(typicals) < MIN_SAP_BARS:
             return None
         sap = sum(typicals) / len(typicals)
         if sap <= 0:
             return None
-        return (float(current_price) - sap) / sap * 100.0
+        dev_pct = (float(current_price) - sap) / sap * 100.0
+        return (sap, dev_pct)
     except Exception:
         return None
 
@@ -849,7 +861,9 @@ async def _pending_order_reconciler_loop():
     last_balance_check_ts = time.time()
     last_rebalance_ts = 0.0
     last_recommend_ts = 0.0
+    last_advance_ratio_log_ts = 0.0
     BALANCE_CHECK_INTERVAL_SEC = 60.0
+    ADVANCE_RATIO_LOG_INTERVAL_SEC = 300  # 5분
 
     while True:
         try:
@@ -888,6 +902,22 @@ async def _pending_order_reconciler_loop():
                             await state.broadcast({"type": "log", "level": r.get("level", "info"), "message": f"[성과 추천] {r.get('message', '')}"})
                 except Exception as e:
                     logger.warning(f"성과 추천 오류(무시): {e}")
+
+            # 상승 종목 비율 필터 켜져 있을 때 5분마다 비율·설정 하한을 시스템 로그(대시보드+파일)에 기록
+            if bool(getattr(state, "advance_ratio_filter_enabled", False)) and (now_ts - last_advance_ratio_log_ts) >= ADVANCE_RATIO_LOG_INTERVAL_SEC:
+                last_advance_ratio_log_ts = now_ts
+                try:
+                    mkt = str(getattr(state, "advance_ratio_market", "1001") or "1001")
+                    min_pct = float(getattr(state, "advance_ratio_min_pct", 40.0) or 40.0)
+                    ratio = await asyncio.to_thread(_get_advance_ratio, mkt)
+                    if ratio is not None:
+                        ratio_pct = ratio * 100.0
+                        msg = f"상승 종목 비율(5분 갱신): {ratio_pct:.1f}% | 설정 하한(advance_ratio_min_pct): {min_pct:.0f}%"
+                    else:
+                        msg = f"상승 종목 비율(5분 갱신): 조회 실패 | 설정 하한(advance_ratio_min_pct): {min_pct:.0f}%"
+                    await state.broadcast({"type": "log", "level": "info", "message": msg})
+                except Exception as e:
+                    logger.warning("advance_ratio 로그 오류(무시): %s", e)
 
             try:
                 events = await asyncio.to_thread(
@@ -1109,6 +1139,8 @@ def _apply_risk_config_dict_to_state(d: dict) -> None:
             rm.partial_take_profit_fraction = float(d.get("partial_take_profit_fraction") or 0.5)
         if "max_trades_per_day" in d:
             rm.max_trades_per_day = int(d.get("max_trades_per_day") or 5)
+        if "max_trades_per_stock_per_day" in d:
+            rm.max_trades_per_stock_per_day = max(0, min(20, int(d.get("max_trades_per_stock_per_day") or 0)))
         if "max_intraday_vol_pct" in d:
             v = float(d.get("max_intraday_vol_pct") or 0)
             rm.max_intraday_vol_pct = max(0.0, min(20.0, v))
@@ -2679,7 +2711,23 @@ def _start_trading_engine_thread():
                                                     period_atr = max(2, min(30, int(getattr(state.risk_manager, "atr_period", 14)) or 14))
                                                     bars = (getattr(state, "_minute_bars", {}) or {}).get(stock_code) or []
                                                     atr_ratio = _get_atr_ratio_from_minute_bars(bars, float(current_price), period_atr)
-                                                    if atr_ratio is not None and (atr_ratio * 100.0) > max_atr_pct:
+                                                    if atr_ratio is not None:
+                                                        atr_value = atr_ratio * float(current_price)
+                                                        now_ts_atr = time.time()
+                                                        with _signal_skip_log_lock:
+                                                            last_atr = _last_atr_log_ts.get(stock_code) or 0.0
+                                                            if now_ts_atr - last_atr >= 300:
+                                                                _last_atr_log_ts[stock_code] = now_ts_atr
+                                                                _run_async_broadcast({
+                                                                    "type": "log",
+                                                                    "level": "info",
+                                                                    "message": f"ATR 필터 | {stock_code} ATR={atr_value:.0f}원 비율={atr_ratio*100:.2f}% 상한(atr_ratio_max_pct)={max_atr_pct}%",
+                                                                })
+                                                    if atr_ratio is None:
+                                                        _record_buy_skip(stock_code, "atr_cap")
+                                                        _throttled_skip_log(stock_code, f"ATR 데이터 부족(분봉 {period_atr}개 미만) → 매수 스킵")
+                                                        continue
+                                                    if (atr_ratio * 100.0) > max_atr_pct:
                                                         _record_buy_skip(stock_code, "atr_cap")
                                                         _throttled_skip_log(
                                                             stock_code,
@@ -2695,12 +2743,28 @@ def _start_trading_engine_thread():
                                                 max_dev_pct = float(getattr(state.risk_manager, "sap_deviation_max_pct", 3.0) or 3.0)
                                                 if max_dev_pct > 0:
                                                     bars = (getattr(state, "_minute_bars", {}) or {}).get(stock_code) or []
-                                                    dev_pct = _get_sap_deviation_pct_from_minute_bars(bars, float(current_price))
-                                                    if dev_pct is not None and abs(dev_pct) > max_dev_pct:
+                                                    result = _get_sap_deviation_pct_from_minute_bars(bars, float(current_price))
+                                                    if result is not None:
+                                                        sap, dev_pct = result
+                                                        now_ts_sap = time.time()
+                                                        with _signal_skip_log_lock:
+                                                            last_sap = _last_sap_log_ts.get(stock_code) or 0.0
+                                                            if now_ts_sap - last_sap >= 300:
+                                                                _last_sap_log_ts[stock_code] = now_ts_sap
+                                                                _run_async_broadcast({
+                                                                    "type": "log",
+                                                                    "level": "info",
+                                                                    "message": f"SAP 필터 | {stock_code} SAP={sap:.0f}원 이탈률={dev_pct:.2f}% 상한(sap_deviation_max_pct)={max_dev_pct}%",
+                                                                })
+                                                    if result is None:
+                                                        _record_buy_skip(stock_code, "sap_deviation")
+                                                        _throttled_skip_log(stock_code, "SAP 데이터 부족(분봉 2개 미만) → 매수 스킵")
+                                                        continue
+                                                    if abs(result[1]) > max_dev_pct:
                                                         _record_buy_skip(stock_code, "sap_deviation")
                                                         _throttled_skip_log(
                                                             stock_code,
-                                                            f"SAP 이탈 과대(|{dev_pct:.2f}%| > {max_dev_pct}%)",
+                                                            f"SAP 이탈 과대(|{result[1]:.2f}%| > {max_dev_pct}%)",
                                                         )
                                                         continue
                                         except Exception:
@@ -4824,6 +4888,7 @@ async def update_risk_config(config: RiskConfig, current_user: str = Depends(get
             state.risk_manager.sap_deviation_filter_enabled = False
             state.risk_manager.sap_deviation_max_pct = 3.0
         state.risk_manager.max_trades_per_day = config.max_trades_per_day
+        state.risk_manager.max_trades_per_stock_per_day = max(0, min(20, int(getattr(config, "max_trades_per_stock_per_day", 0) or 0)))
         state.risk_manager.max_position_size_ratio = config.max_position_size_ratio
         state.risk_manager.max_positions_count = max(0, min(50, int(getattr(config, "max_positions_count", 0) or 0)))
         state.risk_manager.trailing_stop_ratio = getattr(config, "trailing_stop_ratio", 0.0) or 0.0

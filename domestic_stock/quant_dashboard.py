@@ -181,6 +181,7 @@ class RiskConfig(BaseModel):
     # 변동성 틱 부족 시 하한(가격 대비 비율, 예: 0.005=0.5%). 장 초반 사이징 완화
     volatility_floor_ratio: float = 0.005
     max_trades_per_day: int
+    max_trades_per_stock_per_day: int = 0  # 종목당 일일 최대 거래 횟수. 0=미적용
     max_position_size_ratio: float
     max_positions_count: int = 0  # 동시 보유 종목 수 상한. 0=제한 없음
     trailing_stop_ratio: float = 0.0

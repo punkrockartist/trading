@@ -595,6 +595,12 @@ def get_dashboard_html(username: str) -> str:
             font-weight: 700;
             font-size: 13px;
         }}
+        .setting-var {{
+            font-size: 11px;
+            color: var(--muted);
+            font-weight: normal;
+            margin-left: 6px;
+        }}
         .hint {{
             color: var(--muted);
             font-size: 12px;
@@ -957,15 +963,15 @@ def get_dashboard_html(username: str) -> str:
                 <h2>리스크 관리</h2>
                     <div class="hint" id="risk_summary"></div>
                 <div class="form-group">
-                    <label>최대 거래 금액 (원):</label>
+                    <label>최대 거래 금액 (원): <code class="setting-var">max_single_trade_amount</code></label>
                     <input type="number" id="max_trade_amount" value="1000000">
                 </div>
                     <div class="form-group">
-                        <label>최소 매수 수량(주):</label>
+                        <label>최소 매수 수량(주): <code class="setting-var">min_order_quantity</code></label>
                         <input type="number" id="min_order_quantity" value="1" min="1" max="1000">
                     </div>
                 <div class="form-group">
-                    <label>손절매 비율 (%):</label>
+                    <label>손절매 비율 (%): <code class="setting-var">stop_loss_pct</code></label>
                     <input type="number" id="stop_loss" value="1" step="0.1" min="0.1" max="10" title="오전 단타는 0.5~1.2% 권장">
                     <div class="hint">오전 단타: 0.5~1.2% 권장. 2%는 스윙에 가깝습니다.</div>
                 </div>
@@ -974,19 +980,24 @@ def get_dashboard_html(username: str) -> str:
                     <input type="number" id="take_profit" value="2" step="0.1" min="0.2" max="20">
                 </div>
                 <div class="form-group">
-                    <label>일일 손실 한도 (원):</label>
+                    <label>일일 손실 한도 (원): <code class="setting-var">daily_loss_limit</code></label>
                     <input type="number" id="daily_loss_limit" value="50000" min="0" step="10000">
                 </div>
                     <div class="form-group">
-                        <label>일일 손실 한도 기준:</label>
+                        <label>일일 손실 한도 기준: <code class="setting-var">daily_loss_limit_basis</code></label>
                         <select id="daily_loss_limit_basis">
                             <option value="realized">실현(체결 손익)</option>
                             <option value="total">실현+미실현(가정)</option>
                         </select>
                     </div>
                     <div class="form-group">
-                        <label>일일 최대 거래 횟수 (매수+매도=1회):</label>
+                        <label>일일 최대 거래 횟수 (매수+매도=1회): <code class="setting-var">max_trades_per_day</code></label>
                         <input type="number" id="max_trades_per_day" value="5" min="1" max="50">
+                    </div>
+                    <div class="form-group">
+                        <label>종목별 일일 최대 거래 횟수 (0=미적용): <code class="setting-var">max_trades_per_stock_per_day</code></label>
+                        <input type="number" id="max_trades_per_stock_per_day" value="0" min="0" max="20" title="각 종목당 오늘 N회까지 매수 허용. 0이면 전역만 적용">
+                        <div class="hint">0=미적용(전역 max_trades_per_day만 적용). 1~2 권장. 한 종목이 휩쏘로 횟수를 다 쓰는 것 방지.</div>
                     </div>
                     <div class="form-group">
                         <label>동시 보유 종목 수 상한 (0=제한 없음):</label>
@@ -1093,34 +1104,34 @@ def get_dashboard_html(username: str) -> str:
                             <div class="hint">예: 0.005=0.5%. 틱 부족 시 이 비율로 risk 계산.</div>
                         </div>
                         <div class="form-group">
-                            <label>진입 변동성 상한 (%):</label>
+                            <label>진입 변동성 상한 (%): <code class="setting-var">max_intraday_vol_pct</code></label>
                             <input type="number" id="max_intraday_vol_pct" value="0" min="0" max="20" step="0.5" title="틱 변동성(가격 대비)이 이 값 초과면 매수 스킵. 0=미적용">
                             <div class="hint">0이면 미적용. 예: 3 = 최근 틱 변동성 3% 초과 시 진입 안 함.</div>
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="atr_filter_enabled">
-                                ATR(분봉) 변동성 필터
+                                ATR(분봉) 변동성 필터 <code class="setting-var">atr_filter_enabled</code>
                             </label>
                             <div class="hint">분봉으로 ATR 계산. ATR/현재가 비율이 상한 초과면 매수 스킵. 0=미적용.</div>
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label>ATR 기간(봉):</label>
+                            <label>ATR 기간(봉): <code class="setting-var">atr_period</code></label>
                             <input type="number" id="atr_period" value="14" min="2" max="30">
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label>ATR 비율 상한(%):</label>
+                            <label>ATR 비율 상한(%): <code class="setting-var">atr_ratio_max_pct</code></label>
                             <input type="number" id="atr_ratio_max_pct" value="0" step="0.1" min="0" max="20" placeholder="0=미적용">
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="sap_deviation_filter_enabled">
-                                SAP(세션 평균가) 이탈 필터
+                                SAP(세션 평균가) 이탈 필터 <code class="setting-var">sap_deviation_filter_enabled</code>
                             </label>
                             <div class="hint">당일 분봉 (H+L+C)/3 평균 대비 이탈률이 상한 초과면 매수 스킵(과열/과매도 구간).</div>
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label>이탈률 상한(%):</label>
+                            <label>이탈률 상한(%): <code class="setting-var">sap_deviation_max_pct</code></label>
                             <input type="number" id="sap_deviation_max_pct" value="3" step="0.5" min="0.5" max="20">
                         </div>
                         <details>
@@ -1152,7 +1163,7 @@ def get_dashboard_html(username: str) -> str:
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="use_atr_for_stop_take">
-                                ATR(틱 변동성) 배수 손절/익절 사용
+                                ATR(틱 변동성) 배수 손절/익절 사용 <code class="setting-var">use_atr_for_stop_take</code>
                             </label>
                             <div class="hint">체크 시 고정 비율 대신 변동성 배수로 손절/익절 거리 적용</div>
                         </div>
@@ -1169,7 +1180,7 @@ def get_dashboard_html(username: str) -> str:
                             <input type="number" id="atr_lookback_ticks" value="20" min="2" max="300">
                         </div>
                         <div class="form-group">
-                            <label>주문 허용 최소 가격 변동(%):</label>
+                            <label>주문 허용 최소 가격 변동(%): <code class="setting-var">min_price_change_ratio</code></label>
                             <input type="number" id="min_price_change_ratio_pct" value="0" step="0.1" min="0" max="10" title="직전 1틱 대비 이만큼 변동해야 매수 실행. 0=미적용(보통 권장), 1% 이상=급등 순간만 매수">
                             <span class="hint">직전 틱 대비. 0=미적용(보편적), 1% 이상이면 급등한 순간만 허용</span>
                         </div>
@@ -1203,11 +1214,11 @@ def get_dashboard_html(username: str) -> str:
                         </div>
                     </div>
                     <div class="form-group">
-                        <label>단기 이동평균 (틱):</label>
+                        <label>단기 이동평균 (틱): <code class="setting-var">short_ma_period</code></label>
                         <input type="number" id="short_ma_period" value="3" min="2" max="60">
                     </div>
                     <div class="form-group">
-                        <label>장기 이동평균 (틱):</label>
+                        <label>장기 이동평균 (틱): <code class="setting-var">long_ma_period</code></label>
                         <input type="number" id="long_ma_period" value="10" min="3" max="200">
                     </div>
                     <div class="form-group">
@@ -1388,7 +1399,7 @@ def get_dashboard_html(username: str) -> str:
                             </div>
                         </div>
                         <div class="form-group">
-                            <label>재진입 쿨다운(초):</label>
+                            <label>재진입 쿨다운(초): <code class="setting-var">reentry_cooldown_seconds</code></label>
                             <input type="number" id="reentry_cooldown_seconds" value="0" min="0" max="3600">
                         </div>
                         <div class="form-group">
@@ -1409,7 +1420,7 @@ def get_dashboard_html(username: str) -> str:
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="circuit_breaker_filter_enabled" checked>
-                                거래소 서킷(급락) 필터
+                                거래소 서킷(급락) 필터 <code class="setting-var">circuit_breaker_filter_enabled</code>
                             </label>
                             <div class="hint">전일 대비 지수 하락률이 N% 이하이면 신규 매수 스킵. KRX 1단계 서킷(~-8%) 직전 대응.</div>
                         </div>
@@ -1436,7 +1447,7 @@ def get_dashboard_html(username: str) -> str:
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="sidecar_filter_enabled" checked>
-                                사이드카 구간 필터
+                                사이드카 구간 필터 <code class="setting-var">sidecar_filter_enabled</code>
                             </label>
                             <div class="hint">지수 ±5%(코스피)/±6%(코스닥) 변동 시 N분간 신규 매수 스킵. KRX 프로그램매매 5분 정지에 맞춤.</div>
                         </div>
@@ -1463,7 +1474,7 @@ def get_dashboard_html(username: str) -> str:
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="vi_filter_enabled" checked>
-                                VI(종목별 변동성완화장치) 필터
+                                VI(종목별 변동성완화장치) 필터 <code class="setting-var">vi_filter_enabled</code>
                             </label>
                             <div class="hint">VI 발동 종목은 N분간 해당 종목만 매수 스킵.</div>
                         </div>
@@ -1474,25 +1485,25 @@ def get_dashboard_html(username: str) -> str:
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="index_ma_filter_enabled">
-                                지수 MA 시장 레짐 필터
+                                지수 MA 시장 레짐 필터 <code class="setting-var">index_ma_filter_enabled</code>
                             </label>
                             <div class="hint">지수(코스닥/코스피)가 N일 MA 미만이면 매수 전부 스킵. 하락장 진입 억제.</div>
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label>지수:</label>
+                            <label>지수: <code class="setting-var">index_ma_code</code></label>
                             <select id="index_ma_code">
                                 <option value="1001">코스닥(1001)</option>
                                 <option value="0001">코스피(0001)</option>
                             </select>
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label>MA 기간(일):</label>
+                            <label>MA 기간(일): <code class="setting-var">index_ma_period</code></label>
                             <input type="number" id="index_ma_period" value="20" min="5" max="60">
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="advance_ratio_filter_enabled">
-                                상승 종목 비율 시장 레짐 필터
+                                상승 종목 비율 시장 레짐 필터 <code class="setting-var">advance_ratio_filter_enabled</code>
                             </label>
                             <div class="hint">등락률 순위 API 기준 상승/하락 건수 비율. N% 미만이면 매수 스킵.</div>
                         </div>
@@ -1504,19 +1515,19 @@ def get_dashboard_html(username: str) -> str:
                             </select>
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label>상승 비율 하한(%):</label>
+                            <label>상승 비율 하한(%): <code class="setting-var">advance_ratio_min_pct</code></label>
                             <input type="number" id="advance_ratio_min_pct" value="40" min="0" max="100" step="5">
                         </div>
                         <div class="form-group" style="margin-left:12px;">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="advance_ratio_down_market_skip" checked>
-                                하락장 강화(상승비율 &lt;50% 시 전량 매수 스킵)
+                                하락장 강화(상승비율 &lt;50% 시 전량 매수 스킵) <code class="setting-var">advance_ratio_down_market_skip</code>
                             </label>
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="trade_value_concentration_filter_enabled">
-                                거래대금 집중 시장 레짐 필터
+                                거래대금 집중 시장 레짐 필터 <code class="setting-var">trade_value_concentration_filter_enabled</code>
                             </label>
                             <div class="hint">상위 N종목 거래대금/상위 M종목 비율이 X% 초과면 매수 스킵(좁은 시장).</div>
                         </div>
@@ -1548,11 +1559,11 @@ def get_dashboard_html(username: str) -> str:
                             <input type="number" id="max_spread_pct" value="0" step="0.01" min="0" max="5">
                         </div>
                         <div class="form-group">
-                            <label>횡보장 제외: 최근 N틱</label>
+                            <label>횡보장 제외: 최근 N틱 <code class="setting-var">range_lookback_ticks</code></label>
                             <input type="number" id="range_lookback_ticks" value="0" min="0" max="300">
                         </div>
                         <div class="form-group">
-                            <label>횡보장 제외: 최소 레인지(%)</label>
+                            <label>횡보장 제외: 최소 레인지(%) <code class="setting-var">min_range_ratio</code></label>
                             <input type="number" id="min_range_pct" value="0" step="0.01" min="0" max="20">
                         </div>
                         <div class="form-group">
@@ -1564,22 +1575,22 @@ def get_dashboard_html(username: str) -> str:
                             <input type="number" id="min_trade_amount_ratio_for_entry" value="0" step="0.1" min="0" max="5">
                         </div>
                         <div class="form-group">
-                            <label>장 초반 매수 스킵(분, 09:00 KST 기준, 0=미적용):</label>
+                            <label>장 초반 매수 스킵(분, 09:00 KST 기준, 0=미적용): <code class="setting-var">skip_buy_first_minutes</code></label>
                             <input type="number" id="skip_buy_first_minutes" value="0" min="0" max="30">
                         </div>
                         <div class="form-group">
-                            <label>장 마감 전 N분 매수 스킵(0=미적용):</label>
+                            <label>장 마감 전 N분 매수 스킵(0=미적용): <code class="setting-var">last_minutes_no_buy</code></label>
                             <input type="number" id="last_minutes_no_buy" value="0" min="0" max="60">
                         </div>
                         <div class="form-group">
-                            <label>고점 대비 하락 시 매수 스킵(%):</label>
+                            <label>고점 대비 하락 시 매수 스킵(%): <code class="setting-var">skip_buy_below_high_pct</code></label>
                             <input type="number" id="skip_buy_below_high_pct" value="0" min="0" max="20" step="0.1" title="당일 세션 고점 대비 이 비율 이상 하락 시 매수 스킵. 0=미적용. 고점 꺾인 후 하락추세 진입 방지용(예: 1~2%).">
                             <div class="hint">0=미적용. 당일 고점 대비 N% 이상 내려온 구간에서는 매수하지 않습니다(하락추세 진입 방지).</div>
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="relative_strength_filter_enabled">
-                                지수 대비 상대 강도 필터(종목 변동률 &gt; 지수+margin일 때만 매수)
+                                지수 대비 상대 강도 필터(종목 변동률 &gt; 지수+margin일 때만 매수) <code class="setting-var">relative_strength_filter_enabled</code>
                             </label>
                         </div>
                         <div class="form-group" style="margin-left:12px;">
@@ -1840,6 +1851,10 @@ def get_dashboard_html(username: str) -> str:
                             <div class="help-item">
                                 <strong>일일 최대 거래 횟수 (<code>max_trades_per_day</code>)</strong>
                                 하루에 허용하는 <strong>매수</strong> 횟수입니다(매도는 제한 없음). 예: 5이면 매수를 최대 5번까지 할 수 있고, 그에 대응하는 매도는 제한 없이 가능합니다. <strong>적정값</strong>: 종목선정 “최대 선정 종목 수”(<code>max_stocks</code>)보다 작으면 선정된 종목을 전부 살 수 없으므로, <code>max_stocks</code> 이상으로 두는 것이 좋습니다. 여유를 두려면 max_stocks+2~max_stocks×1.5(예: 선정 5종목 → 5~8, 선정 10종목 → 10~15). 단타·보수적이면 5~8, 조금 더 유연하게 10~15.
+                            </div>
+                            <div class="help-item">
+                                <strong>종목별 일일 최대 거래 횟수 (<code>max_trades_per_stock_per_day</code>)</strong>
+                                0이면 미적용(전역 max_trades_per_day만 적용). 1 이상이면 각 종목당 오늘 N회까지만 매수 허용. 한 종목이 휩쏘로 전역 한도를 다 써버리는 것을 막을 수 있습니다. 1~2 권장.
                             </div>
                             <div class="help-item">
                                 <strong>동시 보유 종목 수 상한 (<code>max_positions_count</code>)</strong>
@@ -3804,6 +3819,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     if (risk.daily_total_loss_limit != null) document.getElementById('daily_total_loss_limit').value = risk.daily_total_loss_limit;
                     if (risk.daily_loss_limit_basis != null) document.getElementById('daily_loss_limit_basis').value = risk.daily_loss_limit_basis;
                     if (risk.max_trades_per_day != null) document.getElementById('max_trades_per_day').value = risk.max_trades_per_day;
+                    if (risk.max_trades_per_stock_per_day != null) document.getElementById('max_trades_per_stock_per_day').value = risk.max_trades_per_stock_per_day;
                     if (risk.max_positions_count != null) document.getElementById('max_positions_count').value = risk.max_positions_count;
                     if (risk.daily_profit_limit_basis != null) document.getElementById('daily_profit_limit_basis').value = risk.daily_profit_limit_basis;
                     if (risk.buy_order_style != null) document.getElementById('buy_order_style').value = risk.buy_order_style;
@@ -4049,6 +4065,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     sap_deviation_filter_enabled: !!document.getElementById('sap_deviation_filter_enabled')?.checked,
                     sap_deviation_max_pct: parseFloat(document.getElementById('sap_deviation_max_pct')?.value) || 3,
                     max_trades_per_day: parseInt(document.getElementById('max_trades_per_day')?.value) || 5,
+                    max_trades_per_stock_per_day: parseInt(document.getElementById('max_trades_per_stock_per_day')?.value) || 0,
                     max_positions_count: parseInt(document.getElementById('max_positions_count')?.value) || 0,
                     max_position_size_ratio: 0.1,
                     trailing_stop_ratio: (parseFloat(document.getElementById('trailing_stop_pct').value) || 0) / 100,
