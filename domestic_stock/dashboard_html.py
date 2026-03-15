@@ -1222,41 +1222,41 @@ def get_dashboard_html(username: str) -> str:
                         <input type="number" id="long_ma_period" value="10" min="3" max="200">
                     </div>
                     <div class="form-group">
-                        <label>진입 후 최소 보유 시간(초):</label>
+                        <label>진입 후 최소 보유 시간(초): <code class="setting-var">min_hold_seconds</code></label>
                         <input type="number" id="min_hold_seconds" value="0" min="0" max="600" title="매수 직후 데드크로스로 즉시 매도되는 것 방지. 0=미적용, 30~60 권장">
                         <span class="hint">0=미적용. 30~60초 권장(같은 가격에 매수→매도 반복 방지)</span>
                     </div>
                     <div class="form-group">
-                        <label>신규 매수 허용 시작 (HH:MM, KST):</label>
+                        <label>신규 매수 허용 시작 (HH:MM, KST): <code class="setting-var">buy_window_start_hhmm</code></label>
                         <input type="text" id="buy_window_start_hhmm" value="09:05" placeholder="09:05">
                     </div>
                     <div class="form-group">
-                        <label>신규 매수 허용 종료 (HH:MM, KST):</label>
+                        <label>신규 매수 허용 종료 (HH:MM, KST): <code class="setting-var">buy_window_end_hhmm</code></label>
                         <input type="text" id="buy_window_end_hhmm" value="11:30" placeholder="11:30">
                     </div>
 
                     <details>
                         <summary>고급(필터/쿨다운/보강/레짐/청산)</summary>
                         <div class="form-group">
-                            <label>단기MA 기울기 최소(%/틱):</label>
+                            <label>단기MA 기울기 최소(%/틱): <code class="setting-var">min_short_ma_slope_ratio</code></label>
                             <input type="number" id="min_short_ma_slope_pct" value="0" step="0.001" min="0" max="5">
                         </div>
                         <div class="form-group">
-                            <label>모멘텀 확인: 최근 N틱</label>
+                            <label>모멘텀 확인: 최근 N틱 <code class="setting-var">momentum_lookback_ticks</code></label>
                             <input type="number" id="momentum_lookback_ticks" value="0" min="0" max="200">
                         </div>
                         <div class="form-group">
-                            <label>모멘텀 최소 상승률(%)</label>
+                            <label>모멘텀 최소 상승률(%) <code class="setting-var">min_momentum_pct</code></label>
                             <input type="number" id="min_momentum_pct" value="0" step="0.01" min="0" max="20">
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="avoid_chase_near_high_enabled">
-                                진입 직전: 고점 근접 추격 회피
+                                진입 직전: 고점 근접 추격 회피 <code class="setting-var">avoid_chase_near_high_enabled</code>
                             </label>
                         </div>
                         <div class="form-group">
-                            <label>고점 lookback(분) / “고점 대비 하락폭” 최소(%)</label>
+                            <label>고점 lookback(분) / “고점 대비 하락폭” 최소(%) <code class="setting-var">near_high_lookback_minutes</code> / <code class="setting-var">avoid_near_high_pct</code></label>
                             <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
                                 <input type="number" id="near_high_lookback_minutes" value="2" min="1" max="30">
                                 <input type="number" id="avoid_near_high_pct" value="0.30" step="0.05" min="0" max="5">
@@ -1265,21 +1265,21 @@ def get_dashboard_html(username: str) -> str:
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="avoid_near_high_dynamic">
-                                고점근접 회피 임계값을 변동성 기반으로 자동 상향
+                                고점근접 회피 임계값을 변동성 기반으로 자동 상향 <code class="setting-var">avoid_near_high_dynamic</code>
                             </label>
                         </div>
                         <div class="form-group">
-                            <label>고점근접 정규화 배수(0=사용안함)</label>
+                            <label>고점근접 정규화 배수(0=사용안함) <code class="setting-var">avoid_near_high_vs_vol_mult</code></label>
                             <input type="number" id="avoid_near_high_vs_vol_mult" value="0" step="0.1" min="0" max="20">
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="minute_trend_enabled">
-                                진입 직전: 1~2분봉 추세 유지(양봉 유지)
+                                진입 직전: 1~2분봉 추세 유지(양봉 유지) <code class="setting-var">minute_trend_enabled</code>
                             </label>
                         </div>
                         <div class="form-group">
-                            <label>분봉 추세 모드:</label>
+                            <label>분봉 추세 모드: <code class="setting-var">minute_trend_mode</code></label>
                             <select id="minute_trend_mode">
                                 <option value="green">양봉 유지(개수)</option>
                                 <option value="higher_close">종가 상승 유지</option>
@@ -1290,11 +1290,11 @@ def get_dashboard_html(username: str) -> str:
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="minute_trend_early_only">
-                                분봉 추세 필터를 초반 레짐(09:00~종료)에서만 적용
+                                분봉 추세 필터를 초반 레짐(09:00~종료)에서만 적용 <code class="setting-var">minute_trend_early_only</code>
                             </label>
                         </div>
                         <div class="form-group">
-                            <label>분봉 lookback(개) / 최소 양봉 개수</label>
+                            <label>분봉 lookback(개) / 최소 양봉 개수 <code class="setting-var">minute_trend_lookback_bars</code> / <code class="setting-var">minute_trend_min_green_bars</code></label>
                             <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
                                 <input type="number" id="minute_trend_lookback_bars" value="2" min="1" max="5">
                                 <input type="number" id="minute_trend_min_green_bars" value="2" min="0" max="5">
@@ -1303,21 +1303,21 @@ def get_dashboard_html(username: str) -> str:
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="entry_confirm_enabled">
-                                진입 보강(2단) 사용: 추세 조건 + 아래 조건 중 N개 이상
+                                진입 보강(2단) 사용: 추세 조건 + 아래 조건 중 N개 이상 <code class="setting-var">entry_confirm_enabled</code>
                             </label>
                         </div>
                         <div class="form-group">
-                            <label>보강 조건 최소 충족 개수(N):</label>
+                            <label>보강 조건 최소 충족 개수(N): <code class="setting-var">entry_confirm_min_count</code></label>
                             <input type="number" id="entry_confirm_min_count" value="1" min="1" max="3">
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="confirm_breakout_enabled">
-                                (보강) 최근 N틱 신고가 돌파
+                                (보강) 최근 N틱 신고가 돌파 <code class="setting-var">confirm_breakout_enabled</code>
                             </label>
                         </div>
                         <div class="form-group">
-                            <label>돌파 lookback(N틱) / 버퍼(%)</label>
+                            <label>돌파 lookback(N틱) / 버퍼(%) <code class="setting-var">breakout_lookback_ticks</code> / <code class="setting-var">breakout_buffer_pct</code></label>
                             <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
                                 <input type="number" id="breakout_lookback_ticks" value="20" min="2" max="300">
                                 <input type="number" id="breakout_buffer_pct" value="0" step="0.01" min="0" max="5">
@@ -1326,11 +1326,11 @@ def get_dashboard_html(username: str) -> str:
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="confirm_volume_surge_enabled">
-                                (보강) 거래량 급증(틱 체결량)
+                                (보강) 거래량 급증(틱 체결량) <code class="setting-var">confirm_volume_surge_enabled</code>
                             </label>
                         </div>
                         <div class="form-group">
-                            <label>거래량 급증: lookback(N틱) / 배수</label>
+                            <label>거래량 급증: lookback(N틱) / 배수 <code class="setting-var">volume_surge_lookback_ticks</code> / <code class="setting-var">volume_surge_ratio</code></label>
                             <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
                                 <input type="number" id="volume_surge_lookback_ticks" value="20" min="2" max="200">
                                 <input type="number" id="volume_surge_ratio" value="2.0" step="0.1" min="1.0" max="20">
@@ -1339,59 +1339,59 @@ def get_dashboard_html(username: str) -> str:
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="confirm_trade_value_surge_enabled">
-                                (보강) 거래대금 급증(틱 체결량×가격)
+                                (보강) 거래대금 급증(틱 체결량×가격) <code class="setting-var">confirm_trade_value_surge_enabled</code>
                             </label>
                         </div>
                         <div class="form-group">
-                            <label>거래대금 급증: lookback(N틱) / 배수</label>
+                            <label>거래대금 급증: lookback(N틱) / 배수 <code class="setting-var">trade_value_surge_lookback_ticks</code> / <code class="setting-var">trade_value_surge_ratio</code></label>
                             <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
                                 <input type="number" id="trade_value_surge_lookback_ticks" value="20" min="2" max="200">
                                 <input type="number" id="trade_value_surge_ratio" value="2.0" step="0.1" min="1.0" max="50">
                             </div>
                         </div>
                         <div class="form-group">
-                            <label>변동성 정규화 lookback(N틱)</label>
+                            <label>변동성 정규화 lookback(N틱) <code class="setting-var">vol_norm_lookback_ticks</code></label>
                             <input type="number" id="vol_norm_lookback_ticks" value="20" min="2" max="300">
                         </div>
                         <div class="form-group">
-                            <label>slope 정규화 배수(0=사용안함)</label>
+                            <label>slope 정규화 배수(0=사용안함) <code class="setting-var">slope_vs_vol_mult</code></label>
                             <input type="number" id="slope_vs_vol_mult" value="0" step="0.1" min="0" max="20">
                         </div>
                         <div class="form-group">
-                            <label>range 정규화 배수(0=사용안함)</label>
+                            <label>range 정규화 배수(0=사용안함) <code class="setting-var">range_vs_vol_mult</code></label>
                             <input type="number" id="range_vs_vol_mult" value="0" step="0.1" min="0" max="20">
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="enable_morning_regime_split">
-                                오전장 레짐 분기(초반/메인) 사용
+                                오전장 레짐 분기(초반/메인) 사용 <code class="setting-var">enable_morning_regime_split</code>
                             </label>
                         </div>
                         <div class="form-group">
-                            <label>초반 레짐 종료(HH:MM, KST)</label>
+                            <label>초반 레짐 종료(HH:MM, KST) <code class="setting-var">morning_regime_early_end_hhmm</code></label>
                             <input type="text" id="morning_regime_early_end_hhmm" value="09:10" placeholder="09:10">
                         </div>
                         <div class="form-group">
-                            <label>초반 레짐: slope 최소(%/틱)</label>
+                            <label>초반 레짐: slope 최소(%/틱) <code class="setting-var">early_min_short_ma_slope_ratio</code></label>
                             <input type="number" id="early_min_short_ma_slope_pct" value="0" step="0.001" min="0" max="5">
                         </div>
                         <div class="form-group">
-                            <label>초반 레짐: 모멘텀 N틱 / 최소 상승률(%)</label>
+                            <label>초반 레짐: 모멘텀 N틱 / 최소 상승률(%) <code class="setting-var">early_momentum_lookback_ticks</code> / <code class="setting-var">early_min_momentum_pct</code></label>
                             <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
                                 <input type="number" id="early_momentum_lookback_ticks" value="0" min="0" max="200">
                                 <input type="number" id="early_min_momentum_pct" value="0" step="0.01" min="0" max="20">
                             </div>
                         </div>
                         <div class="form-group">
-                            <label>초반 레짐: 진입 확인(연속 틱 수)</label>
+                            <label>초반 레짐: 진입 확인(연속 틱 수) <code class="setting-var">early_buy_confirm_ticks</code></label>
                             <input type="number" id="early_buy_confirm_ticks" value="1" min="1" max="10">
                         </div>
                         <div class="form-group">
-                            <label>초반 레짐: 최대 스프레드(%)</label>
+                            <label>초반 레짐: 최대 스프레드(%) <code class="setting-var">early_max_spread_pct</code></label>
                             <input type="number" id="early_max_spread_pct" value="0" step="0.01" min="0" max="5">
                         </div>
                         <div class="form-group">
-                            <label>초반 레짐: 횡보장 제외(N틱/레인지%)</label>
+                            <label>초반 레짐: 횡보장 제외(N틱/레인지%) <code class="setting-var">early_range_lookback_ticks</code> / <code class="setting-var">early_min_range_pct</code></label>
                             <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:10px;">
                                 <input type="number" id="early_range_lookback_ticks" value="0" min="0" max="300">
                                 <input type="number" id="early_min_range_pct" value="0" step="0.01" min="0" max="20">
@@ -1405,16 +1405,16 @@ def get_dashboard_html(username: str) -> str:
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="consecutive_loss_cooldown_enabled">
-                                연속 손실 시 쿨다운 확대
+                                연속 손실 시 쿨다운 확대 <code class="setting-var">consecutive_loss_cooldown_enabled</code>
                             </label>
                             <div class="hint">연속 N회 손실 후, 재진입 쿨다운 × 배수만큼 대기 후 다음 매수 허용.</div>
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label>연속 손실 횟수 (N):</label>
+                            <label>연속 손실 횟수 (N): <code class="setting-var">consecutive_loss_count_threshold</code></label>
                             <input type="number" id="consecutive_loss_count_threshold" value="2" min="2" max="5">
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label>쿨다운 배수:</label>
+                            <label>쿨다운 배수: <code class="setting-var">consecutive_loss_cooldown_mult</code></label>
                             <input type="number" id="consecutive_loss_cooldown_mult" value="2" min="1" max="5" step="0.5">
                         </div>
                         <div class="form-group">
@@ -1425,18 +1425,18 @@ def get_dashboard_html(username: str) -> str:
                             <div class="hint">전일 대비 지수 하락률이 N% 이하이면 신규 매수 스킵. KRX 1단계 서킷(~-8%) 직전 대응.</div>
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label>지수:</label>
+                            <label>지수: <code class="setting-var">circuit_breaker_market</code></label>
                             <select id="circuit_breaker_market">
                                 <option value="0001">코스피(0001)</option>
                                 <option value="1001">코스닥(1001)</option>
                             </select>
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label>하락률 임계(%):</label>
+                            <label>하락률 임계(%): <code class="setting-var">circuit_breaker_threshold_pct</code></label>
                             <input type="number" id="circuit_breaker_threshold_pct" value="-7" min="-20" max="0" step="0.5" title="-7 = 7% 하락 시 스킵">
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label>서킷 시 동작:</label>
+                            <label>서킷 시 동작: <code class="setting-var">circuit_breaker_action</code></label>
                             <select id="circuit_breaker_action">
                                 <option value="skip_buy_only">신규 매수만 스킵</option>
                                 <option value="liquidate_all">전량 청산</option>
@@ -1452,18 +1452,18 @@ def get_dashboard_html(username: str) -> str:
                             <div class="hint">지수 ±5%(코스피)/±6%(코스닥) 변동 시 N분간 신규 매수 스킵. KRX 프로그램매매 5분 정지에 맞춤.</div>
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label>지수:</label>
+                            <label>지수: <code class="setting-var">sidecar_market</code></label>
                             <select id="sidecar_market">
                                 <option value="0001">코스피(0001)</option>
                                 <option value="1001">코스닥(1001)</option>
                             </select>
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label>냉각(분):</label>
+                            <label>냉각(분): <code class="setting-var">sidecar_cooling_minutes</code></label>
                             <input type="number" id="sidecar_cooling_minutes" value="5" min="1" max="30" title="변동 감지 후 매수 스킵 시간">
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label>사이드카 시 동작:</label>
+                            <label>사이드카 시 동작: <code class="setting-var">sidecar_action</code></label>
                             <select id="sidecar_action">
                                 <option value="skip_buy_only">신규 매수만 스킵</option>
                                 <option value="liquidate_all">전량 청산</option>

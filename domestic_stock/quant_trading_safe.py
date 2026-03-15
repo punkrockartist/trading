@@ -817,11 +817,20 @@ class QuantStrategy:
     def __init__(self, risk_manager: RiskManager):
         self.risk_manager = risk_manager
         self.price_history: Dict[str, list] = {}  # {종목코드: [가격 리스트]}
-        # 실시간 데이터에 맞게 짧은 기간으로 조정
-        self.short_ma_period = 3  # 단기 이동평균 (3틱)
-        self.long_ma_period = 10  # 장기 이동평균 (10틱)
+        # MA 기간 (휩쏘 완화: 5/20 등으로 조정 가능)
+        self.short_ma_period = 5  # 단기 이동평균 (틱)
+        self.long_ma_period = 20  # 장기 이동평균 (틱)
         self.min_history_length = self.long_ma_period  # 최소 히스토리 길이
-        self.min_hold_seconds = 0  # 진입 후 N초 이내 전략(데드크로스) 매도 방지. 0=미적용
+        # 휩쏘 완화: 진입 후 N초 이내 데드크로스 매도 방지
+        self.min_hold_seconds = 60  # 0=미적용
+        # 단기 MA 기울기 최소 비율 (가격 대비, 예: 0.001 = 0.1%/틱). 매수 시 단기 상승 추세 확인
+        self.min_short_ma_slope_ratio = 0.0  # 0=미적용
+        # 매수 시 가격이 short_ma 위로 최소 이격 (예: 0.001 = 0.1%). 살짝만 넘었다 내려가는 휩쏘 완화
+        self.min_price_above_short_ma_ratio = 0.001
+        # 크로스 확인: 직전 틱(offset=1)에서 반대 크로스였을 때만 신호. 1=적용, 0=미적용
+        self.cross_confirm_ticks = 1
+        # 급등락/갭 필터: 전틱 대비 변동률 상한(예: 0.02=2%). 초과 시 해당 틱 신호 무시
+        self.max_tick_change_ratio_for_signal = 0.02  # 0=미적용
         
     def update_price(self, stock_code: str, price: float):
         """가격 업데이트"""
@@ -869,7 +878,7 @@ class QuantStrategy:
     
     def get_signal(self, stock_code: str, current_price: float) -> Optional[str]:
         """
-        매매 신호 생성 (실시간 데이터 기반)
+        매매 신호 생성 (실시간 데이터 기반, 휩쏘 완화 필터 적용)
         
         Returns:
             "buy", "sell", or None
@@ -877,28 +886,56 @@ class QuantStrategy:
         # 가격 업데이트
         self.update_price(stock_code, current_price)
         
-        # 최소 히스토리가 없으면 신호 생성 안 함
         if stock_code not in self.price_history:
             return None
-        
         prices = self.price_history[stock_code]
         if len(prices) < self.min_history_length:
             return None
         
-        # 이동평균 계산
+        # 급등락/갭 필터: 전틱 대비 변동률이 너무 크면 해당 틱은 신호 무시
+        max_chg = float(getattr(self, "max_tick_change_ratio_for_signal", 0) or 0)
+        if max_chg > 0 and len(prices) >= 2:
+            prev_price = float(prices[-2])
+            if prev_price > 0:
+                chg_ratio = abs(current_price - prev_price) / prev_price
+                if chg_ratio > max_chg:
+                    return None
+        
         short_ma = self.calculate_ma(stock_code, self.short_ma_period)
         long_ma = self.calculate_ma(stock_code, self.long_ma_period)
-        
         if short_ma is None or long_ma is None:
             return None
         
-        # 골든크로스 (단기 > 장기): 매수 신호
-        if short_ma > long_ma and current_price > short_ma:
-            # 기존 포지션이 없을 때만 매수
-            if stock_code not in self.risk_manager.positions:
-                return "buy"
+        # ----- 매수 신호 (골든크로스) -----
+        if stock_code not in self.risk_manager.positions and short_ma > long_ma:
+            # 크로스 확인: 직전 틱에는 short <= long 이었을 때만 진짜 골든크로스 (매수에만 적용)
+            cross_confirm = int(getattr(self, "cross_confirm_ticks", 0) or 0)
+            if cross_confirm > 0:
+                prev_short = self.calculate_ma_offset(stock_code, self.short_ma_period, offset=1)
+                prev_long = self.calculate_ma_offset(stock_code, self.long_ma_period, offset=1)
+                if prev_short is None or prev_long is None:
+                    return None
+                if prev_short > prev_long:
+                    return None  # 직전에도 이미 short > long → 새 크로스 아님, 휩쏘 억제
+            
+            # 가격이 short_ma 위로 최소 이격 (휩쏘: 살짝만 넘었다 내려가는 구간 억제)
+            min_above = float(getattr(self, "min_price_above_short_ma_ratio", 0) or 0)
+            if current_price <= short_ma:
+                return None
+            if min_above > 0 and current_price < short_ma * (1 + min_above):
+                return None
+            
+            # 단기 MA 기울기 필터 (상승 추세 확인)
+            slope_min = float(getattr(self, "min_short_ma_slope_ratio", 0) or 0)
+            if slope_min > 0 and current_price > 0:
+                prev_short_ma = self.calculate_ma_offset(stock_code, self.short_ma_period, offset=1)
+                if prev_short_ma is not None:
+                    slope_ratio = (short_ma - prev_short_ma) / current_price
+                    if slope_ratio < slope_min:
+                        return None
+            return "buy"
         
-        # 데드크로스 (단기 < 장기): 매도 신호 (진입 후 최소 보유 시간 이내면 무시 → 매수 직후 즉시 매도 방지)
+        # ----- 매도 신호 (데드크로스) -----
         if short_ma < long_ma and stock_code in self.risk_manager.positions:
             min_hold = int(getattr(self, "min_hold_seconds", 0) or 0)
             if min_hold > 0:
