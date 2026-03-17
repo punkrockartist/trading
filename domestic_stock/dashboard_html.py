@@ -697,6 +697,7 @@ def get_dashboard_html(username: str) -> str:
             <button class="tab" data-tab="settings" onclick="showTab('settings')">설정</button>
                 <button class="tab" data-tab="signals" onclick="showTab('signals')">승인대기</button>
             <button class="tab" data-tab="trades" onclick="showTab('trades')">거래내역</button>
+            <button class="tab" data-tab="ai-report" onclick="showTab('ai-report')">AI 리포트</button>
             <button class="tab" data-tab="docs" onclick="showTab('docs')">Docs</button>
             </div>
             <div class="nav-right">
@@ -2198,6 +2199,40 @@ def get_dashboard_html(username: str) -> str:
             </div>
         </div>
 
+        <!-- AI 리포트 탭 -->
+        <div id="tab-ai-report" class="tab-content">
+            <div class="card">
+                <h2>AI 일일 리포트</h2>
+                <p class="hint">
+                    Domestic_stock 시스템 로그(<code>system_YYYYMMDD.log</code>), 거래내역(<code>quant_trading_user_hist</code>),
+                    설정(<code>quant_trading_user_settings</code>)을 기반으로 AI가 하루 성과·리스크·개선 제안을 요약합니다.
+                    서버 환경에 OpenAI SDK와 <code>OPENAI_API_KEY</code>가 설정되어 있어야 동작합니다.
+                </p>
+                <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; margin-bottom:12px;">
+                    <div class="form-group" style="margin:0; min-width:auto;">
+                        <label style="font-size:12px;">대상 일자</label>
+                        <input type="date" id="ai_report_date" style="width:16ch; padding:6px 8px; font-size:13px;">
+                    </div>
+                    <button type="button" class="btn btn-inline" onclick="loadAiDailyReport()" style="height:2rem; padding:0 10px; line-height:2rem;">
+                        리포트 생성/새로고침
+                    </button>
+                </div>
+                <div id="ai_report_status" class="hint" style="margin-bottom:8px;"></div>
+                <div id="ai_report_container" style="display:none; max-height:480px; overflow-y:auto;">
+                    <h3 style="font-size:15px; margin-top:0;">요약</h3>
+                    <div id="ai_report_summary" class="hint" style="white-space:pre-wrap;"></div>
+                    <h3 style="font-size:15px; margin-top:16px;">핵심 지표 해석</h3>
+                    <ul id="ai_report_metrics" class="hint" style="padding-left:18px;"></ul>
+                    <h3 style="font-size:15px; margin-top:16px;">문제점 / 리스크 포인트</h3>
+                    <ul id="ai_report_issues" class="hint" style="padding-left:18px;"></ul>
+                    <h3 style="font-size:15px; margin-top:16px;">파라미터 제안</h3>
+                    <ul id="ai_report_param_suggestions" class="hint" style="padding-left:18px;"></ul>
+                    <h3 style="font-size:15px; margin-top:16px;">내일을 위한 액션 아이템</h3>
+                    <ul id="ai_report_actions" class="hint" style="padding-left:18px;"></ul>
+                </div>
+            </div>
+        </div>
+
         <!-- Docs 탭 -->
         <div id="tab-docs" class="tab-content">
             <div id="doc-section-overview" class="doc-section active">
@@ -2482,6 +2517,123 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     fetchSystemTrades();
                     fetchAccountTrades();
                 }}
+            }}
+            if (tabName === 'ai-report') {{
+                const dateEl = document.getElementById('ai_report_date');
+                if (dateEl && !dateEl.value) {{
+                    const today = new Date().toISOString().slice(0, 10);
+                    dateEl.value = today;
+                }}
+            }}
+        }}
+
+        async function loadAiDailyReport() {{
+            const dateEl = document.getElementById('ai_report_date');
+            const statusEl = document.getElementById('ai_report_status');
+            const containerEl = document.getElementById('ai_report_container');
+            if (!dateEl || !statusEl || !containerEl) return;
+            const dateStr = (dateEl.value || '').trim().replace(/[-/]/g, '').slice(0, 8);
+            if (dateStr.length !== 8) {{
+                statusEl.textContent = '대상 일자를 선택해 주세요.';
+                containerEl.style.display = 'none';
+                return;
+            }}
+            statusEl.textContent = 'AI 리포트 생성 중... (수 초 소요될 수 있습니다)';
+            containerEl.style.display = 'none';
+            try {{
+                const r = await fetch(`/api/ai/report/daily?date=${{encodeURIComponent(dateStr)}}`, {{
+                    credentials: 'include',
+                    headers: {{ 'Authorization': 'Bearer ' + (localStorage.getItem('token') || '') }}
+                }});
+                const data = await r.json().catch(() => ({{}}));
+                if (!r.ok || !data.success) {{
+                    statusEl.textContent = data.message || ('리포트 생성 실패: ' + r.status);
+                    containerEl.style.display = 'none';
+                    return;
+                }}
+                const report = data.report || {{}};
+                statusEl.textContent = (report.date_summary || '') || (`${{data.date}} 기준 리포트`);
+
+                const $ = (id) => document.getElementById(id);
+
+                const summaryEl = $('ai_report_summary');
+                if (summaryEl) summaryEl.textContent = report.summary || report.overview || '';
+
+                const metricsEl = $('ai_report_metrics');
+                if (metricsEl) {{
+                    metricsEl.innerHTML = '';
+                    const metrics = report.key_metrics || report.metrics || [];
+                    if (Array.isArray(metrics)) {{
+                        metrics.forEach((m) => {{
+                            const li = document.createElement('li');
+                            const name = m.name || m.label || '';
+                            const value = (m.value !== undefined && m.value !== null) ? m.value : '';
+                            const comment = m.comment || m.note || '';
+                            li.textContent = name
+                                ? (name + (value !== '' ? `: ${{value}}` : '') + (comment ? ` - ${{comment}}` : ''))
+                                : (comment || JSON.stringify(m));
+                            metricsEl.appendChild(li);
+                        }});
+                    }}
+                }}
+
+                const issuesEl = $('ai_report_issues');
+                if (issuesEl) {{
+                    issuesEl.innerHTML = '';
+                    const issues = report.issues || report.risks || [];
+                    if (Array.isArray(issues)) {{
+                        issues.forEach((it) => {{
+                            const li = document.createElement('li');
+                            const txt = it.detail || it.description || it.message || JSON.stringify(it);
+                            li.textContent = txt;
+                            issuesEl.appendChild(li);
+                        }});
+                    }}
+                }}
+
+                const paramsEl = $('ai_report_param_suggestions');
+                if (paramsEl) {{
+                    paramsEl.innerHTML = '';
+                    const params = report.parameter_suggestions || report.param_suggestions || [];
+                    if (Array.isArray(params)) {{
+                        params.forEach((p) => {{
+                            const li = document.createElement('li');
+                            const name = p.param || p.name || '';
+                            const cur = p.current;
+                            const sugg = p.suggested;
+                            const reason = p.reason || p.comment || '';
+                            let txt = name ? name : '';
+                            if (name && (cur !== undefined || sugg !== undefined)) {{
+                                txt += `: ${{cur}} → ${{sugg}}`;
+                            }}
+                            if (reason) {{
+                                txt += txt ? ` - ${{reason}}` : reason;
+                            }}
+                            if (!txt) txt = JSON.stringify(p);
+                            li.textContent = txt;
+                            paramsEl.appendChild(li);
+                        }});
+                    }}
+                }}
+
+                const actionsEl = $('ai_report_actions');
+                if (actionsEl) {{
+                    actionsEl.innerHTML = '';
+                    const actions = report.action_items || report.actions || [];
+                    if (Array.isArray(actions)) {{
+                        actions.forEach((a) => {{
+                            const li = document.createElement('li');
+                            const txt = typeof a === 'string' ? a : (a.detail || a.description || JSON.stringify(a));
+                            li.textContent = txt;
+                            actionsEl.appendChild(li);
+                        }});
+                    }}
+                }}
+
+                containerEl.style.display = 'block';
+            }} catch (e) {{
+                statusEl.textContent = '리포트 생성 실패: ' + (e.message || e);
+                containerEl.style.display = 'none';
             }}
         }}
 

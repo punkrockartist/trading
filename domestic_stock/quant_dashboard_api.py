@@ -6,7 +6,7 @@ API 엔드포인트 모듈 (모바일 대시보드용)
 
 from fastapi import Depends, HTTPException, WebSocket, WebSocketDisconnect, Query, Body
 from fastapi.responses import JSONResponse
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from datetime import datetime, time as dtime, timedelta, timezone
 import logging
 import asyncio
@@ -14,6 +14,7 @@ import threading
 import uuid
 import time
 import os
+import json
 
 import kis_auth as ka
 from domestic_stock_functions_ws import ccnl_krx, asking_price_krx
@@ -30,6 +31,12 @@ from quant_trading_safe import safe_execute_order
 from audit_log import audit_log, audit_get
 from notifier import send_alert
 from system_log import system_log_append
+
+try:
+    # OpenAI Python SDK (v1.x). AI 리포트 생성을 위해 사용. 환경에 설치·키 설정이 안 되어 있으면 graceful fallback.
+    from openai import OpenAI  # type: ignore
+except Exception:  # pragma: no cover - 환경 의존
+    OpenAI = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 pending_signals_lock = threading.Lock()
@@ -3935,6 +3942,190 @@ async def get_trades_system(
     except Exception as e:
         logger.warning("get_trades_system failed: %s", e)
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+def _read_system_log_for_date(yyyymmdd: str) -> str:
+    """
+    system_YYYYMMDD.log 내용을 문자열로 반환. 너무 길면 최근 부분만 잘라서 반환.
+    """
+    try:
+        log_dir_env = os.environ.get("SYSTEM_LOG_DIR", "logs").strip()
+        if log_dir_env in ("0", "off", "false", "no"):
+            return ""
+        if os.path.isabs(log_dir_env):
+            log_dir = log_dir_env
+        else:
+            root = os.path.dirname(os.path.abspath(__file__))
+            log_dir = os.path.join(root, log_dir_env)
+        path = os.path.join(log_dir, f"system_{yyyymmdd}.log")
+        if not os.path.isfile(path):
+            return ""
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        # 로그가 너무 길면 최근 1000줄만 사용
+        if len(lines) > 1000:
+            lines = lines[-1000:]
+        return "".join(lines)
+    except Exception as e:
+        logger.warning("AI report: system log read failed for %s: %s", yyyymmdd, e)
+        return ""
+
+
+def _build_ai_daily_input(username: str, yyyymmdd: str) -> Dict[str, Any]:
+    """
+    AI 일일 리포트 입력 데이터 구성: 로그 + 거래내역 + 설정 스냅샷.
+    """
+    from user_hist_store import get_user_hist_store
+
+    log_text = _read_system_log_for_date(yyyymmdd)
+
+    # 거래내역: quant_trading_user_hist (1일 범위)
+    trades: List[Dict[str, Any]] = []
+    try:
+        hist = get_user_hist_store()
+        if hist and hist.enabled:
+            trades = hist.get_trades(username, yyyymmdd, yyyymmdd)
+    except Exception as e:
+        logger.warning("AI report: get_trades failed (%s %s): %s", username, yyyymmdd, e)
+
+    # 설정 스냅샷: quant_trading_user_settings
+    settings: Dict[str, Any] = {}
+    try:
+        store = _get_user_settings_store()
+        if store and getattr(store, "enabled", False):
+            settings = store.load(username) or {}
+    except Exception as e:
+        logger.warning("AI report: user settings load failed (%s): %s", username, e)
+
+    return {
+        "username": username,
+        "date": yyyymmdd,
+        "log_text": log_text,
+        "trades": trades,
+        "settings": settings,
+    }
+
+
+def _get_ai_client():
+    if OpenAI is None:
+        return None
+    try:
+        return OpenAI()
+    except Exception as e:  # pragma: no cover - 환경 의존
+        logger.warning("AI report: OpenAI client init failed: %s", e)
+        return None
+
+
+def _generate_ai_daily_report(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    AI 모델을 호출해 일일 리포트(JSON)를 생성.
+    """
+    client = _get_ai_client()
+    if client is None:
+        raise RuntimeError("AI client not configured (OpenAI SDK 또는 API 키 미설정)")
+
+    model = os.getenv("AI_REPORT_MODEL", "gpt-4.1-mini")
+
+    system_prompt = (
+        "당신은 퀀트 주식 자동매매 시스템의 리스크/전략 분석 어드바이저입니다. "
+        "입력으로 하루치 시스템 로그, 거래내역(quant_trading_user_hist), "
+        "사용자 설정(quant_trading_user_settings 스냅샷)을 받습니다. "
+        "전략 성과, 리스크, 파라미터 적정성, 개선 아이디어를 구조화된 JSON으로 출력하세요. "
+        "실제 매매 변경은 사람이 결정하므로, 제안은 보수적으로 하고 근거를 함께 제시하세요."
+    )
+
+    # 프롬프트 입력 데이터 정리 (너무 길지 않게 요약 필드 포함)
+    log_text = payload.get("log_text") or ""
+    trades = payload.get("trades") or []
+    settings = payload.get("settings") or {}
+
+    # 거래건수가 많아도 요약 가능하도록 상한 제한
+    max_trades = 300
+    if len(trades) > max_trades:
+        trades_input = trades[:max_trades]
+    else:
+        trades_input = trades
+
+    user_payload = {
+        "username": payload.get("username"),
+        "date": payload.get("date"),
+        "log_text": log_text,
+        "trades": trades_input,
+        "trades_truncated": len(trades) > len(trades_input),
+        "settings": settings,
+    }
+
+    try:
+        resp = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": "아래 JSON 데이터를 분석해서 일일 리포트를 생성해 주세요.\n"
+                    "반드시 JSON 객체 형식만 출력하세요.\n"
+                    + json.dumps(user_payload, ensure_ascii=False),
+                },
+            ],
+            response_format={"type": "json_object"},
+        )
+        text = resp.output[0].content[0].text  # type: ignore[attr-defined]
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("AI 응답이 JSON 객체 형식이 아닙니다.")
+        return data
+    except Exception as e:
+        logger.warning("AI report: generation failed: %s", e, exc_info=True)
+        raise
+
+
+@app.get("/api/ai/report/daily")
+async def get_ai_report_daily(
+    date: Optional[str] = Query(None, description="YYYYMMDD. 비면 오늘."),
+    current_user: str = Depends(get_current_user),
+):
+    """
+    AI 일일 리포트 생성/조회.
+
+    - 입력: system_YYYYMMDD.log, quant_trading_user_hist(해당일), quant_trading_user_settings 스냅샷
+    - 출력: AI가 생성한 JSON 리포트 (요약, 지표 해석, 문제점, 파라미터 제안, 액션 아이템 등)
+    """
+    try:
+        tz = timezone(timedelta(hours=9))
+        today = datetime.now(tz).strftime("%Y%m%d")
+        yyyymmdd = (date or today).strip().replace("-", "").replace("/", "")[:8]
+        if len(yyyymmdd) != 8 or not yyyymmdd.isdigit():
+            return JSONResponse({"success": False, "message": "date는 YYYYMMDD 형식이어야 합니다."}, status_code=400)
+
+        payload = await asyncio.to_thread(_build_ai_daily_input, current_user, yyyymmdd)
+
+        # AI 비활성화/미설정 시 안내
+        if OpenAI is None or not os.getenv("OPENAI_API_KEY"):
+            return JSONResponse(
+                {
+                    "success": False,
+                    "message": "AI 리포트 기능이 비활성화되어 있습니다. 서버 환경에 OpenAI Python SDK와 OPENAI_API_KEY를 설정하세요.",
+                    "date": yyyymmdd,
+                    "input_preview": {
+                        "has_log": bool(payload.get("log_text")),
+                        "trade_count": len(payload.get("trades") or []),
+                        "has_settings": bool(payload.get("settings")),
+                    },
+                },
+                status_code=501,
+            )
+
+        report = await asyncio.to_thread(_generate_ai_daily_report, payload)
+        return JSONResponse(
+            {
+                "success": True,
+                "date": yyyymmdd,
+                "report": report,
+            }
+        )
+    except Exception as e:
+        logger.warning("get_ai_report_daily failed: %s", e, exc_info=True)
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
 
 @app.post("/api/positions/sync-from-balance")
