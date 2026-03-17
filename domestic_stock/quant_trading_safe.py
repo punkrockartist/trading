@@ -55,17 +55,17 @@ class RiskManager:
         # 최소 매수 수량 (0/1이면 사실상 제한 없음)
         self.min_order_quantity = 1
         
-        # 손절매/익절매 설정
-        self.stop_loss_ratio = 0.02  # 2% 손실 시 매도
-        self.take_profit_ratio = 0.05  # 5% 수익 시 매도
+        # 손절매/익절매 설정 (오전 단타: 실제 체결 변동폭에 맞춘 기본값)
+        self.stop_loss_ratio = 0.005  # 0.5% 손실 시 매도 (기본 2%→0.5%)
+        self.take_profit_ratio = 0.01  # 1% 수익 시 매도 (기본 5%→1%)
         # ATR(또는 틱 변동성) 배수 손절/익절: True면 변동성 기반 거리 사용
         self.use_atr_for_stop_take = False
         self.atr_stop_mult = 1.5  # 손절 = 매수가 - atr_stop_mult * ATR
         self.atr_take_mult = 2.0  # 익절 = 매수가 + atr_take_mult * ATR
         self.atr_lookback_ticks = 20  # ATR 대용 틱 변동성 lookback
-        # 트레일링 스탑 (0이면 사용 안 함)
-        self.trailing_stop_ratio = 0.0
-        self.trailing_activation_ratio = 0.0  # 수익이 이 비율 이상일 때부터 trailing 적용
+        # 트레일링 스탑 (단타: 0.4% 하락 시 정리, 0.6% 수익부터 활성화)
+        self.trailing_stop_ratio = 0.004  # 0.4%
+        self.trailing_activation_ratio = 0.006  # 0.6% 수익 이상일 때부터 trailing 적용
         # 부분 익절 (0이면 사용 안 함)
         self.partial_take_profit_ratio = 0.0
         self.partial_take_profit_fraction = 0.5  # 0~1
@@ -114,7 +114,7 @@ class RiskManager:
         self.slippage_bps = 0
         
         # 거래 제한
-        self.max_trades_per_day = 5  # 하루 최대 거래 횟수 (매수+매도 = 1회)
+        self.max_trades_per_day = 12  # 하루 최대 거래 횟수 (매수+매도=1회). 5→12 휩쏘 대응
         self.max_trades_per_stock_per_day = 0  # 종목당 하루 최대 거래 횟수. 0=미적용
         self.max_positions_count = 0  # 동시 보유 종목 수 상한. 0이면 제한 없음
         self.min_price_change_ratio = 0.0  # 직전 틱 대비 최소 변동률. 0=미적용, 0.01=1% 이상 변동 시만 거래(급등 순간 위주)
@@ -139,8 +139,8 @@ class RiskManager:
         # key: "{stock_code}:{side}" where side in {"buy","sell"}
         self._pending_orders: Dict[str, Dict] = {}
         self.pending_order_ttl_seconds = 120
-        # 재진입 쿨다운
-        self.reentry_cooldown_seconds = 0
+        # 재진입 쿨다운 (기본 240초. 600초는 같은 종목 재진입이 너무 늦음)
+        self.reentry_cooldown_seconds = 240
         self._last_exit_at: Dict[str, datetime] = {}
         self._last_exit_reason: Dict[str, str] = {}
         # 포지션별 고점 추적 (트레일링 스탑)

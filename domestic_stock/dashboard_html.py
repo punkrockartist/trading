@@ -972,12 +972,12 @@ def get_dashboard_html(username: str) -> str:
                     </div>
                 <div class="form-group">
                     <label>손절매 비율 (%): <code class="setting-var">stop_loss_pct</code></label>
-                    <input type="number" id="stop_loss" value="1" step="0.1" min="0.1" max="10" title="오전 단타는 0.5~1.2% 권장">
+                    <input type="number" id="stop_loss" value="0.5" step="0.1" min="0.1" max="10" title="오전 단타는 0.5~1.2% 권장">
                     <div class="hint">오전 단타: 0.5~1.2% 권장. 2%는 스윙에 가깝습니다.</div>
                 </div>
                 <div class="form-group">
                     <label>익절매 비율 (%):</label>
-                    <input type="number" id="take_profit" value="2" step="0.1" min="0.2" max="20">
+                    <input type="number" id="take_profit" value="1" step="0.1" min="0.2" max="20">
                 </div>
                 <div class="form-group">
                     <label>일일 손실 한도 (원): <code class="setting-var">daily_loss_limit</code></label>
@@ -992,7 +992,7 @@ def get_dashboard_html(username: str) -> str:
                     </div>
                     <div class="form-group">
                         <label>일일 최대 거래 횟수 (매수+매도=1회): <code class="setting-var">max_trades_per_day</code></label>
-                        <input type="number" id="max_trades_per_day" value="5" min="1" max="50">
+                        <input type="number" id="max_trades_per_day" value="12" min="1" max="50">
                     </div>
                     <div class="form-group">
                         <label>종목별 일일 최대 거래 횟수 (0=미적용): <code class="setting-var">max_trades_per_stock_per_day</code></label>
@@ -1154,11 +1154,11 @@ def get_dashboard_html(username: str) -> str:
                         </div>
                         <div class="form-group">
                             <label>트레일링 스탑 (%):</label>
-                            <input type="number" id="trailing_stop_pct" value="0" step="0.1" min="0" max="50">
+                            <input type="number" id="trailing_stop_pct" value="0.5" step="0.1" min="0" max="50">
                         </div>
                         <div class="form-group">
                             <label>트레일링 활성화 최소 수익(%):</label>
-                            <input type="number" id="trailing_activation_pct" value="0" step="0.1" min="0" max="50">
+                            <input type="number" id="trailing_activation_pct" value="0.6" step="0.1" min="0" max="50">
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
@@ -1400,7 +1400,7 @@ def get_dashboard_html(username: str) -> str:
                         </div>
                         <div class="form-group">
                             <label>재진입 쿨다운(초): <code class="setting-var">reentry_cooldown_seconds</code></label>
-                            <input type="number" id="reentry_cooldown_seconds" value="0" min="0" max="3600">
+                            <input type="number" id="reentry_cooldown_seconds" value="240" min="0" max="3600">
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
@@ -1516,7 +1516,7 @@ def get_dashboard_html(username: str) -> str:
                         </div>
                         <div class="form-group" style="margin-left:12px;">
                             <label>상승 비율 하한(%): <code class="setting-var">advance_ratio_min_pct</code></label>
-                            <input type="number" id="advance_ratio_min_pct" value="40" min="0" max="100" step="5">
+                            <input type="number" id="advance_ratio_min_pct" value="35" min="0" max="100" step="5">
                         </div>
                         <div class="form-group" style="margin-left:12px;">
                             <label style="display:flex; align-items:center; gap:8px;">
@@ -1576,11 +1576,11 @@ def get_dashboard_html(username: str) -> str:
                         <div class="form-group">
                             <label>SAP 풀백 진입 구간(%): <code class="setting-var">sap_revert_entry_from_pct</code> ~ <code class="setting-var">sap_revert_entry_to_pct</code></label>
                             <div style="display:flex; align-items:center; gap:6px;">
-                                <input type="number" id="sap_revert_entry_from_pct" value="-2.5" step="0.1" min="-20" max="0">
+                                <input type="number" id="sap_revert_entry_from_pct" value="-1.5" step="0.1" min="-20" max="0">
                                 <span>~</span>
-                                <input type="number" id="sap_revert_entry_to_pct" value="-1.0" step="0.1" min="-20" max="0">
+                                <input type="number" id="sap_revert_entry_to_pct" value="-0.5" step="0.1" min="-20" max="0">
                             </div>
-                            <div class="hint">예: -2.5 ~ -1.0 → SAP보다 1~2.5% 아래 구간에서만 신규 매수 허용.</div>
+                            <div class="hint">예: -1.5 ~ -0.5 → SAP보다 0.5~1.5% 아래 구간에서만 신규 매수 허용(실제 변동폭에 맞춤).</div>
                         </div>
                         <div class="form-group">
                             <label>진입 거래량 하한(평균 대비 배수, 0=미적용):</label>
@@ -1652,37 +1652,37 @@ def get_dashboard_html(username: str) -> str:
                     </select>
                 </div>
                 <div class="form-group">
-                    <label>최소 상승률 (%):</label>
+                    <label>최소 상승률 (%): <code class="setting-var">min_price_change_ratio</code></label>
                     <input type="number" id="min_change" value="1" step="0.1">
                 </div>
                 <div class="form-group">
-                    <label>최대 상승률 (%):</label>
+                    <label>최대 상승률 (%): <code class="setting-var">max_price_change_ratio</code></label>
                     <input type="number" id="max_change" value="15" step="0.1">
                 </div>
                 <div class="form-group">
-                        <label>선정 후보군 수(최대 20):</label>
+                        <label>선정 후보군 수(최대 20): <code class="setting-var">max_stocks</code></label>
                         <input type="number" id="max_stocks" value="10" min="1" max="20">
                 </div>
                     <div class="form-group">
-                        <label>최소 가격 (원):</label>
+                        <label>최소 가격 (원): <code class="setting-var">min_price</code></label>
                         <input type="number" id="min_price" value="1000">
                     </div>
                     <div class="form-group">
-                        <label>최대 가격 (원):</label>
+                        <label>최대 가격 (원): <code class="setting-var">max_price</code></label>
                         <input type="number" id="max_price" value="2000000">
                     </div>
                     <div class="form-group">
-                        <label>최소 거래량 (주):</label>
+                        <label>최소 거래량 (주): <code class="setting-var">min_volume</code></label>
                         <input type="number" id="min_volume" value="50000">
                     </div>
                     <div class="form-group">
-                        <label>최소 거래대금 (원):</label>
+                        <label>최소 거래대금 (원): <code class="setting-var">min_trade_amount</code></label>
                         <input type="number" id="min_trade_amount" value="0">
                     </div>
                     <div class="form-group">
                         <label style="display:flex; align-items:center; gap:8px;">
                             <input type="checkbox" id="kospi_only">
-                            코스피만 (코스닥 제외)
+                            코스피만 (코스닥 제외) <code class="setting-var">kospi_only</code>
                         </label>
                         <div class="hint">체크 시 등락률 순위에서 거래소(코스피) 종목만 선정합니다. 코스닥은 변동성·스프레드가 클 수 있어 제외할 때 유리합니다.</div>
                     </div>
@@ -1690,7 +1690,7 @@ def get_dashboard_html(username: str) -> str:
                     <details>
                         <summary>고급(장초/드로우다운)</summary>
                         <div class="form-group">
-                            <label>선정 정렬 기준:</label>
+                            <label>선정 정렬 기준: <code class="setting-var">sort_by</code></label>
                             <select id="stock_sort_by">
                                 <option value="change">등락률(기본)</option>
                                 <option value="trade_amount">당일 거래대금(가능시)</option>
@@ -1698,47 +1698,47 @@ def get_dashboard_html(username: str) -> str:
                             </select>
                         </div>
                         <div class="form-group">
-                            <label>전일 거래대금 정렬 후보 pool 크기:</label>
+                            <label>전일 거래대금 정렬 후보 pool 크기: <code class="setting-var">prev_day_rank_pool_size</code></label>
                             <input type="number" id="prev_day_rank_pool_size" value="80" min="10" max="200" step="10">
                         </div>
                         <div class="form-group">
-                            <label>장 시작 시각 (HH:MM):</label>
+                            <label>장 시작 시각 (HH:MM): <code class="setting-var">market_open_hhmm</code></label>
                             <input type="text" id="market_open_hhmm" value="09:00" placeholder="09:00">
                         </div>
                         <div class="form-group">
-                            <label>장초 워밍업(분):</label>
+                            <label>장초 워밍업(분): <code class="setting-var">warmup_minutes</code></label>
                             <input type="number" id="warmup_minutes" value="5" min="0" max="60">
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="early_strict">
-                                장초 강화 필터 사용(초기 변동 노이즈 완화)
+                                장초 강화 필터 사용(초기 변동 노이즈 완화) <code class="setting-var">early_strict</code>
                             </label>
                         </div>
                         <div class="form-group">
-                            <label>장초 강화 적용 시간(분):</label>
+                            <label>장초 강화 적용 시간(분): <code class="setting-var">early_strict_minutes</code></label>
                             <input type="number" id="early_strict_minutes" value="30" min="1" max="180">
                         </div>
                         <div class="form-group">
-                            <label>장초 강화 최소 거래량(주):</label>
+                            <label>장초 강화 최소 거래량(주): <code class="setting-var">early_min_volume</code></label>
                             <input type="number" id="early_min_volume" value="200000" min="0">
                         </div>
                         <div class="form-group">
-                            <label>장초 강화 최소 거래대금(원):</label>
+                            <label>장초 강화 최소 거래대금(원): <code class="setting-var">early_min_trade_amount</code></label>
                             <input type="number" id="early_min_trade_amount" value="0" min="0">
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="exclude_drawdown">
-                                고점 대비 하락추세 종목 제외(장중 후행 진입 방지)
+                                고점 대비 하락추세 종목 제외(장중 후행 진입 방지) <code class="setting-var">exclude_drawdown</code>
                             </label>
                         </div>
                         <div class="form-group">
-                            <label>고점 대비 최대 허용 하락폭(%):</label>
-                            <input type="number" id="max_drawdown_pct" value="2.0" step="0.1" min="0" max="50">
+                            <label>고점 대비 최대 허용 하락폭(%): <code class="setting-var">max_drawdown_from_high_ratio</code></label>
+                            <input type="number" id="max_drawdown_pct" value="12.0" step="0.1" min="0" max="50">
                         </div>
                         <div class="form-group">
-                            <label>하락추세 제외 적용 시작 시각(HH:MM):</label>
+                            <label>하락추세 제외 적용 시작 시각(HH:MM): <code class="setting-var">drawdown_filter_after_hhmm</code></label>
                             <input type="text" id="drawdown_filter_after_hhmm" value="12:00" placeholder="12:00">
                         </div>
                     </details>
@@ -2060,7 +2060,7 @@ def get_dashboard_html(username: str) -> str:
                             </div>
                             <div class="help-item">
                                 <strong>고점 대비 하락추세 제외 (<code>exclude_drawdown</code> / <code>max_drawdown_pct</code>)</strong>
-                                켜면 “당일 고점 대비 N% 이상 내려온 종목”을 후보에서 제외합니다. 오후에 선정할 때 “아침에 고점 찍고 밀린 종목”을 빼는 데 씁니다. <code>max_drawdown_pct</code>를 너무 작게 두면 대부분이 제외될 수 있으니 3~5% 정도부터 시험해 보세요.
+                                켜면 “당일 고점 대비 N% 이상 내려온 종목”을 후보에서 제외합니다. 오후에 선정할 때 “아침에 고점 찍고 밀린 종목”을 빼는 데 씁니다. 고가는 선정 시점까지의 당일 장중 고가이므로, 9:30 선정이면 드로우다운이 작고 13:00 선정이면 같은 N%여도 더 많이 제외됩니다. 실전에서는 10~12% 이상으로 두어야 한두 종목이라도 선정되는 경우가 많습니다.
                             </div>
                         </div>
                     </details>
@@ -3220,7 +3220,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     const dtl = document.getElementById('daily_total_loss_limit')?.value || '0';
                     const dlb = document.getElementById('daily_loss_limit_basis')?.value || 'realized';
                     const dpb = document.getElementById('daily_profit_limit_basis')?.value || 'total';
-                    const mtpd = document.getElementById('max_trades_per_day')?.value || '5';
+                    const mtpd = document.getElementById('max_trades_per_day')?.value || '12';
                     const pt = document.getElementById('partial_tp_pct')?.value || '0';
                     const tr = document.getElementById('trailing_stop_pct')?.value || '0';
                     const legacyLoss = (parseInt(dtl || '0') > 0) ? (' · legacyTotalLoss=' + dtl + '원') : '';
@@ -3246,7 +3246,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     const momN = document.getElementById('momentum_lookback_ticks')?.value || '0';
                     const momP = document.getElementById('min_momentum_pct')?.value || '0';
                     const ec = !!document.getElementById('entry_confirm_enabled')?.checked;
-                    const cd = document.getElementById('reentry_cooldown_seconds')?.value || '0';
+                    const cd = document.getElementById('reentry_cooldown_seconds')?.value || '240';
                     const conf = document.getElementById('buy_confirm_ticks')?.value || '1';
                     const spr = document.getElementById('max_spread_pct')?.value || '0';
                     const n = document.getElementById('range_lookback_ticks')?.value || '0';
@@ -4083,7 +4083,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     atr_ratio_max_pct: parseFloat(document.getElementById('atr_ratio_max_pct')?.value) || 0,
                     sap_deviation_filter_enabled: !!document.getElementById('sap_deviation_filter_enabled')?.checked,
                     sap_deviation_max_pct: parseFloat(document.getElementById('sap_deviation_max_pct')?.value) || 3,
-                    max_trades_per_day: parseInt(document.getElementById('max_trades_per_day')?.value) || 5,
+                    max_trades_per_day: parseInt(document.getElementById('max_trades_per_day')?.value) || 12,
                     max_trades_per_stock_per_day: parseInt(document.getElementById('max_trades_per_stock_per_day')?.value) || 0,
                     max_positions_count: parseInt(document.getElementById('max_positions_count')?.value) || 0,
                     max_position_size_ratio: 0.1,
@@ -4156,7 +4156,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     early_max_spread_ratio: (parseFloat(document.getElementById('early_max_spread_pct').value) || 0) / 100,
                     early_range_lookback_ticks: parseInt(document.getElementById('early_range_lookback_ticks').value) || 0,
                     early_min_range_ratio: (parseFloat(document.getElementById('early_min_range_pct').value) || 0) / 100,
-                    reentry_cooldown_seconds: parseInt(document.getElementById('reentry_cooldown_seconds').value) || 0,
+                    reentry_cooldown_seconds: parseInt(document.getElementById('reentry_cooldown_seconds').value) || 240,
                     consecutive_loss_cooldown_enabled: !!document.getElementById('consecutive_loss_cooldown_enabled').checked,
                     consecutive_loss_count_threshold: parseInt(document.getElementById('consecutive_loss_count_threshold').value) || 2,
                     consecutive_loss_cooldown_mult: parseFloat(document.getElementById('consecutive_loss_cooldown_mult').value) || 2,
@@ -4175,7 +4175,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     index_ma_period: parseInt(document.getElementById('index_ma_period').value) || 20,
                     advance_ratio_filter_enabled: !!document.getElementById('advance_ratio_filter_enabled').checked,
                     advance_ratio_market: (document.getElementById('advance_ratio_market')?.value || '1001'),
-                    advance_ratio_min_pct: parseFloat(document.getElementById('advance_ratio_min_pct').value) || 40,
+                    advance_ratio_min_pct: parseFloat(document.getElementById('advance_ratio_min_pct').value) || 35,
                     trade_value_concentration_filter_enabled: !!document.getElementById('trade_value_concentration_filter_enabled').checked,
                     trade_value_concentration_market: (document.getElementById('trade_value_concentration_market')?.value || '1001'),
                     trade_value_concentration_top_n: parseInt(document.getElementById('trade_value_concentration_top_n').value) || 10,
@@ -4197,8 +4197,8 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     relative_strength_margin_pct: parseFloat(document.getElementById('relative_strength_margin_pct')?.value) || 0,
                     advance_ratio_down_market_skip: !!document.getElementById('advance_ratio_down_market_skip')?.checked,
                     use_sap_revert_entry: !!document.getElementById('use_sap_revert_entry')?.checked,
-                    sap_revert_entry_from_pct: parseFloat(document.getElementById('sap_revert_entry_from_pct')?.value) || -2.5,
-                    sap_revert_entry_to_pct: parseFloat(document.getElementById('sap_revert_entry_to_pct')?.value) || -1.0,
+                    sap_revert_entry_from_pct: parseFloat(document.getElementById('sap_revert_entry_from_pct')?.value) || -1.5,
+                    sap_revert_entry_to_pct: parseFloat(document.getElementById('sap_revert_entry_to_pct')?.value) || -0.5,
                 }};
                 const response = await fetch('/api/config/strategy', {{
                     method: 'POST',
@@ -4413,7 +4413,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 take_profit: 1.8,
                 daily_loss_limit: 50000,
                 daily_profit_limit: 50000,
-                max_trades_per_day: 5,
+                max_trades_per_day: 12,
                 max_positions_count: 2,
                 last_minutes_no_buy: 10,
                 name: '오전 단타'
@@ -4436,7 +4436,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 overrides.take_profit = 2.5;
                 overrides.daily_loss_limit = 80000;
                 overrides.daily_profit_limit = 80000;
-                overrides.max_trades_per_day = 8;
+                overrides.max_trades_per_day = 12;
                 overrides.max_positions_count = 3;
                 overrides.name = '공격적 단타';
             }}
@@ -4534,7 +4534,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 document.getElementById('index_ma_period').value = 20;
                 document.getElementById('advance_ratio_filter_enabled').checked = true;
                 document.getElementById('advance_ratio_market').value = '1001';
-                document.getElementById('advance_ratio_min_pct').value = 40;
+                document.getElementById('advance_ratio_min_pct').value = 35;
                 document.getElementById('advance_ratio_down_market_skip').checked = true;
                 // 서킷/사이드카/VI: 급락·변동 시 매수 스킵 (단타 보호)
                 document.getElementById('circuit_breaker_filter_enabled').checked = true;
@@ -4599,7 +4599,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     early_min_trade_amount: parseInt(document.getElementById('early_min_trade_amount').value) || 0,
                     kospi_only: !!document.getElementById('kospi_only').checked,
                     exclude_drawdown: !!document.getElementById('exclude_drawdown').checked,
-                    max_drawdown_from_high_ratio: (parseFloat(document.getElementById('max_drawdown_pct').value) || 0) / 100,
+                    max_drawdown_from_high_ratio: (parseFloat(document.getElementById('max_drawdown_pct').value) || 12) / 100,
                     drawdown_filter_after_hhmm: (document.getElementById('drawdown_filter_after_hhmm').value || '12:00').trim(),
                 }};
                 const response = await fetch('/api/config/stock-selection', {{

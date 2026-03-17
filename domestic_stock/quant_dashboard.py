@@ -226,7 +226,7 @@ class StockSelectionConfig(BaseModel):
     early_min_volume: int = 200000
     early_min_trade_amount: int = 0
     exclude_drawdown: bool = False
-    max_drawdown_from_high_ratio: float = 0.02
+    max_drawdown_from_high_ratio: float = 0.12  # 12%; 실전에서는 10~12% 이상이어야 종목이 선정되는 경우 많음
     drawdown_filter_after_hhmm: str = "12:00"
     kospi_only: bool = False  # True: 코스피만(코스닥 제외)
 
@@ -296,7 +296,7 @@ class StrategyConfig(BaseModel):
     minute_trend_min_green_bars: int = 2  # 최근 N개 중 양봉 최소 개수
     minute_trend_mode: str = "green"  # green | higher_close | higher_low | hh_hl
     minute_trend_early_only: bool = False
-    reentry_cooldown_seconds: int = 0
+    reentry_cooldown_seconds: int = 240  # 휩쏘 완화: 600→240초 권장
     consecutive_loss_cooldown_enabled: bool = False
     consecutive_loss_count_threshold: int = 2
     consecutive_loss_cooldown_mult: float = 2.0
@@ -307,7 +307,7 @@ class StrategyConfig(BaseModel):
     # 상승 종목 비율 시장 레짐: 등락률 순위 API로 상승/하락 건수 비율, N% 미만이면 매수 스킵
     advance_ratio_filter_enabled: bool = False
     advance_ratio_market: str = "1001"  # 1001:코스닥, 0001:코스피
-    advance_ratio_min_pct: float = 40.0  # 상승 비율 하한(0~100%)
+    advance_ratio_min_pct: float = 35.0  # 상승 비율 하한(0~100%). 40→35 완화
     # 거래소 서킷브레이커(급락) 구간: 전일 대비 지수 하락률이 N% 이하이면 신규 매수 스킵 (KRX 1단계 서킷 ~-8% 직전)
     circuit_breaker_filter_enabled: bool = True
     circuit_breaker_market: str = "0001"  # 0001:코스피, 1001:코스닥
@@ -351,9 +351,9 @@ class StrategyConfig(BaseModel):
     advance_ratio_down_market_skip: bool = True
     # SAP 기반 풀백/역추세 진입 보조: 당일 세션 평균가(SAP) 대비 하단 구간에서만 매수 허용
     use_sap_revert_entry: bool = False
-    # 예: -2.5~-1.0 구간에서만 진입 (평균가보다 1~2.5% 아래에서만 진입)
-    sap_revert_entry_from_pct: float = -2.5
-    sap_revert_entry_to_pct: float = -1.0
+    # 예: -1.5~-0.5 구간(실제 변동폭에 맞춤). -2.5~-1.0은 변동 작을 때 진입 안 나옴
+    sap_revert_entry_from_pct: float = -1.5
+    sap_revert_entry_to_pct: float = -0.5
 
 class ManualOrder(BaseModel):
     stock_code: str

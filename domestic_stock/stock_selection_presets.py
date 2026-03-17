@@ -108,7 +108,7 @@ PRESET_SCALP_MORNING = {
     "early_min_volume": 200000,
     "early_min_trade_amount": 5000000000,  # 50억
     "exclude_drawdown": True,
-    "max_drawdown_from_high_ratio": 0.02,  # 2%
+    "max_drawdown_from_high_ratio": 0.12,  # 12%; 실전에서 10~12% 이상 필요하는 경우 많음
     "drawdown_filter_after_hhmm": "10:30",
     "kospi_only": True,  # 코스닥 제외, 코스피만(변동성·스프레드 완화)
 }

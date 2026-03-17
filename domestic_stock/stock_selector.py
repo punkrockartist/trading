@@ -97,7 +97,7 @@ class StockSelector:
             }
         else:
             self.exclude_drawdown = bool(exclude_drawdown)
-        self.max_drawdown_from_high_ratio = float(max_drawdown_from_high_ratio) if max_drawdown_from_high_ratio is not None else float(os.getenv("STOCK_SELECTION_MAX_DRAWDOWN_FROM_HIGH_RATIO", "0.02") or "0.02")
+        self.max_drawdown_from_high_ratio = float(max_drawdown_from_high_ratio) if max_drawdown_from_high_ratio is not None else float(os.getenv("STOCK_SELECTION_MAX_DRAWDOWN_FROM_HIGH_RATIO", "0.12") or "0.12")
         self.drawdown_filter_after_hhmm = (drawdown_filter_after_hhmm or os.getenv("STOCK_SELECTION_DRAWDOWN_FILTER_AFTER_HHMM", "12:00")).strip()
         # fid_input_iscd: 0000=전체, 0001=거래소(코스피), 1001=코스닥, 2001=코스피200
         self.kospi_only = bool(kospi_only) if kospi_only is not None else (str(os.getenv("STOCK_SELECTION_KOSPI_ONLY", "false")).strip().lower() in ("1", "true", "t", "yes", "y", "on"))
@@ -553,7 +553,9 @@ class StockSelector:
 
             # (선택) 고점 대비 하락추세(드로우다운) 종목 제외
             # - 목적: 장중(특히 오후) 시작 시점에 이미 고점 찍고 밀린 종목을 배제
-            # - 기준: 현재가가 고가 대비 일정 비율 이상 하락하면 제외
+            # - 기준: 현재가 vs 당일 고가(STCK_HGPR, 장 시작~선정 시점까지의 고가). 9:30 선정이면 고가가
+            #   아직 현재가에 가까워 드로우다운이 작고, 13:00 선정이면 오전 고점 대비 하락이 커져 같은
+            #   비율도 더 많이 걸러짐. 선정 시각에 따라 같은 max_drawdown 값의 효과가 크게 달라짐.
             # - env:
             #   STOCK_SELECTION_EXCLUDE_DRAWDOWN=true/false (default false)
             #   STOCK_SELECTION_MAX_DRAWDOWN_FROM_HIGH_RATIO=0.02  (2% 이상 밀리면 제외)

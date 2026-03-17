@@ -1138,7 +1138,7 @@ def _apply_risk_config_dict_to_state(d: dict) -> None:
         if "partial_take_profit_fraction" in d:
             rm.partial_take_profit_fraction = float(d.get("partial_take_profit_fraction") or 0.5)
         if "max_trades_per_day" in d:
-            rm.max_trades_per_day = int(d.get("max_trades_per_day") or 5)
+            rm.max_trades_per_day = int(d.get("max_trades_per_day") or 12)
         if "max_trades_per_stock_per_day" in d:
             rm.max_trades_per_stock_per_day = max(0, min(20, int(d.get("max_trades_per_stock_per_day") or 0)))
         if "max_intraday_vol_pct" in d:
@@ -1262,7 +1262,7 @@ def _apply_stock_selection_config_dict_to_state(d: dict) -> None:
             early_min_volume=int(getattr(config, "early_min_volume", 200000) or 200000),
             early_min_trade_amount=int(getattr(config, "early_min_trade_amount", 0) or 0),
             exclude_drawdown=bool(getattr(config, "exclude_drawdown", False)),
-            max_drawdown_from_high_ratio=float(getattr(config, "max_drawdown_from_high_ratio", 0.02) or 0.02),
+            max_drawdown_from_high_ratio=float(getattr(config, "max_drawdown_from_high_ratio", 0.12) or 0.12),
             drawdown_filter_after_hhmm=getattr(config, "drawdown_filter_after_hhmm", "12:00"),
             kospi_only=bool(getattr(config, "kospi_only", False)),
         )
@@ -3393,14 +3393,16 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
         }, headers=_STATUS_NO_CACHE)
     
     await _refresh_kis_account_balance(force=False, ttl_sec=60)
-    # 재시작 후 접속 시 당일 손익·거래 횟수 0이면 DB에서 복원
+    # 재시작 후 접속 시 당일 손익이 0이면 DB에서 복원
     try:
         rm = state.risk_manager
-        if (float(getattr(rm, "daily_pnl", 0) or 0) == 0 and (int(getattr(rm, "daily_trades", 0) or 0) == 0)):
+        if float(getattr(rm, "daily_pnl", 0) or 0) == 0:
             pnl, cnt = _load_today_daily_stats(current_user)
-            if pnl is not None and cnt is not None:
+            if pnl is not None:
                 rm.daily_pnl = float(pnl)
-                rm.daily_trades = int(cnt)
+                # 거래 횟수는 이미 값이 있으면 유지, 없으면 DB 기준으로 채움
+                if cnt is not None and int(getattr(rm, "daily_trades", 0) or 0) == 0:
+                    rm.daily_trades = int(cnt)
                 if getattr(state, "is_paper_trading", True):
                     kis_bal = int(getattr(state, "kis_account_balance", 0) or 0)
                     if kis_bal > 0:
@@ -4259,11 +4261,33 @@ def _get_today_daily_row(current_user: str) -> Optional[dict]:
 
 @app.get("/api/performance/summary")
 async def get_performance_summary(current_user: str = Depends(get_current_user)):
-    """일일·세션 성과 요약. 당일은 일별 성과 '오늘' 행과 동일한 값(실현손익·거래횟수)으로 표시."""
+    """일일·세션 성과 요약. 당일 거래(user_hist/메모리)가 있으면 그걸로 집계, 없을 때만 일별 성과 DB 행 사용."""
     try:
         tz = timezone(timedelta(hours=9))
         today_str = datetime.now(tz).strftime("%Y-%m-%d")
-        # 당일 일별 행이 있으면 그대로 사용 → 일별 성과 3/12와 동일 값
+        today_ymd = today_str.replace("-", "")[:8]
+        # 1) 당일 거래 리스트 우선 수집 (user_hist + 메모리 trade_history)
+        today_trades = _today_trades_from_user_hist(current_user)
+        if not today_trades:
+            history = getattr(state, "trade_history", []) or []
+            for t in history:
+                ts = t.get("timestamp") or ""
+                if isinstance(ts, str) and (ts.startswith(today_str) or ts.replace("-", "")[:8] == today_ymd):
+                    today_trades.append(t)
+                elif isinstance(ts, str) and "T" in ts:
+                    try:
+                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=tz)
+                        if dt.strftime("%Y-%m-%d") == today_str:
+                            today_trades.append(t)
+                    except Exception:
+                        pass
+        # 2) 거래가 있으면 거래 기준으로 집계 (실제 손익 반영, 갱신됨)
+        if today_trades:
+            summary = _compute_summary_from_trade_list(today_trades, today_str)
+            return JSONResponse({"success": True, "summary": summary})
+        # 3) 거래 없을 때만 일별 성과 DB 행 사용 (저장된 오늘 행)
         today_row = _get_today_daily_row(current_user)
         if today_row is not None:
             pnl = today_row.get("pnl")
@@ -4292,25 +4316,8 @@ async def get_performance_summary(current_user: str = Depends(get_current_user))
                 "recommendations": _compute_summary_from_trade_list([], today_str).get("recommendations", []),
             }
             return JSONResponse({"success": True, "summary": summary})
-        # 일별 행 없으면 거래 리스트로 집계(메모리 → user_hist)
-        today_trades = _today_trades_from_user_hist(current_user)
-        if not today_trades:
-            history = getattr(state, "trade_history", []) or []
-            today_ymd = today_str.replace("-", "")[:8]
-            for t in history:
-                ts = t.get("timestamp") or ""
-                if isinstance(ts, str) and (ts.startswith(today_str) or ts.replace("-", "")[:8] == today_ymd):
-                    today_trades.append(t)
-                elif isinstance(ts, str) and "T" in ts:
-                    try:
-                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=tz)
-                        if dt.strftime("%Y-%m-%d") == today_str:
-                            today_trades.append(t)
-                    except Exception:
-                        pass
-        summary = _compute_summary_from_trade_list(today_trades, today_str)
+        # 4) 거래도 없고 DB 행도 없으면 0 요약
+        summary = _compute_summary_from_trade_list([], today_str)
         return JSONResponse({"success": True, "summary": summary})
     except Exception as e:
         logger.exception(e)
@@ -5028,7 +5035,7 @@ async def update_strategy_config(config: StrategyConfig, current_user: str = Dep
         state.early_max_spread_ratio = float(getattr(config, "early_max_spread_ratio", getattr(state, "early_max_spread_ratio", 0.0)) or 0.0)
         state.early_range_lookback_ticks = int(getattr(config, "early_range_lookback_ticks", getattr(state, "early_range_lookback_ticks", 0)) or 0)
         state.early_min_range_ratio = float(getattr(config, "early_min_range_ratio", getattr(state, "early_min_range_ratio", 0.0)) or 0.0)
-        state.reentry_cooldown_seconds = int(getattr(config, "reentry_cooldown_seconds", getattr(state, "reentry_cooldown_seconds", 0)) or 0)
+        state.reentry_cooldown_seconds = int(getattr(config, "reentry_cooldown_seconds", getattr(state, "reentry_cooldown_seconds", 240)) or 0)
         if getattr(state, "risk_manager", None):
             state.risk_manager.reentry_cooldown_seconds = int(state.reentry_cooldown_seconds or 0)
         state.consecutive_loss_cooldown_enabled = bool(getattr(config, "consecutive_loss_cooldown_enabled", getattr(state, "consecutive_loss_cooldown_enabled", False)))
@@ -5041,7 +5048,7 @@ async def update_strategy_config(config: StrategyConfig, current_user: str = Dep
         # 상승 종목 비율 시장 레짐
         state.advance_ratio_filter_enabled = bool(getattr(config, "advance_ratio_filter_enabled", getattr(state, "advance_ratio_filter_enabled", False)))
         state.advance_ratio_market = str(getattr(config, "advance_ratio_market", getattr(state, "advance_ratio_market", "1001")) or "1001")
-        state.advance_ratio_min_pct = max(0.0, min(100.0, float(getattr(config, "advance_ratio_min_pct", getattr(state, "advance_ratio_min_pct", 40.0)) or 40.0)))
+        state.advance_ratio_min_pct = max(0.0, min(100.0, float(getattr(config, "advance_ratio_min_pct", getattr(state, "advance_ratio_min_pct", 35.0)) or 35.0)))
         # 거래소 서킷브레이커(급락) 구간: 전일 대비 지수 하락 시 신규 매수 스킵
         state.circuit_breaker_filter_enabled = bool(getattr(config, "circuit_breaker_filter_enabled", getattr(state, "circuit_breaker_filter_enabled", True)))
         state.circuit_breaker_market = str(getattr(config, "circuit_breaker_market", getattr(state, "circuit_breaker_market", "0001")) or "0001")
@@ -5075,8 +5082,8 @@ async def update_strategy_config(config: StrategyConfig, current_user: str = Dep
         state.min_range_ratio = float(getattr(config, "min_range_ratio", getattr(state, "min_range_ratio", 0.0)) or 0.0)
         # SAP 기반 풀백 진입 보조 (평균가 대비 하단 구간에서만 매수 허용)
         state.use_sap_revert_entry = bool(getattr(config, "use_sap_revert_entry", getattr(state, "use_sap_revert_entry", False)))
-        state.sap_revert_entry_from_pct = float(getattr(config, "sap_revert_entry_from_pct", getattr(state, "sap_revert_entry_from_pct", -2.5)) or -2.5)
-        state.sap_revert_entry_to_pct = float(getattr(config, "sap_revert_entry_to_pct", getattr(state, "sap_revert_entry_to_pct", -1.0)) or -1.0)
+        state.sap_revert_entry_from_pct = float(getattr(config, "sap_revert_entry_from_pct", getattr(state, "sap_revert_entry_from_pct", -1.5)) or -1.5)
+        state.sap_revert_entry_to_pct = float(getattr(config, "sap_revert_entry_to_pct", getattr(state, "sap_revert_entry_to_pct", -0.5)) or -0.5)
         # 2~6번: 진입 거래량/거래대금 하한, 장초 N분 스킵, 지수 상대강도, 마감 전 N분 스킵, 하락장 스킵 강화
         state.min_volume_ratio_for_entry = max(0.0, min(5.0, float(getattr(config, "min_volume_ratio_for_entry", 0.0) or 0.0)))
         state.min_trade_amount_ratio_for_entry = max(0.0, min(5.0, float(getattr(config, "min_trade_amount_ratio_for_entry", 0.0) or 0.0)))
@@ -5169,7 +5176,7 @@ async def update_stock_selection_config(config: StockSelectionConfig, current_us
             early_min_volume=int(getattr(config, "early_min_volume", 200000) or 200000),
             early_min_trade_amount=int(getattr(config, "early_min_trade_amount", 0) or 0),
             exclude_drawdown=bool(getattr(config, "exclude_drawdown", False)),
-            max_drawdown_from_high_ratio=float(getattr(config, "max_drawdown_from_high_ratio", 0.02) or 0.02),
+            max_drawdown_from_high_ratio=float(getattr(config, "max_drawdown_from_high_ratio", 0.12) or 0.12),
             drawdown_filter_after_hhmm=getattr(config, "drawdown_filter_after_hhmm", "12:00"),
             kospi_only=bool(getattr(config, "kospi_only", False)),
         )
@@ -5632,7 +5639,7 @@ def initialize_trading_system(
             early_min_volume=200000,
             early_min_trade_amount=0,
             exclude_drawdown=False,
-            max_drawdown_from_high_ratio=0.02,
+            max_drawdown_from_high_ratio=0.12,
             drawdown_filter_after_hhmm="12:00",
             kospi_only=False,
         )
