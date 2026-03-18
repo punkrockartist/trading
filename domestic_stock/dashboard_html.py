@@ -665,6 +665,52 @@ def get_dashboard_html(username: str) -> str:
             padding: 2px 6px;
             border-radius: 2px;
         }}
+        .table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12.5px;
+        }}
+        .table th, .table td {{
+            border-bottom: 1px solid var(--border);
+            padding: 8px 10px;
+            vertical-align: top;
+        }}
+        .table th {{
+            text-align: left;
+            color: var(--muted);
+            font-weight: 600;
+            font-size: 12px;
+        }}
+        .pill {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: 999px;
+            font-size: 12px;
+            border: 1px solid var(--border);
+            background: var(--surface-2);
+            color: var(--text);
+        }}
+        .pill.ok {{ border-color: rgba(29,129,2,0.35); color: var(--ok); background: rgba(29,129,2,0.10); }}
+        .pill.warn {{ border-color: rgba(222,158,0,0.45); color: #b97d00; background: rgba(222,158,0,0.12); }}
+        .pill.err {{ border-color: rgba(209,50,18,0.35); color: var(--err); background: rgba(209,50,18,0.10); }}
+        .preflight-box {{
+            margin-top: 10px;
+            border: 1px dashed var(--border);
+            border-radius: 10px;
+            padding: 12px;
+            background: rgba(255,255,255,0.02);
+        }}
+        .preflight-kv {{
+            display: grid;
+            grid-template-columns: 120px 1fr;
+            gap: 6px 10px;
+            font-size: 12px;
+            margin: 10px 0 6px;
+        }}
+        .preflight-kv .k {{ color: var(--muted); }}
+        .preflight-kv code {{ font-size: 12px; }}
         @media (min-width: 768px) {{
             :root {{
                 --container-pad: 20px;
@@ -783,8 +829,10 @@ def get_dashboard_html(username: str) -> str:
                 </div>
                 <div class="metric">
                     <span class="metric-label">계좌 잔고:</span>
-                    <span class="metric-value" id="balance">-</span>
-                    <span class="metric-hint" id="balance_hint" style="display:block; font-size:11px; color:var(--muted); margin-top:2px;"></span>
+                    <div style="flex:1; text-align:right; min-width:0;">
+                        <span class="metric-value" id="balance">-</span>
+                        <span class="metric-hint" id="balance_hint" style="display:block; font-size:11px; color:var(--muted); margin-top:2px;"></span>
+                    </div>
                 </div>
                 <div class="metric">
                     <span class="metric-label">일일 손익:</span>
@@ -798,9 +846,26 @@ def get_dashboard_html(username: str) -> str:
                     <button class="btn" onclick="startSystem()">시작</button>
                     <button class="btn btn-danger" onclick="openStopModal()">중지</button>
                 </div>
+                <div class="preflight-box" id="preflightBox">
+                    <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;">
+                        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+                            <strong style="font-size:13px;">Preflight (시작 전 강제 점검)</strong>
+                            <span id="preflightBadge" class="pill">미실행</span>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <button class="btn btn-inline" onclick="runPreflight(false)">점검 실행</button>
+                            <button class="btn btn-inline" onclick="renderPreflight(window.__lastPreflight || null)">결과 보기</button>
+                        </div>
+                    </div>
+                    <div class="hint" style="margin-top:6px;">
+                        시작 전 점검으로 필수 설정/리스크 상한/환경을 확인합니다. <strong>issues</strong>가 있으면 시스템 시작이 차단됩니다.
+                    </div>
+                    <div id="preflightResult" style="margin-top:10px; display:none;"></div>
+                </div>
             </div>
             <div class="card">
                 <h2 style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">선정 종목 리스트 <a href="#" onclick="openCriteriaModal(); return false;" style="font-size: 13px; font-weight: normal; color: var(--primary); text-decoration: none;">선정 기준 보기</a> <button type="button" class="btn btn-inline" style="font-size: 12px; padding: 4px 10px;" onclick="selectStocks()">종목 재선정</button></h2>
+                <div class="hint">안내: <strong>실행 중에는 종목 변경이 불가</strong>합니다. 변경하려면 <strong>시스템 중지 → 종목 재선정 → 시스템 시작</strong> 순서로 진행하세요.</div>
                 <div id="selected_stocks">
                     <p style="color: var(--muted); text-align: center; padding: 20px;">선정된 종목이 없습니다.</p>
                 </div>
@@ -972,12 +1037,12 @@ def get_dashboard_html(username: str) -> str:
                         <input type="number" id="min_order_quantity" value="1" min="1" max="1000">
                     </div>
                 <div class="form-group">
-                    <label>손절매 비율 (%): <code class="setting-var">stop_loss_pct</code></label>
+                    <label>손절매 비율 (%): <code class="setting-var">stop_loss_ratio</code></label>
                     <input type="number" id="stop_loss" value="0.5" step="0.1" min="0.1" max="10" title="오전 단타는 0.5~1.2% 권장">
                     <div class="hint">오전 단타: 0.5~1.2% 권장. 2%는 스윙에 가깝습니다.</div>
                 </div>
                 <div class="form-group">
-                    <label>익절매 비율 (%):</label>
+                    <label>익절매 비율 (%): <code class="setting-var">take_profit_ratio</code></label>
                     <input type="number" id="take_profit" value="1" step="0.1" min="0.2" max="20">
                 </div>
                 <div class="form-group">
@@ -1001,16 +1066,20 @@ def get_dashboard_html(username: str) -> str:
                         <div class="hint">0=미적용(전역 max_trades_per_day만 적용). 1~2 권장. 한 종목이 휩쏘로 횟수를 다 쓰는 것 방지.</div>
                     </div>
                     <div class="form-group">
-                        <label>동시 보유 종목 수 상한 (0=제한 없음):</label>
+                        <label>동시 보유 종목 수 상한 (0=제한 없음): <code class="setting-var">max_positions_count</code></label>
                         <input type="number" id="max_positions_count" value="0" min="0" max="50">
                     </div>
                     <div class="form-group">
-                        <label>일일 이익 한도(원) (전량매도 트리거):</label>
+                        <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="expand_position_when_few_stocks" checked> 선정 1~2종목일 때 잔고 활용 확대 <code class="setting-var">expand_position_when_few_stocks</code></label>
+                        <div class="hint">켜면: 1종목 100%, 2종목 50% each. 끄면 항상 종목당 max_position_size_ratio(기본 10%)만 사용.</div>
+                    </div>
+                    <div class="form-group">
+                        <label>일일 이익 한도(원) (전량매도 트리거): <code class="setting-var">daily_profit_limit</code></label>
                         <input type="number" id="daily_profit_limit" value="50000" min="0" step="10000">
                         <div class="hint">dailyProfit ≥ dailyLoss 권장(대칭 한도). 예: 5만/5만.</div>
                     </div>
                     <div class="form-group">
-                        <label>일일 이익 한도 기준:</label>
+                        <label>일일 이익 한도 기준: <code class="setting-var">daily_profit_limit_basis</code></label>
                         <select id="daily_profit_limit_basis">
                             <option value="total">실현+미실현(가정)</option>
                             <option value="realized">실현(체결 손익)</option>
@@ -1146,19 +1215,19 @@ def get_dashboard_html(username: str) -> str:
                             </div>
                         </details>
                         <div class="form-group">
-                            <label>부분 익절 트리거(%):</label>
+                            <label>부분 익절 트리거(%): <code class="setting-var">partial_take_profit_ratio</code></label>
                             <input type="number" id="partial_tp_pct" value="0" step="0.1" min="0" max="50">
                         </div>
                         <div class="form-group">
-                            <label>부분 익절 비율(%):</label>
+                            <label>부분 익절 비율(%): <code class="setting-var">partial_take_profit_fraction</code></label>
                             <input type="number" id="partial_tp_fraction_pct" value="50" step="5" min="0" max="100">
                         </div>
                         <div class="form-group">
-                            <label>트레일링 스탑 (%):</label>
+                            <label>트레일링 스탑 (%): <code class="setting-var">trailing_stop_ratio</code></label>
                             <input type="number" id="trailing_stop_pct" value="0.5" step="0.1" min="0" max="50">
                         </div>
                         <div class="form-group">
-                            <label>트레일링 활성화 최소 수익(%):</label>
+                            <label>트레일링 활성화 최소 수익(%): <code class="setting-var">trailing_activation_ratio</code></label>
                             <input type="number" id="trailing_activation_pct" value="0.6" step="0.1" min="0" max="50">
                         </div>
                         <div class="form-group">
@@ -1247,7 +1316,7 @@ def get_dashboard_html(username: str) -> str:
                             <input type="number" id="momentum_lookback_ticks" value="0" min="0" max="200">
                         </div>
                         <div class="form-group">
-                            <label>모멘텀 최소 상승률(%) <code class="setting-var">min_momentum_pct</code></label>
+                            <label>모멘텀 최소 상승률(%) <code class="setting-var">min_momentum_ratio</code></label>
                             <input type="number" id="min_momentum_pct" value="0" step="0.01" min="0" max="20">
                         </div>
                         <div class="form-group">
@@ -1257,7 +1326,7 @@ def get_dashboard_html(username: str) -> str:
                             </label>
                         </div>
                         <div class="form-group">
-                            <label>고점 lookback(분) / “고점 대비 하락폭” 최소(%) <code class="setting-var">near_high_lookback_minutes</code> / <code class="setting-var">avoid_near_high_pct</code></label>
+                            <label>고점 lookback(분) / “고점 대비 하락폭” 최소(%) <code class="setting-var">near_high_lookback_minutes</code> / <code class="setting-var">avoid_near_high_ratio</code></label>
                             <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
                                 <input type="number" id="near_high_lookback_minutes" value="2" min="1" max="30">
                                 <input type="number" id="avoid_near_high_pct" value="0.30" step="0.05" min="0" max="5">
@@ -1318,7 +1387,7 @@ def get_dashboard_html(username: str) -> str:
                             </label>
                         </div>
                         <div class="form-group">
-                            <label>돌파 lookback(N틱) / 버퍼(%) <code class="setting-var">breakout_lookback_ticks</code> / <code class="setting-var">breakout_buffer_pct</code></label>
+                            <label>돌파 lookback(N틱) / 버퍼(%) <code class="setting-var">breakout_lookback_ticks</code> / <code class="setting-var">breakout_buffer_ratio</code></label>
                             <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
                                 <input type="number" id="breakout_lookback_ticks" value="20" min="2" max="300">
                                 <input type="number" id="breakout_buffer_pct" value="0" step="0.01" min="0" max="5">
@@ -1377,7 +1446,7 @@ def get_dashboard_html(username: str) -> str:
                             <input type="number" id="early_min_short_ma_slope_pct" value="0" step="0.001" min="0" max="5">
                         </div>
                         <div class="form-group">
-                            <label>초반 레짐: 모멘텀 N틱 / 최소 상승률(%) <code class="setting-var">early_momentum_lookback_ticks</code> / <code class="setting-var">early_min_momentum_pct</code></label>
+                            <label>초반 레짐: 모멘텀 N틱 / 최소 상승률(%) <code class="setting-var">early_momentum_lookback_ticks</code> / <code class="setting-var">early_min_momentum_ratio</code></label>
                             <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
                                 <input type="number" id="early_momentum_lookback_ticks" value="0" min="0" max="200">
                                 <input type="number" id="early_min_momentum_pct" value="0" step="0.01" min="0" max="20">
@@ -1388,11 +1457,11 @@ def get_dashboard_html(username: str) -> str:
                             <input type="number" id="early_buy_confirm_ticks" value="1" min="1" max="10">
                         </div>
                         <div class="form-group">
-                            <label>초반 레짐: 최대 스프레드(%) <code class="setting-var">early_max_spread_pct</code></label>
+                            <label>초반 레짐: 최대 스프레드(%) <code class="setting-var">early_max_spread_ratio</code></label>
                             <input type="number" id="early_max_spread_pct" value="0" step="0.01" min="0" max="5">
                         </div>
                         <div class="form-group">
-                            <label>초반 레짐: 횡보장 제외(N틱/레인지%) <code class="setting-var">early_range_lookback_ticks</code> / <code class="setting-var">early_min_range_pct</code></label>
+                            <label>초반 레짐: 횡보장 제외(N틱/레인지%) <code class="setting-var">early_range_lookback_ticks</code> / <code class="setting-var">early_min_range_ratio</code></label>
                             <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:10px;">
                                 <input type="number" id="early_range_lookback_ticks" value="0" min="0" max="300">
                                 <input type="number" id="early_min_range_pct" value="0" step="0.01" min="0" max="20">
@@ -1741,6 +1810,7 @@ def get_dashboard_html(username: str) -> str:
                         <div class="form-group">
                             <label>하락추세 제외 적용 시작 시각(HH:MM): <code class="setting-var">drawdown_filter_after_hhmm</code></label>
                             <input type="text" id="drawdown_filter_after_hhmm" value="12:00" placeholder="12:00">
+                            <div class="hint">이 시각 이후에만 고점 대비 하락 필터를 적용합니다. 장초(9~10시) 재선정 시 12:00으로 두면 필터가 적용되지 않아 후보가 잘 걸립니다.</div>
                         </div>
                     </details>
 
@@ -2060,7 +2130,7 @@ def get_dashboard_html(username: str) -> str:
                                 켜면 장 시작 후 일정 시간 동안 “최소 거래량·거래대금”을 기본값보다 더 높게 적용합니다. 초반 몇 건 체결만으로 랭킹에 올라온 종목을 걸러내는 용도입니다.
                             </div>
                             <div class="help-item">
-                                <strong>고점 대비 하락추세 제외 (<code>exclude_drawdown</code> / <code>max_drawdown_pct</code>)</strong>
+                                <strong>고점 대비 하락추세 제외 (<code>exclude_drawdown</code> / <code>max_drawdown_from_high_ratio</code>)</strong>
                                 켜면 “당일 고점 대비 N% 이상 내려온 종목”을 후보에서 제외합니다. 오후에 선정할 때 “아침에 고점 찍고 밀린 종목”을 빼는 데 씁니다. 고가는 선정 시점까지의 당일 장중 고가이므로, 9:30 선정이면 드로우다운이 작고 13:00 선정이면 같은 N%여도 더 많이 제외됩니다. 실전에서는 10~12% 이상으로 두어야 한두 종목이라도 선정되는 경우가 많습니다.
                             </div>
                         </div>
@@ -3303,6 +3373,16 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 const el = document.getElementById('performance_recommend_interval_minutes');
                 if (el) el.value = data.performance_recommend_interval_minutes;
             }}
+            // Preflight badge/status
+            if (window._systemRunning) {{
+                _setPreflightBadge('warn', '실행 중');
+                const box = document.getElementById('preflightResult');
+                if (box) box.style.display = 'none';
+            }} else {{
+                if (!window.__lastPreflight) {{
+                    _setPreflightBadge('', '미실행');
+                }}
+            }}
             updateSettingsSummaries();
         }}
 
@@ -3901,6 +3981,13 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
 
         async function startSystem() {{
             try {{
+                // 시작 전 Preflight를 먼저 실행해 UI에 차단 사유를 즉시 표시
+                const pf = await runPreflight(true);
+                if (pf && pf.success && pf.preflight && pf.preflight.ok === false) {{
+                    renderPreflight(pf.preflight);
+                    addLog('시스템 시작 차단(Preflight): issues를 해결한 뒤 다시 시도하세요.', 'error');
+                    return;
+                }}
                 const response = await fetch('/api/system/start', {{ method: 'POST' }});
                 const data = await response.json();
                 if (data.success) {{
@@ -3989,6 +4076,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     if (risk.max_trades_per_day != null) document.getElementById('max_trades_per_day').value = risk.max_trades_per_day;
                     if (risk.max_trades_per_stock_per_day != null) document.getElementById('max_trades_per_stock_per_day').value = risk.max_trades_per_stock_per_day;
                     if (risk.max_positions_count != null) document.getElementById('max_positions_count').value = risk.max_positions_count;
+                    if (risk.expand_position_when_few_stocks !== undefined && risk.expand_position_when_few_stocks !== null) {{ const el = document.getElementById('expand_position_when_few_stocks'); if (el) el.checked = !!risk.expand_position_when_few_stocks; }}
                     if (risk.daily_profit_limit_basis != null) document.getElementById('daily_profit_limit_basis').value = risk.daily_profit_limit_basis;
                     if (risk.buy_order_style != null) document.getElementById('buy_order_style').value = risk.buy_order_style;
                     if (risk.sell_order_style != null) document.getElementById('sell_order_style').value = risk.sell_order_style;
@@ -4238,6 +4326,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     max_trades_per_day: parseInt(document.getElementById('max_trades_per_day')?.value) || 12,
                     max_trades_per_stock_per_day: parseInt(document.getElementById('max_trades_per_stock_per_day')?.value) || 0,
                     max_positions_count: parseInt(document.getElementById('max_positions_count')?.value) || 0,
+                    expand_position_when_few_stocks: !!document.getElementById('expand_position_when_few_stocks')?.checked,
                     max_position_size_ratio: 0.1,
                     trailing_stop_ratio: (parseFloat(document.getElementById('trailing_stop_pct').value) || 0) / 100,
                     trailing_activation_ratio: (parseFloat(document.getElementById('trailing_activation_pct').value) || 0) / 100,
@@ -4863,6 +4952,14 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
 
         async function selectStocks(silent = false) {{
             try {{
+                if (window._systemRunning) {{
+                    const msg = '실행 중에는 종목을 재선정할 수 없습니다. 시스템을 중지 → 종목 재선정 → 시스템 시작 순서로 진행하세요.';
+                    if (!silent) {{
+                        addLog(msg, 'warning');
+                        alert(msg);
+                    }}
+                    return {{ success: false, message: msg }};
+                }}
                 const ok = await updateStockSelection(true);
                 if (!ok) {{
                     if (!silent) addLog('종목 재선정 중단: 선정 기준 저장 실패', 'warning');
@@ -4872,7 +4969,13 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 const response = await fetch('/api/stocks/select', {{ method: 'POST' }});
                 const data = await response.json();
                 if (data.success) {{
-                    if (!silent) addLog(`종목 선정 완료: ${{data.stocks.join(', ')}}`, 'info');
+                    if (!silent) {{
+                        if (data.kept_previous) {{
+                            addLog(`선정 결과 없음 → 이전 목록 유지: ${{(data.stocks || []).join(', ') || '-'}}`, 'warning');
+                        }} else {{
+                            addLog(`종목 선정 완료: ${{(data.stocks || []).join(', ')}}`, 'info');
+                        }}
+                    }}
                     await refreshData();
                     return data;
                 }} else {{
@@ -4883,6 +4986,110 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
             }} catch (error) {{
                 if (!silent) addLog('종목 선정 실패: ' + error, 'error');
                 return {{ success: false, message: String(error) }};
+            }}
+        }}
+
+        function _setPreflightBadge(kind, text) {{
+            const el = document.getElementById('preflightBadge');
+            if (!el) return;
+            el.className = 'pill ' + (kind || '');
+            el.textContent = text || '-';
+        }}
+
+        function _escapeHtml(s) {{
+            return String(s == null ? '' : s)
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;')
+                .replaceAll('"', '&quot;')
+                .replaceAll("'", '&#039;');
+        }}
+
+        function renderPreflight(pf) {{
+            const box = document.getElementById('preflightResult');
+            if (!box) return;
+            if (!pf) {{
+                box.style.display = 'none';
+                return;
+            }}
+            box.style.display = 'block';
+            const ok = !!pf.ok;
+            const issues = Array.isArray(pf.issues) ? pf.issues : [];
+            const warnings = Array.isArray(pf.warnings) ? pf.warnings : [];
+            const snap = pf.snapshot || {{}};
+            const risk = (snap.risk || {{}}) || {{}};
+            const strat = (snap.strategy || {{}}) || {{}};
+            const sel = Array.isArray(snap.selected_stocks) ? snap.selected_stocks : [];
+
+            const head = `
+                <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:10px;">
+                    <span class="pill ${{ok ? 'ok' : 'err'}}">${{ok ? 'OK' : 'BLOCKED'}}</span>
+                    <span class="pill ${{issues.length ? 'err' : 'ok'}}">issues: ${{issues.length}}</span>
+                    <span class="pill ${{warnings.length ? 'warn' : 'ok'}}">warnings: ${{warnings.length}}</span>
+                </div>
+            `;
+            const kv = `
+                <div class="preflight-kv">
+                    <div class="k">환경</div><div><code>${{_escapeHtml(snap.is_paper_trading ? '모의' : '실전')}}</code> / <code>${{_escapeHtml(snap.manual_approval ? '수동' : '자동')}}</code></div>
+                    <div class="k">감시 종목</div><div><code>${{_escapeHtml(sel.join(', ') || '-')}}</code></div>
+                    <div class="k">max_single</div><div><code>${{_escapeHtml(risk.max_single_trade_amount ?? '-')}}</code></div>
+                    <div class="k">daily_loss</div><div><code>${{_escapeHtml(risk.daily_loss_limit ?? '-')}}</code></div>
+                    <div class="k">max_pos_ratio</div><div><code>${{_escapeHtml(risk.max_position_size_ratio ?? '-')}}</code></div>
+                    <div class="k">MA</div><div><code>${{_escapeHtml(strat.short_ma_period ?? '-')}}</code> / <code>${{_escapeHtml(strat.long_ma_period ?? '-')}}</code></div>
+                </div>
+            `;
+            const rows = (title, items) => {{
+                const arr = Array.isArray(items) ? items : [];
+                if (!arr.length) {{
+                    return `<div class="hint">${{_escapeHtml(title)}}: 없음</div>`;
+                }}
+                const lis = arr.map(x => `<li style="margin:4px 0;">${{_escapeHtml(x)}}</li>`).join('');
+                return `
+                    <div style="margin:10px 0 6px; font-weight:600; font-size:12px; color:var(--muted);">${{_escapeHtml(title)}}</div>
+                    <ul style="margin:0; padding-left:18px; color: var(--text);">${{lis}}</ul>
+                `;
+            }};
+            box.innerHTML = `
+                ${{head}}
+                ${{kv}}
+                <div style="margin-top:8px;">
+                    ${{rows('issues (시작 차단 사유)', issues)}}
+                    ${{rows('warnings (경고)', warnings)}}
+                </div>
+            `;
+        }}
+
+        async function runPreflight(silent = false) {{
+            try {{
+                _setPreflightBadge('', '점검 중...');
+                const r = await fetch('/api/system/preflight', {{
+                    credentials: 'include',
+                    headers: {{ 'Authorization': 'Bearer ' + (localStorage.getItem('token') || '') }},
+                }});
+                const data = await r.json().catch(() => ({{}}));
+                if (!r.ok || data.success === false) {{
+                    const msg = (data && data.message) ? data.message : ('Preflight 실패: ' + r.status);
+                    _setPreflightBadge('err', '오류');
+                    if (!silent) addLog(msg, 'error');
+                    renderPreflight(null);
+                    return {{ success: false, message: msg }};
+                }}
+                const pf = (data.preflight || null);
+                window.__lastPreflight = pf;
+                if (pf && pf.ok) {{
+                    _setPreflightBadge('ok', 'OK');
+                    if (!silent) addLog('Preflight OK (시작 가능)', 'info');
+                }} else {{
+                    _setPreflightBadge('err', 'BLOCKED');
+                    const issues = (pf && Array.isArray(pf.issues)) ? pf.issues : [];
+                    if (!silent) addLog('Preflight 차단: ' + (issues.join('; ') || 'unknown'), 'error');
+                }}
+                if (!silent) renderPreflight(pf);
+                return {{ success: true, preflight: pf }};
+            }} catch (e) {{
+                _setPreflightBadge('err', '오류');
+                if (!silent) addLog('Preflight 오류: ' + (e.message || e), 'error');
+                return {{ success: false, message: String(e) }};
             }}
         }}
 

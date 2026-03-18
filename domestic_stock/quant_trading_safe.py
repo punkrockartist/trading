@@ -52,6 +52,7 @@ class RiskManager:
         # 포지션 크기 제한 (계좌 자산의 최대 비율)
         self.max_position_size_ratio = 0.1  # 10% (매우 보수적)
         self.max_single_trade_amount = 1000000  # 최대 100만원
+        self.expand_position_when_few_stocks = True  # True: 선정 1~2종목일 때 잔고 활용 확대
         # 최소 매수 수량 (0/1이면 사실상 제한 없음)
         self.min_order_quantity = 1
         
@@ -147,8 +148,22 @@ class RiskManager:
         self._highest_price: Dict[str, float] = {}
         # 동시성: 엔진 스레드 vs reconcile 루프에서 positions/_pending_orders 보호
         self._lock = threading.Lock()
+
+    def get_effective_position_ratio(self, selected_count: Optional[int] = None) -> float:
+        """
+        선정 종목 수에 따른 종목당 허용 포지션 비율.
+        - expand_position_when_few_stocks False면 항상 max_position_size_ratio.
+        - True일 때: 1종목 100%, 2종목 50% each, 3종목 이상 max_position_size_ratio(기본 10%).
+        """
+        if not bool(getattr(self, "expand_position_when_few_stocks", True)):
+            return float(getattr(self, "max_position_size_ratio", 0.1) or 0.1)
+        n = int(selected_count) if selected_count is not None and selected_count > 0 else 999
+        base = float(getattr(self, "max_position_size_ratio", 0.1) or 0.1)
+        if n <= 2:
+            return min(1.0, 1.0 / n)
+        return base
         
-    def can_trade(self, stock_code: str, price: float, quantity: int) -> Tuple[bool, str]:
+    def can_trade(self, stock_code: str, price: float, quantity: int, selected_count: Optional[int] = None) -> Tuple[bool, str]:
         """
         거래 가능 여부 확인
         
@@ -247,10 +262,11 @@ class RiskManager:
         if trade_amount > self.max_single_trade_amount:
             return False, f"거래 금액 초과 (최대: {self.max_single_trade_amount:,}원)"
         
-        # 4. 포지션 크기 비율 체크
-        max_position_value = self.account_balance * self.max_position_size_ratio
+        # 4. 포지션 크기 비율 체크 (선정 1~2종목일 때 잔고 대비 허용 비율 확대)
+        effective_ratio = self.get_effective_position_ratio(selected_count)
+        max_position_value = self.account_balance * effective_ratio
         if trade_amount > max_position_value:
-            return False, f"포지션 크기 초과 (최대: {max_position_value:,.0f}원, 계좌의 {self.max_position_size_ratio*100}%)"
+            return False, f"포지션 크기 초과 (최대: {max_position_value:,.0f}원, 계좌의 {effective_ratio*100:.0f}%)"
         
         # 4-1. 동시 보유 종목 수 상한 (0이면 미적용). 거절 직전에 체결 확인 훅 실행 후 재검사(접수대기→체결 반영 지연 보정)
         max_pos = int(getattr(self, "max_positions_count", 0) or 0)
@@ -372,18 +388,20 @@ class RiskManager:
                 if k.startswith(prefix):
                     self._pending_orders.pop(k, None)
     
-    def calculate_quantity(self, price: float) -> int:
+    def calculate_quantity(self, price: float, selected_count: Optional[int] = None) -> int:
         """
         거래 수량 계산.
         - max_loss_per_stock_krw > 0 이면: position size = risk / stop distance (고정 리스크 per trade).
         - 아니면: 계좌 잔고·최대 거래금액 기반 금액/가격.
+        - selected_count 1~2일 때 종목당 허용 비율 확대(잔고 전체 활용).
         """
         min_q = max(1, int(self.min_order_quantity or 1))
         if price <= 0:
             return min_q
+        effective_ratio = self.get_effective_position_ratio(selected_count)
         max_trade_amount = min(
             float(getattr(self, "max_single_trade_amount", 0) or 0),
-            float(getattr(self, "account_balance", 0) or 0) * float(getattr(self, "max_position_size_ratio", 0) or 0),
+            float(getattr(self, "account_balance", 0) or 0) * effective_ratio,
         )
         # 리스크 기반: 수량 = risk_per_trade / stop_distance (손절거리)
         max_loss = int(getattr(self, "max_loss_per_stock_krw", 0) or 0)
@@ -404,6 +422,7 @@ class RiskManager:
         stock_code: str,
         price: float,
         fallback_quantity: int,
+        selected_count: Optional[int] = None,
     ) -> int:
         """
         변동성 기반(ATR 유사) 사이징:
@@ -441,9 +460,10 @@ class RiskManager:
                 qty_risk = int(max_loss / risk_per_share)
                 if qty_risk <= 0:
                     return int(fallback_quantity)
+                eff_ratio = self.get_effective_position_ratio(selected_count)
                 max_trade_amount = min(
                     float(getattr(self, "max_single_trade_amount", 0) or 0),
-                    float(getattr(self, "account_balance", 0) or 0) * float(getattr(self, "max_position_size_ratio", 0) or 0),
+                    float(getattr(self, "account_balance", 0) or 0) * eff_ratio,
                 )
                 qty_amount = int(max_trade_amount / price) if max_trade_amount > 0 else qty_risk
                 min_q = max(1, int(self.min_order_quantity or 1))
@@ -461,9 +481,10 @@ class RiskManager:
                     risk_per_share = max(stop_by_ratio, vol_floor)
                     qty_risk = int(max_loss / risk_per_share)
                     if qty_risk > 0:
+                        eff_ratio = self.get_effective_position_ratio(selected_count)
                         max_trade_amount = min(
                             float(getattr(self, "max_single_trade_amount", 0) or 0),
-                            float(getattr(self, "account_balance", 0) or 0) * float(getattr(self, "max_position_size_ratio", 0) or 0),
+                            float(getattr(self, "account_balance", 0) or 0) * eff_ratio,
                         )
                         qty_amount = int(max_trade_amount / price) if max_trade_amount > 0 else qty_risk
                         min_q = max(1, int(self.min_order_quantity or 1))
@@ -480,10 +501,11 @@ class RiskManager:
             if qty_risk <= 0:
                 return 0
 
-            # 금액 기반 상한도 같이 적용
+            # 금액 기반 상한도 같이 적용 (선정 1~2종목일 때 잔고 활용 확대)
+            eff_ratio = self.get_effective_position_ratio(selected_count)
             max_trade_amount = min(
                 float(getattr(self, "max_single_trade_amount", 0) or 0),
-                float(getattr(self, "account_balance", 0) or 0) * float(getattr(self, "max_position_size_ratio", 0) or 0),
+                float(getattr(self, "account_balance", 0) or 0) * eff_ratio,
             )
             qty_amount = int(max_trade_amount / price) if max_trade_amount > 0 else qty_risk
             min_q = 1
@@ -1145,6 +1167,7 @@ def safe_execute_order(
     manual_approval: bool = True,  # 수동 승인 필요 여부
     return_details: bool = False,
     quantity_override: Optional[int] = None,
+    selected_stocks_count: Optional[int] = None,  # 선정 종목 수(1~2일 때 잔고 활용 확대)
 ):
     """
     안전한 주문 실행
@@ -1157,7 +1180,13 @@ def safe_execute_order(
         trenv: KIS 환경 변수
         is_paper_trading: 모의투자 여부 (True: 모의투자, False: 실전투자)
         manual_approval: 수동 승인 필요 여부
+        selected_stocks_count: 선정 종목 수. 1~2일 때 종목당 잔고 활용 비율 확대(100%/50%).
     """
+    if signal not in ("buy", "sell"):
+        if return_details:
+            return False, {"ok": False, "reason": f"invalid signal: {signal}"}
+        return False
+
     risk_mgr = strategy.risk_manager
     
     # 환경 설정 확인
@@ -1170,6 +1199,16 @@ def safe_execute_order(
         "is_paper_trading": is_paper_trading,
         "env_dv": "demo" if is_paper_trading else "real",
     }
+    # 기본 입력 검증: 비정상 값이면 주문 자체를 막아 예기치 않은 주문/예외를 방지
+    try:
+        if float(price) <= 0:
+            raise ValueError("price<=0")
+    except Exception:
+        if return_details:
+            details["ok"] = False
+            details["reason"] = "invalid price"
+            return False, details
+        return False
 
     if signal == "buy":
         # 거래 수량 계산 (override가 있으면 우선)
@@ -1180,18 +1219,23 @@ def safe_execute_order(
         except Exception:
             quantity = None
         if quantity is None:
-            base_qty = risk_mgr.calculate_quantity(price)
-            quantity = risk_mgr.calculate_quantity_with_volatility(stock_code, price, fallback_quantity=base_qty)
-        # 최대 거래 금액 상한으로 수량 상한 적용 (계산/override 오류 시에도 주문 실패 방지)
+            base_qty = risk_mgr.calculate_quantity(price, selected_count=selected_stocks_count)
+            quantity = risk_mgr.calculate_quantity_with_volatility(
+                stock_code, price, fallback_quantity=base_qty, selected_count=selected_stocks_count
+            )
+        # 최대 거래 금액 상한으로 수량 상한 적용 (선정 1~2종목일 때 잔고 비율 반영)
         max_amt = float(getattr(risk_mgr, "max_single_trade_amount", 0) or 0)
         if price > 0 and max_amt > 0:
-            qty_cap = max(1, int(max_amt / price))
-            if quantity > qty_cap:
-                quantity = qty_cap
+            eff_ratio = risk_mgr.get_effective_position_ratio(selected_stocks_count)
+            amt_cap = min(max_amt, float(getattr(risk_mgr, "account_balance", 0) or 0) * eff_ratio)
+            if amt_cap > 0:
+                qty_cap = max(1, int(amt_cap / price))
+                if quantity > qty_cap:
+                    quantity = qty_cap
         details["quantity"] = int(quantity)
         
         # 거래 가능 여부 확인
-        can_trade, reason = risk_mgr.can_trade(stock_code, price, quantity)
+        can_trade, reason = risk_mgr.can_trade(stock_code, price, quantity, selected_count=selected_stocks_count)
         
         if not can_trade:
             logging.warning(f"[매수 거부] {stock_code}: {reason}")
@@ -1228,7 +1272,8 @@ def safe_execute_order(
             attempts = []
             last_result = pd.DataFrame()
             last_style_used = style
-            net_retries = min(3, 2)
+            # 네트워크 재시도(Timeout/Connection/OSError)는 별도로 짧게 수행 (주문 중복 방지 위해 과도하게 늘리지 않음)
+            net_retries = 2
             base_delay = max(200, min(10000, int(getattr(risk_mgr, "order_retry_base_delay_ms", 1000) or 1000)))
             use_backoff = bool(getattr(risk_mgr, "order_retry_exponential_backoff", True))
             for i in range(retries + 1):
@@ -1449,6 +1494,12 @@ def safe_execute_order(
         except Exception:
             pass
         details["quantity"] = int(quantity)
+        if quantity <= 0:
+            details["ok"] = False
+            details["reason"] = "invalid quantity"
+            if return_details:
+                return False, details
+            return False
         
         # 수동 승인 필요 시
         if manual_approval:
@@ -1479,7 +1530,7 @@ def safe_execute_order(
             attempts = []
             last_result = pd.DataFrame()
             last_style_used = style
-            net_retries = min(3, 2)
+            net_retries = 2
             base_delay = max(200, min(10000, int(getattr(risk_mgr, "order_retry_base_delay_ms", 1000) or 1000)))
             use_backoff = bool(getattr(risk_mgr, "order_retry_exponential_backoff", True))
             for i in range(retries + 1):

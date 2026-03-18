@@ -879,19 +879,19 @@ async def _pending_order_reconciler_loop():
 
             now_ts = time.time()
 
-            # 자동 리밸런싱(종목 주기 재선정): 설정 시 N분마다 재선정, 목록 갱신(다음 시작 시 적용)
+            # 자동 리밸런싱(종목 주기 재선정)
+            # 정책: 실행 중에는 종목 변경 불가(중지→재선정→재시작). 실행 중에는 자동 재선정도 수행하지 않음.
             enable_rebal = bool(getattr(state, "enable_auto_rebalance", False))
             rebal_min = int(getattr(state, "auto_rebalance_interval_minutes", 30) or 30)
             rebal_min = max(5, min(120, rebal_min))
             if enable_rebal and (now_ts - last_rebalance_ts) >= (rebal_min * 60.0):
                 last_rebalance_ts = now_ts
                 try:
-                    selected_codes, selected_info = await asyncio.to_thread(_run_auto_rebalance_sync)
-                    if selected_codes:
-                        state.selected_stocks = selected_codes
-                        state.selected_stock_info = selected_info
-                        await state.broadcast({"type": "log", "level": "info", "message": f"자동 리밸런싱: 종목 {len(selected_codes)}개 갱신됨. 변경 사항은 다음 시스템 시작 시 적용됩니다."})
-                        await state.broadcast({"type": "selected_stocks", "data": {"codes": selected_codes, "info": selected_info}})
+                    await state.broadcast({
+                        "type": "log",
+                        "level": "warning",
+                        "message": "자동 리밸런싱: 실행 중에는 종목을 변경할 수 없어 자동 재선정을 수행하지 않습니다. (중지 → 재선정 → 시작)",
+                    })
                 except Exception as e:
                     logger.warning(f"자동 리밸런싱 오류(무시): {e}")
 
@@ -1120,8 +1120,20 @@ def _apply_risk_config_dict_to_state(d: dict) -> None:
             rm.order_retry_count = int(d.get("order_retry_count") or 0)
         if "order_retry_delay_ms" in d:
             rm.order_retry_delay_ms = int(d.get("order_retry_delay_ms") or 300)
+        if "order_retry_exponential_backoff" in d:
+            rm.order_retry_exponential_backoff = bool(d.get("order_retry_exponential_backoff", True))
+        if "order_retry_base_delay_ms" in d:
+            rm.order_retry_base_delay_ms = max(200, min(10000, int(d.get("order_retry_base_delay_ms") or 1000)))
         if "order_fallback_to_market" in d:
             rm.order_fallback_to_market = bool(d.get("order_fallback_to_market", True))
+        if "daily_loss_limit_calendar" in d:
+            rm.daily_loss_limit_calendar = bool(d.get("daily_loss_limit_calendar", True))
+        if "daily_profit_limit_calendar" in d:
+            rm.daily_profit_limit_calendar = bool(d.get("daily_profit_limit_calendar", True))
+        if "monthly_loss_limit" in d:
+            rm.monthly_loss_limit = max(0, int(d.get("monthly_loss_limit") or 0))
+        if "cumulative_loss_limit" in d:
+            rm.cumulative_loss_limit = max(0, int(d.get("cumulative_loss_limit") or 0))
         if "enable_volatility_sizing" in d:
             rm.enable_volatility_sizing = bool(d.get("enable_volatility_sizing", False))
         if "volatility_lookback_ticks" in d:
@@ -1173,6 +1185,8 @@ def _apply_risk_config_dict_to_state(d: dict) -> None:
             rm.atr_lookback_ticks = max(2, min(300, int(d.get("atr_lookback_ticks") or 20)))
         if "max_positions_count" in d:
             rm.max_positions_count = max(0, min(50, int(d.get("max_positions_count") or 0)))
+        if "expand_position_when_few_stocks" in d:
+            rm.expand_position_when_few_stocks = bool(d.get("expand_position_when_few_stocks", True))
     except Exception as e:
         logger.warning(f"저장된 리스크 설정 적용 중 오류(무시): {e}")
 
@@ -1210,33 +1224,114 @@ def _apply_operational_config_dict_to_state(d: dict) -> None:
         logger.warning(f"저장된 운영 옵션 적용 중 오류(무시): {e}")
 
 
+def _apply_strategy_config_to_state(config: "StrategyConfig") -> None:
+    """StrategyConfig를 state 및 state.strategy에 반영. POST /api/config/strategy와 DB 로드 시 공통 사용."""
+    if getattr(state, "strategy", None):
+        short_period = int(config.short_ma_period)
+        long_period = int(config.long_ma_period)
+        if short_period >= 2 and long_period >= 3 and short_period < long_period:
+            state.strategy.short_ma_period = short_period
+            state.strategy.long_ma_period = long_period
+            state.strategy.min_history_length = long_period
+        state.strategy.min_hold_seconds = max(0, int(getattr(config, "min_hold_seconds", 0) or 0))
+    start_hhmm = str(getattr(config, "buy_window_start_hhmm", getattr(state, "buy_window_start_hhmm", "09:05")) or "09:05")
+    end_hhmm = str(getattr(config, "buy_window_end_hhmm", getattr(state, "buy_window_end_hhmm", "11:30")) or "11:30")
+    state.buy_window_start_hhmm = start_hhmm
+    state.buy_window_end_hhmm = end_hhmm
+    state.min_short_ma_slope_ratio = float(getattr(config, "min_short_ma_slope_ratio", getattr(state, "min_short_ma_slope_ratio", 0.0)) or 0.0)
+    state.momentum_lookback_ticks = int(getattr(config, "momentum_lookback_ticks", getattr(state, "momentum_lookback_ticks", 0)) or 0)
+    state.min_momentum_ratio = float(getattr(config, "min_momentum_ratio", getattr(state, "min_momentum_ratio", 0.0)) or 0.0)
+    state.entry_confirm_enabled = bool(getattr(config, "entry_confirm_enabled", getattr(state, "entry_confirm_enabled", False)))
+    state.entry_confirm_min_count = int(getattr(config, "entry_confirm_min_count", getattr(state, "entry_confirm_min_count", 1)) or 1)
+    state.confirm_breakout_enabled = bool(getattr(config, "confirm_breakout_enabled", getattr(state, "confirm_breakout_enabled", False)))
+    state.breakout_lookback_ticks = int(getattr(config, "breakout_lookback_ticks", getattr(state, "breakout_lookback_ticks", 20)) or 20)
+    state.breakout_buffer_ratio = float(getattr(config, "breakout_buffer_ratio", getattr(state, "breakout_buffer_ratio", 0.0)) or 0.0)
+    state.confirm_volume_surge_enabled = bool(getattr(config, "confirm_volume_surge_enabled", getattr(state, "confirm_volume_surge_enabled", False)))
+    state.volume_surge_lookback_ticks = int(getattr(config, "volume_surge_lookback_ticks", getattr(state, "volume_surge_lookback_ticks", 20)) or 20)
+    state.volume_surge_ratio = float(getattr(config, "volume_surge_ratio", getattr(state, "volume_surge_ratio", 2.0)) or 2.0)
+    state.confirm_trade_value_surge_enabled = bool(getattr(config, "confirm_trade_value_surge_enabled", getattr(state, "confirm_trade_value_surge_enabled", False)))
+    state.trade_value_surge_lookback_ticks = int(getattr(config, "trade_value_surge_lookback_ticks", getattr(state, "trade_value_surge_lookback_ticks", 20)) or 20)
+    state.trade_value_surge_ratio = float(getattr(config, "trade_value_surge_ratio", getattr(state, "trade_value_surge_ratio", 2.0)) or 2.0)
+    state.avoid_chase_near_high_enabled = bool(getattr(config, "avoid_chase_near_high_enabled", getattr(state, "avoid_chase_near_high_enabled", False)))
+    state.near_high_lookback_minutes = int(getattr(config, "near_high_lookback_minutes", getattr(state, "near_high_lookback_minutes", 2)) or 2)
+    state.avoid_near_high_ratio = float(getattr(config, "avoid_near_high_ratio", getattr(state, "avoid_near_high_ratio", 0.003)) or 0.003)
+    state.avoid_near_high_dynamic = bool(getattr(config, "avoid_near_high_dynamic", getattr(state, "avoid_near_high_dynamic", False)))
+    state.avoid_near_high_vs_vol_mult = float(getattr(config, "avoid_near_high_vs_vol_mult", getattr(state, "avoid_near_high_vs_vol_mult", 0.0)) or 0.0)
+    state.minute_trend_enabled = bool(getattr(config, "minute_trend_enabled", getattr(state, "minute_trend_enabled", False)))
+    state.minute_trend_lookback_bars = int(getattr(config, "minute_trend_lookback_bars", getattr(state, "minute_trend_lookback_bars", 2)) or 2)
+    state.minute_trend_min_green_bars = int(getattr(config, "minute_trend_min_green_bars", getattr(state, "minute_trend_min_green_bars", 2)) or 2)
+    state.minute_trend_mode = str(getattr(config, "minute_trend_mode", getattr(state, "minute_trend_mode", "green")) or "green")
+    state.minute_trend_early_only = bool(getattr(config, "minute_trend_early_only", getattr(state, "minute_trend_early_only", False)))
+    state.vol_norm_lookback_ticks = int(getattr(config, "vol_norm_lookback_ticks", getattr(state, "vol_norm_lookback_ticks", 20)) or 20)
+    state.slope_vs_vol_mult = float(getattr(config, "slope_vs_vol_mult", getattr(state, "slope_vs_vol_mult", 0.0)) or 0.0)
+    state.range_vs_vol_mult = float(getattr(config, "range_vs_vol_mult", getattr(state, "range_vs_vol_mult", 0.0)) or 0.0)
+    state.enable_morning_regime_split = bool(getattr(config, "enable_morning_regime_split", getattr(state, "enable_morning_regime_split", False)))
+    state.morning_regime_early_end_hhmm = str(getattr(config, "morning_regime_early_end_hhmm", getattr(state, "morning_regime_early_end_hhmm", "09:10")) or "09:10")
+    state.early_min_short_ma_slope_ratio = float(getattr(config, "early_min_short_ma_slope_ratio", getattr(state, "early_min_short_ma_slope_ratio", 0.0)) or 0.0)
+    state.early_momentum_lookback_ticks = int(getattr(config, "early_momentum_lookback_ticks", getattr(state, "early_momentum_lookback_ticks", 0)) or 0)
+    state.early_min_momentum_ratio = float(getattr(config, "early_min_momentum_ratio", getattr(state, "early_min_momentum_ratio", 0.0)) or 0.0)
+    state.early_buy_confirm_ticks = int(getattr(config, "early_buy_confirm_ticks", getattr(state, "early_buy_confirm_ticks", 1)) or 1)
+    state.early_max_spread_ratio = float(getattr(config, "early_max_spread_ratio", getattr(state, "early_max_spread_ratio", 0.0)) or 0.0)
+    state.early_range_lookback_ticks = int(getattr(config, "early_range_lookback_ticks", getattr(state, "early_range_lookback_ticks", 0)) or 0)
+    state.early_min_range_ratio = float(getattr(config, "early_min_range_ratio", getattr(state, "early_min_range_ratio", 0.0)) or 0.0)
+    state.reentry_cooldown_seconds = int(getattr(config, "reentry_cooldown_seconds", getattr(state, "reentry_cooldown_seconds", 240)) or 0)
+    if getattr(state, "risk_manager", None):
+        state.risk_manager.reentry_cooldown_seconds = int(state.reentry_cooldown_seconds or 0)
+    state.consecutive_loss_cooldown_enabled = bool(getattr(config, "consecutive_loss_cooldown_enabled", getattr(state, "consecutive_loss_cooldown_enabled", False)))
+    state.consecutive_loss_count_threshold = max(2, min(5, int(getattr(config, "consecutive_loss_count_threshold", getattr(state, "consecutive_loss_count_threshold", 2)) or 2)))
+    state.consecutive_loss_cooldown_mult = max(1.0, min(5.0, float(getattr(config, "consecutive_loss_cooldown_mult", getattr(state, "consecutive_loss_cooldown_mult", 2.0)) or 2.0)))
+    state.index_ma_filter_enabled = bool(getattr(config, "index_ma_filter_enabled", getattr(state, "index_ma_filter_enabled", False)))
+    state.index_ma_code = str(getattr(config, "index_ma_code", getattr(state, "index_ma_code", "1001")) or "1001")
+    state.index_ma_period = max(5, min(60, int(getattr(config, "index_ma_period", getattr(state, "index_ma_period", 20)) or 20)))
+    state.advance_ratio_filter_enabled = bool(getattr(config, "advance_ratio_filter_enabled", getattr(state, "advance_ratio_filter_enabled", False)))
+    state.advance_ratio_market = str(getattr(config, "advance_ratio_market", getattr(state, "advance_ratio_market", "1001")) or "1001")
+    state.advance_ratio_min_pct = max(0.0, min(100.0, float(getattr(config, "advance_ratio_min_pct", getattr(state, "advance_ratio_min_pct", 35.0)) or 35.0)))
+    state.circuit_breaker_filter_enabled = bool(getattr(config, "circuit_breaker_filter_enabled", getattr(state, "circuit_breaker_filter_enabled", True)))
+    state.circuit_breaker_market = str(getattr(config, "circuit_breaker_market", getattr(state, "circuit_breaker_market", "0001")) or "0001")
+    state.circuit_breaker_threshold_pct = max(-20.0, min(0.0, float(getattr(config, "circuit_breaker_threshold_pct", getattr(state, "circuit_breaker_threshold_pct", -7.0)) or -7.0)))
+    state.circuit_breaker_action = str(getattr(config, "circuit_breaker_action", getattr(state, "circuit_breaker_action", "skip_buy_only")) or "skip_buy_only").strip().lower()
+    if state.circuit_breaker_action not in ("skip_buy_only", "liquidate_all", "liquidate_partial", "no_buy_rest_of_day"):
+        state.circuit_breaker_action = "skip_buy_only"
+    state.sidecar_filter_enabled = bool(getattr(config, "sidecar_filter_enabled", getattr(state, "sidecar_filter_enabled", True)))
+    state.sidecar_market = str(getattr(config, "sidecar_market", getattr(state, "sidecar_market", "0001")) or "0001")
+    state.sidecar_cooling_minutes = max(1, min(30, int(getattr(config, "sidecar_cooling_minutes", getattr(state, "sidecar_cooling_minutes", 5)) or 5)))
+    state.sidecar_action = str(getattr(config, "sidecar_action", getattr(state, "sidecar_action", "skip_buy_only")) or "skip_buy_only").strip().lower()
+    if state.sidecar_action not in ("skip_buy_only", "liquidate_all", "liquidate_partial", "no_buy_rest_of_day"):
+        state.sidecar_action = "skip_buy_only"
+    state.vi_filter_enabled = bool(getattr(config, "vi_filter_enabled", getattr(state, "vi_filter_enabled", True)))
+    state.vi_cooling_minutes = max(1, min(30, int(getattr(config, "vi_cooling_minutes", getattr(state, "vi_cooling_minutes", 5)) or 5)))
+    state.trade_value_concentration_filter_enabled = bool(getattr(config, "trade_value_concentration_filter_enabled", getattr(state, "trade_value_concentration_filter_enabled", False)))
+    state.trade_value_concentration_market = str(getattr(config, "trade_value_concentration_market", getattr(state, "trade_value_concentration_market", "1001")) or "1001")
+    state.trade_value_concentration_top_n = max(2, min(20, int(getattr(config, "trade_value_concentration_top_n", getattr(state, "trade_value_concentration_top_n", 10)) or 10)))
+    state.trade_value_concentration_denom_n = max(state.trade_value_concentration_top_n + 1, min(50, int(getattr(config, "trade_value_concentration_denom_n", getattr(state, "trade_value_concentration_denom_n", 30)) or 30)))
+    state.trade_value_concentration_max_pct = max(10.0, min(80.0, float(getattr(config, "trade_value_concentration_max_pct", getattr(state, "trade_value_concentration_max_pct", 45.0)) or 45.0)))
+    state.buy_confirm_ticks = int(getattr(config, "buy_confirm_ticks", getattr(state, "buy_confirm_ticks", 1)) or 1)
+    state.enable_time_liquidation = bool(getattr(config, "enable_time_liquidation", getattr(state, "enable_time_liquidation", False)))
+    state.liquidate_after_hhmm = str(getattr(config, "liquidate_after_hhmm", getattr(state, "liquidate_after_hhmm", "11:55")) or "11:55")
+    state.max_spread_ratio = float(getattr(config, "max_spread_ratio", getattr(state, "max_spread_ratio", 0.0)) or 0.0)
+    state.range_lookback_ticks = int(getattr(config, "range_lookback_ticks", getattr(state, "range_lookback_ticks", 0)) or 0)
+    state.min_range_ratio = float(getattr(config, "min_range_ratio", getattr(state, "min_range_ratio", 0.0)) or 0.0)
+    state.use_sap_revert_entry = bool(getattr(config, "use_sap_revert_entry", getattr(state, "use_sap_revert_entry", False)))
+    state.sap_revert_entry_from_pct = float(getattr(config, "sap_revert_entry_from_pct", getattr(state, "sap_revert_entry_from_pct", -1.5)) or -1.5)
+    state.sap_revert_entry_to_pct = float(getattr(config, "sap_revert_entry_to_pct", getattr(state, "sap_revert_entry_to_pct", -0.5)) or -0.5)
+    state.min_volume_ratio_for_entry = max(0.0, min(5.0, float(getattr(config, "min_volume_ratio_for_entry", 0.0) or 0.0)))
+    state.min_trade_amount_ratio_for_entry = max(0.0, min(5.0, float(getattr(config, "min_trade_amount_ratio_for_entry", 0.0) or 0.0)))
+    state.skip_buy_first_minutes = max(0, min(30, int(getattr(config, "skip_buy_first_minutes", 0) or 0)))
+    state.relative_strength_filter_enabled = bool(getattr(config, "relative_strength_filter_enabled", False))
+    state.relative_strength_index_code = str(getattr(config, "relative_strength_index_code", "0001") or "0001")
+    state.relative_strength_margin_pct = float(getattr(config, "relative_strength_margin_pct", 0.0) or 0.0)
+    state.last_minutes_no_buy = max(0, min(60, int(getattr(config, "last_minutes_no_buy", 0) or 0)))
+    state.advance_ratio_down_market_skip = bool(getattr(config, "advance_ratio_down_market_skip", True))
+    state.skip_buy_below_high_pct = max(0.0, min(0.20, float(getattr(config, "skip_buy_below_high_pct", 0.0) or 0.0)))
+
+
 def _apply_strategy_config_dict_to_state(d: dict) -> None:
-    """DB에서 불러온 strategy_config를 state에 반영. /api/system/status가 DB값을 반환해 refreshData()가 폼을 덮어쓰지 않도록 함."""
+    """DB에서 불러온 strategy_config를 state에 반영. StrategyConfig로 검증 후 _apply_strategy_config_to_state 호출."""
     if not d or not isinstance(d, dict):
         return
     try:
-        if getattr(state, "strategy", None):
-            short_p = d.get("short_ma_period")
-            long_p = d.get("long_ma_period")
-            if short_p is not None and long_p is not None:
-                short_period = int(short_p)
-                long_period = int(long_p)
-                if short_period >= 2 and long_period >= 3 and short_period < long_period:
-                    state.strategy.short_ma_period = short_period
-                    state.strategy.long_ma_period = long_period
-                    state.strategy.min_history_length = long_period
-            min_hold = d.get("min_hold_seconds")
-            if min_hold is not None:
-                state.strategy.min_hold_seconds = max(0, int(min_hold))
-        # 재진입 쿨다운: DB에 저장된 값이 있으면 state·risk_manager에 반영 (시작/설정 로드 시 적용)
-        reentry = d.get("reentry_cooldown_seconds")
-        if reentry is not None:
-            state.reentry_cooldown_seconds = max(0, int(reentry))
-            if getattr(state, "risk_manager", None):
-                state.risk_manager.reentry_cooldown_seconds = state.reentry_cooldown_seconds
-        below_high = d.get("skip_buy_below_high_pct")
-        if below_high is not None:
-            state.skip_buy_below_high_pct = max(0.0, min(0.20, float(below_high)))
+        config = StrategyConfig.model_validate(d)
+        _apply_strategy_config_to_state(config)
     except Exception as e:
         logger.warning(f"저장된 전략 설정 적용 중 오류(무시): {e}")
 
@@ -1935,6 +2030,7 @@ def _handle_signal(stock_code: str, signal: str, price: float, reason: str, sugg
         manual_approval=False,
         return_details=True,
         quantity_override=suggested_qty_override,
+        selected_stocks_count=len(getattr(state, "selected_stocks", None) or []),
     )
     if not result:
         reason = details.get("reason") or ""
@@ -2077,7 +2173,18 @@ def _handle_signal(stock_code: str, signal: str, price: float, reason: str, sugg
 
 
 def _start_trading_engine_thread():
-    """실시간 체결 수신 -> 신호 생성 -> 승인 대기 등록."""
+    """실시간 체결 수신 -> 신호 생성 -> 승인 대기 등록. 선정 종목 목록은 구독 시점의 state.selected_stocks 사용."""
+    # 이전 엔진 스레드가 아직 살아 있으면(중지 후 WS가 아직 끊기지 않은 경우) 종료될 때까지 대기
+    engine_thread = getattr(state, "engine_thread", None)
+    if engine_thread is not None and engine_thread.is_alive():
+        state.engine_running = False
+        for _ in range(16):
+            time.sleep(0.5)
+            if not (getattr(state, "engine_thread", None) and state.engine_thread.is_alive()):
+                break
+        if getattr(state, "engine_thread", None) and state.engine_thread.is_alive():
+            logger.warning("엔진 스레드가 아직 종료되지 않음. WebSocket 연결이 끊길 때까지 잠시 기다린 뒤 다시 시작하세요.")
+            return
     if state.engine_running:
         return
 
@@ -2107,6 +2214,9 @@ def _start_trading_engine_thread():
                 if not getattr(state, "engine_running", True):
                     break
                 try:
+                    # 매 연결마다 구독 목록 초기화 (재선정 시 새 목록만 구독하도록)
+                    for _sub_key in ("ccnl_krx", "asking_price_krx"):
+                        getattr(ka, "open_map", {}).pop(_sub_key, None)
                     kws = ka.KISWebSocket(api_url="/tryitout")
                     # 선정 종목 + 보유 포지션 종목 모두 구독 (재선정으로 빠진 보유 종목도 매도 신호 수신 가능)
                     selected = state.selected_stocks or []
@@ -2730,11 +2840,8 @@ def _start_trading_engine_thread():
                                                                     "level": "info",
                                                                     "message": f"ATR 필터 | {stock_code} ATR={atr_value:.0f}원 비율={atr_ratio*100:.2f}% 상한(atr_ratio_max_pct)={max_atr_pct}%",
                                                                 })
-                                                    if atr_ratio is None:
-                                                        _record_buy_skip(stock_code, "atr_cap")
-                                                        _throttled_skip_log(stock_code, f"ATR 데이터 부족(분봉 {period_atr}개 미만) → 매수 스킵")
-                                                        continue
-                                                    if (atr_ratio * 100.0) > max_atr_pct:
+                                                    # 분봉이 period 미만이면 이번 틱에서는 ATR 검사 생략 → 장 초반에도 매수 가능(기다릴 필요 없음)
+                                                    if atr_ratio is not None and (atr_ratio * 100.0) > max_atr_pct:
                                                         _record_buy_skip(stock_code, "atr_cap")
                                                         _throttled_skip_log(
                                                             stock_code,
@@ -3317,6 +3424,148 @@ def _get_stock_selection_criteria(current_user: str):
 _STATUS_NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate"}
 
 
+def _build_settings_snapshot_for_preflight(username: str) -> Dict[str, Any]:
+    """시작 전 점검용: DB 설정 + 현재 state 핵심값 스냅샷."""
+    snap: Dict[str, Any] = {
+        "username": username,
+        "is_paper_trading": bool(getattr(state, "is_paper_trading", True)),
+        "manual_approval": bool(getattr(state, "manual_approval", True)),
+        "selected_stocks": list(getattr(state, "selected_stocks", []) or []),
+    }
+    try:
+        rm = getattr(state, "risk_manager", None)
+        if rm:
+            snap["risk"] = {
+                "account_balance": float(getattr(rm, "account_balance", 0) or 0),
+                "max_single_trade_amount": int(getattr(rm, "max_single_trade_amount", 0) or 0),
+                "max_position_size_ratio": float(getattr(rm, "max_position_size_ratio", 0.0) or 0.0),
+                "max_positions_count": int(getattr(rm, "max_positions_count", 0) or 0),
+                "min_order_quantity": int(getattr(rm, "min_order_quantity", 1) or 1),
+                "stop_loss_ratio": float(getattr(rm, "stop_loss_ratio", 0.0) or 0.0),
+                "take_profit_ratio": float(getattr(rm, "take_profit_ratio", 0.0) or 0.0),
+                "daily_loss_limit": int(getattr(rm, "daily_loss_limit", 0) or 0),
+                "daily_total_loss_limit": int(getattr(rm, "daily_total_loss_limit", 0) or 0),
+                "daily_profit_limit": int(getattr(rm, "daily_profit_limit", 0) or 0),
+                "max_trades_per_day": int(getattr(rm, "max_trades_per_day", 0) or 0),
+                "max_trades_per_stock_per_day": int(getattr(rm, "max_trades_per_stock_per_day", 0) or 0),
+                "slippage_bps": int(getattr(rm, "slippage_bps", 0) or 0),
+            }
+    except Exception:
+        pass
+    try:
+        strat = getattr(state, "strategy", None)
+        if strat:
+            snap["strategy"] = {
+                "short_ma_period": int(getattr(strat, "short_ma_period", 0) or 0),
+                "long_ma_period": int(getattr(strat, "long_ma_period", 0) or 0),
+                "min_hold_seconds": int(getattr(strat, "min_hold_seconds", 0) or 0),
+                "buy_window_start_hhmm": str(getattr(state, "buy_window_start_hhmm", "09:05") or "09:05"),
+                "buy_window_end_hhmm": str(getattr(state, "buy_window_end_hhmm", "11:30") or "11:30"),
+            }
+    except Exception:
+        pass
+    try:
+        snap["operational"] = {
+            "enable_auto_rebalance": bool(getattr(state, "enable_auto_rebalance", False)),
+            "auto_rebalance_interval_minutes": int(getattr(state, "auto_rebalance_interval_minutes", 30) or 30),
+        }
+    except Exception:
+        pass
+    try:
+        store = _get_user_settings_store()
+        if store and getattr(store, "enabled", False):
+            snap["db_settings"] = store.load(username) or {}
+    except Exception:
+        pass
+    return snap
+
+
+def _preflight_check(username: str) -> Dict[str, Any]:
+    """
+    시작 전 강제 점검:
+    - 치명 이슈(issues)가 있으면 시작 차단
+    - 경고(warnings)는 로그로 남기되 시작은 허용(필요 시 강화 가능)
+    """
+    issues: List[str] = []
+    warnings: List[str] = []
+
+    # 필수 객체
+    if not getattr(state, "trenv", None):
+        issues.append("KIS 환경(trenv)이 없습니다. (초기화 실패)")
+    if not getattr(state, "risk_manager", None):
+        issues.append("RiskManager가 초기화되지 않았습니다.")
+    if not getattr(state, "strategy", None):
+        issues.append("Strategy가 초기화되지 않았습니다.")
+    if not getattr(state, "stock_selector", None):
+        warnings.append("StockSelector가 없습니다. 종목 재선정 기능이 제한될 수 있습니다.")
+
+    # 실전/자동 안전장치(추가 안전: 여기서는 점검용 메시지)
+    if (not bool(getattr(state, "is_paper_trading", True))) and (not bool(getattr(state, "manual_approval", True))):
+        warnings.append("실전 + 자동(즉시체결) 조합입니다. 안전장치 설정에 따라 시작이 차단될 수 있습니다.")
+
+    # 리스크 핵심값 sanity
+    rm = getattr(state, "risk_manager", None)
+    if rm:
+        try:
+            bal = float(getattr(rm, "account_balance", 0) or 0)
+            if bal <= 0:
+                warnings.append("계좌 잔고(account_balance)가 0 이하입니다. (잔고 조회 실패/초기화 문제 가능)")
+        except Exception:
+            warnings.append("account_balance 파싱 실패")
+        try:
+            msa = int(getattr(rm, "max_single_trade_amount", 0) or 0)
+            if msa <= 0:
+                issues.append("max_single_trade_amount가 0 이하입니다. (주문 상한 미설정)")
+        except Exception:
+            issues.append("max_single_trade_amount 파싱 실패")
+        try:
+            mpsr = float(getattr(rm, "max_position_size_ratio", 0.0) or 0.0)
+            if mpsr <= 0 or mpsr > 1.0:
+                issues.append("max_position_size_ratio가 비정상입니다. (0 < ratio <= 1 이어야 함)")
+        except Exception:
+            issues.append("max_position_size_ratio 파싱 실패")
+        try:
+            sl = float(getattr(rm, "stop_loss_ratio", 0.0) or 0.0)
+            tp = float(getattr(rm, "take_profit_ratio", 0.0) or 0.0)
+            if sl <= 0 or sl > 0.2:
+                issues.append("stop_loss_ratio가 비정상입니다. (0 < ratio <= 0.2 권장)")
+            if tp <= 0 or tp > 0.5:
+                issues.append("take_profit_ratio가 비정상입니다. (0 < ratio <= 0.5 권장)")
+        except Exception:
+            issues.append("손절/익절 비율 파싱 실패")
+        try:
+            dll = int(getattr(rm, "daily_loss_limit", 0) or 0)
+            if dll <= 0:
+                issues.append("daily_loss_limit가 0 이하입니다. (일일 손실 한도 미설정)")
+        except Exception:
+            issues.append("daily_loss_limit 파싱 실패")
+        try:
+            mtd = int(getattr(rm, "max_trades_per_day", 0) or 0)
+            if mtd <= 0:
+                issues.append("max_trades_per_day가 0 이하입니다.")
+        except Exception:
+            issues.append("max_trades_per_day 파싱 실패")
+        try:
+            miq = int(getattr(rm, "min_order_quantity", 1) or 1)
+            if miq < 1:
+                issues.append("min_order_quantity가 1 미만입니다.")
+        except Exception:
+            issues.append("min_order_quantity 파싱 실패")
+
+    # 종목 목록
+    sel = getattr(state, "selected_stocks", None)
+    if not isinstance(sel, list) or not sel:
+        warnings.append("selected_stocks가 비어있습니다. (시작 시 자동 선정이 실패했을 수 있음)")
+
+    snap = _build_settings_snapshot_for_preflight(username)
+    return {
+        "ok": len(issues) == 0,
+        "issues": issues,
+        "warnings": warnings,
+        "snapshot": snap,
+    }
+
+
 def _load_today_daily_stats(current_user: str) -> tuple:
     """당일 일일 손익·거래 횟수를 user_result 또는 user_hist에서 조회. (daily_pnl, daily_trades) 또는 (None, None)."""
     if not current_user:
@@ -3621,6 +3870,58 @@ async def _do_start_system(username: str) -> tuple:
         if not getattr(state, "selected_stock_info", None):
             state.selected_stock_info = DEFAULT_STOCK_INFO.copy()
 
+        # Preflight: 강제 점검(치명 이슈 시 시작 차단)
+        try:
+            pf = _preflight_check(username)
+            if not pf.get("ok"):
+                issues = pf.get("issues") or []
+                warnings = pf.get("warnings") or []
+                msg = "시작 차단(Preflight 실패): " + ("; ".join(issues) if issues else "unknown")
+                # 시스템 로그(파일) + 대시보드 로그에 남김
+                try:
+                    system_log_append("error", msg)
+                    if warnings:
+                        system_log_append("warning", "Preflight warnings: " + "; ".join(warnings))
+                except Exception:
+                    pass
+                try:
+                    await state.broadcast({"type": "log", "level": "error", "message": msg})
+                    for w in warnings:
+                        await state.broadcast({"type": "log", "level": "warning", "message": f"[Preflight] {w}"})
+                except Exception:
+                    pass
+                return False, msg
+            else:
+                warnings = pf.get("warnings") or []
+                if warnings:
+                    try:
+                        for w in warnings:
+                            await state.broadcast({"type": "log", "level": "warning", "message": f"[Preflight] {w}"})
+                    except Exception:
+                        pass
+                try:
+                    snap = pf.get("snapshot") or {}
+                    # 너무 길어지는 것을 피하기 위해 핵심만 남김
+                    r = (snap.get("risk") or {}) if isinstance(snap, dict) else {}
+                    s = (snap.get("strategy") or {}) if isinstance(snap, dict) else {}
+                    system_log_append(
+                        "info",
+                        "Preflight OK: "
+                        f"paper={snap.get('is_paper_trading')} manual={snap.get('manual_approval')} "
+                        f"max_single={r.get('max_single_trade_amount')} daily_loss={r.get('daily_loss_limit')} "
+                        f"short={s.get('short_ma_period')} long={s.get('long_ma_period')}",
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            # 점검 로직 자체 오류는 보수적으로 차단
+            msg = f"시작 차단(Preflight 오류): {e}"
+            try:
+                await state.broadcast({"type": "log", "level": "error", "message": msg})
+            except Exception:
+                pass
+            return False, msg
+
         # 시작 시 당일 손익·거래 횟수 복원(초기화로 0이 된 값은 DB/거래내역 기준으로 합산 유지)
         try:
             pnl, cnt = _load_today_daily_stats(username)
@@ -3633,6 +3934,20 @@ async def _do_start_system(username: str) -> tuple:
                         state.session_start_balance = float(kis_bal) - float(pnl)
         except Exception:
             pass
+
+        # 안전장치: 실전(real) + 자동(즉시 체결) 조합은 기본적으로 차단 (환경변수로만 해제)
+        # - 실수로 실전 자동매매를 켜서 손실이 나는 사고 방지 목적
+        try:
+            allow_real_auto = str(os.getenv("ALLOW_REAL_AUTO_TRADING", "false") or "false").strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+        except Exception:
+            allow_real_auto = False
+        if (not getattr(state, "is_paper_trading", True)) and (not bool(getattr(state, "manual_approval", True))) and (not allow_real_auto):
+            msg = "안전장치: 실전투자 + 자동(즉시 체결) 모드는 기본적으로 차단됩니다. 수동(승인대기)으로 바꾸거나, 반드시 필요하면 서버 환경변수 ALLOW_REAL_AUTO_TRADING=true로 해제한 뒤 다시 시작하세요."
+            try:
+                await state.broadcast({"type": "log", "level": "error", "message": msg})
+            except Exception:
+                pass
+            return False, msg
 
         state.is_running = True
         state.trading_username = username
@@ -3665,6 +3980,26 @@ async def start_system(current_user: str = Depends(get_current_user)):
     """시스템 시작"""
     success, message = await _do_start_system(current_user)
     return JSONResponse({"success": success, "message": message})
+
+
+@app.get("/api/system/preflight")
+async def system_preflight(current_user: str = Depends(get_current_user)):
+    """시스템 시작 전 강제 점검(Preflight). 시작은 하지 않고 결과만 반환."""
+    try:
+        if not state.strategy or not state.trenv or not state.risk_manager:
+            _ensure_initialized()
+        # DB 설정을 먼저 반영한 뒤 점검
+        store = _get_user_settings_store()
+        if store and getattr(store, "enabled", False):
+            saved = store.load(current_user) or {}
+            _apply_risk_config_dict_to_state(saved.get("risk_config"))
+            _apply_operational_config_dict_to_state(saved.get("operational_config"))
+            _apply_strategy_config_dict_to_state(saved.get("strategy_config"))
+            _apply_stock_selection_config_dict_to_state(saved.get("stock_selection_config"))
+        pf = _preflight_check(current_user)
+        return JSONResponse({"success": True, "preflight": pf})
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)})
 
 @app.post("/api/system/set-env")
 async def set_trading_env(
@@ -3720,6 +4055,8 @@ async def _do_stop_system(username: str, liquidate: bool) -> tuple:
     """시스템 중지 내부 로직. (success: bool, message: str) 반환."""
     try:
         state.is_running = False
+        # 엔진 스레드가 다음 WebSocket 끊김 시 루프를 빠져나가도록 설정 (재시작 시 새 선정 목록으로 구독하려면 필수)
+        state.engine_running = False
         try:
             t = getattr(state, "pending_order_reconciler_task", None)
             if t is not None and hasattr(t, "cancel"):
@@ -4901,6 +5238,7 @@ async def approve_signal(signal_id: str, current_user: str = Depends(get_current
         manual_approval=False,
         return_details=True,
         quantity_override=int(signal_data.get("suggested_qty") or 0) or None,
+        selected_stocks_count=len(getattr(state, "selected_stocks", None) or []),
     )
     filled = bool(details.get("filled", False))
     await state.broadcast({"type": "log", "message": _format_order_log(details), "level": "info" if (result and filled) else ("warning" if result else "error")})
@@ -5108,6 +5446,7 @@ async def update_risk_config(config: RiskConfig, current_user: str = Depends(get
         state.risk_manager.max_trades_per_stock_per_day = max(0, min(20, int(getattr(config, "max_trades_per_stock_per_day", 0) or 0)))
         state.risk_manager.max_position_size_ratio = config.max_position_size_ratio
         state.risk_manager.max_positions_count = max(0, min(50, int(getattr(config, "max_positions_count", 0) or 0)))
+        state.risk_manager.expand_position_when_few_stocks = bool(getattr(config, "expand_position_when_few_stocks", True))
         state.risk_manager.trailing_stop_ratio = getattr(config, "trailing_stop_ratio", 0.0) or 0.0
         state.risk_manager.trailing_activation_ratio = getattr(config, "trailing_activation_ratio", 0.0) or 0.0
         state.risk_manager.partial_take_profit_ratio = getattr(config, "partial_take_profit_ratio", 0.0) or 0.0
@@ -5175,116 +5514,7 @@ async def update_strategy_config(config: StrategyConfig, current_user: str = Dep
         if short_period >= long_period:
             return JSONResponse({"success": False, "message": "단기 이동평균은 장기 이동평균보다 작아야 합니다."})
 
-        state.strategy.short_ma_period = short_period
-        state.strategy.long_ma_period = long_period
-        state.strategy.min_history_length = long_period
-        state.strategy.min_hold_seconds = max(0, int(getattr(config, "min_hold_seconds", 0) or 0))
-
-        # 신규 매수 허용 시간대(한국시간)
-        start_hhmm = str(getattr(config, "buy_window_start_hhmm", getattr(state, "buy_window_start_hhmm", "09:05")) or "09:05")
-        end_hhmm = str(getattr(config, "buy_window_end_hhmm", getattr(state, "buy_window_end_hhmm", "11:30")) or "11:30")
-        state.buy_window_start_hhmm = start_hhmm
-        state.buy_window_end_hhmm = end_hhmm
-        # 추세 강도 필터 + 재진입 쿨다운
-        state.min_short_ma_slope_ratio = float(getattr(config, "min_short_ma_slope_ratio", getattr(state, "min_short_ma_slope_ratio", 0.0)) or 0.0)
-        state.momentum_lookback_ticks = int(getattr(config, "momentum_lookback_ticks", getattr(state, "momentum_lookback_ticks", 0)) or 0)
-        state.min_momentum_ratio = float(getattr(config, "min_momentum_ratio", getattr(state, "min_momentum_ratio", 0.0)) or 0.0)
-        # 진입 보강(2단)
-        state.entry_confirm_enabled = bool(getattr(config, "entry_confirm_enabled", getattr(state, "entry_confirm_enabled", False)))
-        state.entry_confirm_min_count = int(getattr(config, "entry_confirm_min_count", getattr(state, "entry_confirm_min_count", 1)) or 1)
-        state.confirm_breakout_enabled = bool(getattr(config, "confirm_breakout_enabled", getattr(state, "confirm_breakout_enabled", False)))
-        state.breakout_lookback_ticks = int(getattr(config, "breakout_lookback_ticks", getattr(state, "breakout_lookback_ticks", 20)) or 20)
-        state.breakout_buffer_ratio = float(getattr(config, "breakout_buffer_ratio", getattr(state, "breakout_buffer_ratio", 0.0)) or 0.0)
-        state.confirm_volume_surge_enabled = bool(getattr(config, "confirm_volume_surge_enabled", getattr(state, "confirm_volume_surge_enabled", False)))
-        state.volume_surge_lookback_ticks = int(getattr(config, "volume_surge_lookback_ticks", getattr(state, "volume_surge_lookback_ticks", 20)) or 20)
-        state.volume_surge_ratio = float(getattr(config, "volume_surge_ratio", getattr(state, "volume_surge_ratio", 2.0)) or 2.0)
-        state.confirm_trade_value_surge_enabled = bool(getattr(config, "confirm_trade_value_surge_enabled", getattr(state, "confirm_trade_value_surge_enabled", False)))
-        state.trade_value_surge_lookback_ticks = int(getattr(config, "trade_value_surge_lookback_ticks", getattr(state, "trade_value_surge_lookback_ticks", 20)) or 20)
-        state.trade_value_surge_ratio = float(getattr(config, "trade_value_surge_ratio", getattr(state, "trade_value_surge_ratio", 2.0)) or 2.0)
-        # 진입 직전 추가 필터(피크 추격/초단기 추세)
-        state.avoid_chase_near_high_enabled = bool(getattr(config, "avoid_chase_near_high_enabled", getattr(state, "avoid_chase_near_high_enabled", False)))
-        state.near_high_lookback_minutes = int(getattr(config, "near_high_lookback_minutes", getattr(state, "near_high_lookback_minutes", 2)) or 2)
-        state.avoid_near_high_ratio = float(getattr(config, "avoid_near_high_ratio", getattr(state, "avoid_near_high_ratio", 0.003)) or 0.003)
-        state.avoid_near_high_dynamic = bool(getattr(config, "avoid_near_high_dynamic", getattr(state, "avoid_near_high_dynamic", False)))
-        state.avoid_near_high_vs_vol_mult = float(getattr(config, "avoid_near_high_vs_vol_mult", getattr(state, "avoid_near_high_vs_vol_mult", 0.0)) or 0.0)
-        state.minute_trend_enabled = bool(getattr(config, "minute_trend_enabled", getattr(state, "minute_trend_enabled", False)))
-        state.minute_trend_lookback_bars = int(getattr(config, "minute_trend_lookback_bars", getattr(state, "minute_trend_lookback_bars", 2)) or 2)
-        state.minute_trend_min_green_bars = int(getattr(config, "minute_trend_min_green_bars", getattr(state, "minute_trend_min_green_bars", 2)) or 2)
-        state.minute_trend_mode = str(getattr(config, "minute_trend_mode", getattr(state, "minute_trend_mode", "green")) or "green")
-        state.minute_trend_early_only = bool(getattr(config, "minute_trend_early_only", getattr(state, "minute_trend_early_only", False)))
-        # 변동성 정규화(보조)
-        state.vol_norm_lookback_ticks = int(getattr(config, "vol_norm_lookback_ticks", getattr(state, "vol_norm_lookback_ticks", 20)) or 20)
-        state.slope_vs_vol_mult = float(getattr(config, "slope_vs_vol_mult", getattr(state, "slope_vs_vol_mult", 0.0)) or 0.0)
-        state.range_vs_vol_mult = float(getattr(config, "range_vs_vol_mult", getattr(state, "range_vs_vol_mult", 0.0)) or 0.0)
-        # 오전장 레짐 분기(초반/메인)
-        state.enable_morning_regime_split = bool(getattr(config, "enable_morning_regime_split", getattr(state, "enable_morning_regime_split", False)))
-        state.morning_regime_early_end_hhmm = str(getattr(config, "morning_regime_early_end_hhmm", getattr(state, "morning_regime_early_end_hhmm", "09:10")) or "09:10")
-        state.early_min_short_ma_slope_ratio = float(getattr(config, "early_min_short_ma_slope_ratio", getattr(state, "early_min_short_ma_slope_ratio", 0.0)) or 0.0)
-        state.early_momentum_lookback_ticks = int(getattr(config, "early_momentum_lookback_ticks", getattr(state, "early_momentum_lookback_ticks", 0)) or 0)
-        state.early_min_momentum_ratio = float(getattr(config, "early_min_momentum_ratio", getattr(state, "early_min_momentum_ratio", 0.0)) or 0.0)
-        state.early_buy_confirm_ticks = int(getattr(config, "early_buy_confirm_ticks", getattr(state, "early_buy_confirm_ticks", 1)) or 1)
-        state.early_max_spread_ratio = float(getattr(config, "early_max_spread_ratio", getattr(state, "early_max_spread_ratio", 0.0)) or 0.0)
-        state.early_range_lookback_ticks = int(getattr(config, "early_range_lookback_ticks", getattr(state, "early_range_lookback_ticks", 0)) or 0)
-        state.early_min_range_ratio = float(getattr(config, "early_min_range_ratio", getattr(state, "early_min_range_ratio", 0.0)) or 0.0)
-        state.reentry_cooldown_seconds = int(getattr(config, "reentry_cooldown_seconds", getattr(state, "reentry_cooldown_seconds", 240)) or 0)
-        if getattr(state, "risk_manager", None):
-            state.risk_manager.reentry_cooldown_seconds = int(state.reentry_cooldown_seconds or 0)
-        state.consecutive_loss_cooldown_enabled = bool(getattr(config, "consecutive_loss_cooldown_enabled", getattr(state, "consecutive_loss_cooldown_enabled", False)))
-        state.consecutive_loss_count_threshold = max(2, min(5, int(getattr(config, "consecutive_loss_count_threshold", getattr(state, "consecutive_loss_count_threshold", 2)) or 2)))
-        state.consecutive_loss_cooldown_mult = max(1.0, min(5.0, float(getattr(config, "consecutive_loss_cooldown_mult", getattr(state, "consecutive_loss_cooldown_mult", 2.0)) or 2.0)))
-        # 지수 MA 시장 레짐 필터
-        state.index_ma_filter_enabled = bool(getattr(config, "index_ma_filter_enabled", getattr(state, "index_ma_filter_enabled", False)))
-        state.index_ma_code = str(getattr(config, "index_ma_code", getattr(state, "index_ma_code", "1001")) or "1001")
-        state.index_ma_period = max(5, min(60, int(getattr(config, "index_ma_period", getattr(state, "index_ma_period", 20)) or 20)))
-        # 상승 종목 비율 시장 레짐
-        state.advance_ratio_filter_enabled = bool(getattr(config, "advance_ratio_filter_enabled", getattr(state, "advance_ratio_filter_enabled", False)))
-        state.advance_ratio_market = str(getattr(config, "advance_ratio_market", getattr(state, "advance_ratio_market", "1001")) or "1001")
-        state.advance_ratio_min_pct = max(0.0, min(100.0, float(getattr(config, "advance_ratio_min_pct", getattr(state, "advance_ratio_min_pct", 35.0)) or 35.0)))
-        # 거래소 서킷브레이커(급락) 구간: 전일 대비 지수 하락 시 신규 매수 스킵
-        state.circuit_breaker_filter_enabled = bool(getattr(config, "circuit_breaker_filter_enabled", getattr(state, "circuit_breaker_filter_enabled", True)))
-        state.circuit_breaker_market = str(getattr(config, "circuit_breaker_market", getattr(state, "circuit_breaker_market", "0001")) or "0001")
-        state.circuit_breaker_threshold_pct = max(-20.0, min(0.0, float(getattr(config, "circuit_breaker_threshold_pct", getattr(state, "circuit_breaker_threshold_pct", -7.0)) or -7.0)))
-        state.circuit_breaker_action = str(getattr(config, "circuit_breaker_action", getattr(state, "circuit_breaker_action", "skip_buy_only")) or "skip_buy_only").strip().lower()
-        if state.circuit_breaker_action not in ("skip_buy_only", "liquidate_all", "liquidate_partial", "no_buy_rest_of_day"):
-            state.circuit_breaker_action = "skip_buy_only"
-        # 사이드카 구간
-        state.sidecar_filter_enabled = bool(getattr(config, "sidecar_filter_enabled", getattr(state, "sidecar_filter_enabled", True)))
-        state.sidecar_market = str(getattr(config, "sidecar_market", getattr(state, "sidecar_market", "0001")) or "0001")
-        state.sidecar_cooling_minutes = max(1, min(30, int(getattr(config, "sidecar_cooling_minutes", getattr(state, "sidecar_cooling_minutes", 5)) or 5)))
-        state.sidecar_action = str(getattr(config, "sidecar_action", getattr(state, "sidecar_action", "skip_buy_only")) or "skip_buy_only").strip().lower()
-        if state.sidecar_action not in ("skip_buy_only", "liquidate_all", "liquidate_partial", "no_buy_rest_of_day"):
-            state.sidecar_action = "skip_buy_only"
-        # VI(종목별)
-        state.vi_filter_enabled = bool(getattr(config, "vi_filter_enabled", getattr(state, "vi_filter_enabled", True)))
-        state.vi_cooling_minutes = max(1, min(30, int(getattr(config, "vi_cooling_minutes", getattr(state, "vi_cooling_minutes", 5)) or 5)))
-        # 거래대금 집중 시장 레짐
-        state.trade_value_concentration_filter_enabled = bool(getattr(config, "trade_value_concentration_filter_enabled", getattr(state, "trade_value_concentration_filter_enabled", False)))
-        state.trade_value_concentration_market = str(getattr(config, "trade_value_concentration_market", getattr(state, "trade_value_concentration_market", "1001")) or "1001")
-        state.trade_value_concentration_top_n = max(2, min(20, int(getattr(config, "trade_value_concentration_top_n", getattr(state, "trade_value_concentration_top_n", 10)) or 10)))
-        state.trade_value_concentration_denom_n = max(state.trade_value_concentration_top_n + 1, min(50, int(getattr(config, "trade_value_concentration_denom_n", getattr(state, "trade_value_concentration_denom_n", 30)) or 30)))
-        state.trade_value_concentration_max_pct = max(10.0, min(80.0, float(getattr(config, "trade_value_concentration_max_pct", getattr(state, "trade_value_concentration_max_pct", 45.0)) or 45.0)))
-        # 2틱 확인 + 시간기반 청산
-        state.buy_confirm_ticks = int(getattr(config, "buy_confirm_ticks", getattr(state, "buy_confirm_ticks", 1)) or 1)
-        state.enable_time_liquidation = bool(getattr(config, "enable_time_liquidation", getattr(state, "enable_time_liquidation", False)))
-        state.liquidate_after_hhmm = str(getattr(config, "liquidate_after_hhmm", getattr(state, "liquidate_after_hhmm", "11:55")) or "11:55")
-        # 스프레드/횡보장 필터
-        state.max_spread_ratio = float(getattr(config, "max_spread_ratio", getattr(state, "max_spread_ratio", 0.0)) or 0.0)
-        state.range_lookback_ticks = int(getattr(config, "range_lookback_ticks", getattr(state, "range_lookback_ticks", 0)) or 0)
-        state.min_range_ratio = float(getattr(config, "min_range_ratio", getattr(state, "min_range_ratio", 0.0)) or 0.0)
-        # SAP 기반 풀백 진입 보조 (평균가 대비 하단 구간에서만 매수 허용)
-        state.use_sap_revert_entry = bool(getattr(config, "use_sap_revert_entry", getattr(state, "use_sap_revert_entry", False)))
-        state.sap_revert_entry_from_pct = float(getattr(config, "sap_revert_entry_from_pct", getattr(state, "sap_revert_entry_from_pct", -1.5)) or -1.5)
-        state.sap_revert_entry_to_pct = float(getattr(config, "sap_revert_entry_to_pct", getattr(state, "sap_revert_entry_to_pct", -0.5)) or -0.5)
-        # 2~6번: 진입 거래량/거래대금 하한, 장초 N분 스킵, 지수 상대강도, 마감 전 N분 스킵, 하락장 스킵 강화
-        state.min_volume_ratio_for_entry = max(0.0, min(5.0, float(getattr(config, "min_volume_ratio_for_entry", 0.0) or 0.0)))
-        state.min_trade_amount_ratio_for_entry = max(0.0, min(5.0, float(getattr(config, "min_trade_amount_ratio_for_entry", 0.0) or 0.0)))
-        state.skip_buy_first_minutes = max(0, min(30, int(getattr(config, "skip_buy_first_minutes", 0) or 0)))
-        state.relative_strength_filter_enabled = bool(getattr(config, "relative_strength_filter_enabled", False))
-        state.relative_strength_index_code = str(getattr(config, "relative_strength_index_code", "0001") or "0001")
-        state.relative_strength_margin_pct = float(getattr(config, "relative_strength_margin_pct", 0.0) or 0.0)
-        state.last_minutes_no_buy = max(0, min(60, int(getattr(config, "last_minutes_no_buy", 0) or 0)))
-        state.advance_ratio_down_market_skip = bool(getattr(config, "advance_ratio_down_market_skip", True))
-        state.skip_buy_below_high_pct = max(0.0, min(0.20, float(getattr(config, "skip_buy_below_high_pct", 0.0) or 0.0)))
+        _apply_strategy_config_to_state(config)
 
         store = _get_user_settings_store()
         persisted = False
@@ -5305,7 +5535,7 @@ async def update_strategy_config(config: StrategyConfig, current_user: str = Dep
             "type": "log",
             "message": (
                 f"전략 설정 업데이트: short={short_period}, long={long_period}, "
-                f"buy_window={start_hhmm}-{end_hhmm}, "
+                f"buy_window={getattr(state, 'buy_window_start_hhmm', '09:05')}-{getattr(state, 'buy_window_end_hhmm', '11:30')}, "
                 f"slope>={state.min_short_ma_slope_ratio*100:.3f}%/tick, "
                 f"momentum>={getattr(state,'min_momentum_ratio',0.0)*100:.2f}%/N{int(getattr(state,'momentum_lookback_ticks',0) or 0)}, "
                 f"entryConfirm={'on' if getattr(state,'entry_confirm_enabled',False) else 'off'}(min={int(getattr(state,'entry_confirm_min_count',1) or 1)}), "
@@ -5464,7 +5694,7 @@ async def get_user_settings(current_user: str = Depends(get_current_user)):
     _apply_risk_config_dict_to_state(settings.get("risk_config"))
     _apply_operational_config_dict_to_state(settings.get("operational_config"))
     _apply_strategy_config_dict_to_state(settings.get("strategy_config"))
-    if settings.get("stock_selection_config") and state.stock_selector is None:
+    if settings.get("stock_selection_config"):
         try:
             _apply_stock_selection_config_dict_to_state(settings.get("stock_selection_config"))
         except Exception:
@@ -5606,11 +5836,15 @@ async def update_profile(
 
 @app.post("/api/stocks/select")
 async def select_stocks(current_user: str = Depends(get_current_user)):
-    """종목 재선정"""
+    """종목 재선정. 실행 중에는 변경 불가(중지 → 재선정 → 재시작으로 통일)."""
     try:
-        # 전역 KIS 환경을 일시 전환할 수 있어 실행 중에는 방지 (엔진/WS 안정성)
         if getattr(state, "is_running", False):
-            return JSONResponse({"success": False, "message": "실행 중에는 종목을 재선정할 수 없습니다. 시스템을 중지한 후 다시 시도하세요."})
+            msg = "실행 중에는 종목을 재선정할 수 없습니다. 시스템을 중지 → 종목 재선정 → 시스템 시작 순서로 진행하세요."
+            try:
+                await state.broadcast({"type": "log", "level": "warning", "message": msg})
+            except Exception:
+                pass
+            return JSONResponse({"success": False, "message": msg})
 
         if not state.stock_selector:
             ok = _ensure_initialized()
@@ -5653,6 +5887,7 @@ async def select_stocks(current_user: str = Depends(get_current_user)):
                     "message": "선정 결과 없음(이전 목록 유지)",
                     "stocks": state.selected_stocks,
                     "stock_info": getattr(state, "selected_stock_info", []),
+                    "kept_previous": True,
                 })
             state.selected_stocks = []
             state.selected_stock_info = []
@@ -5725,6 +5960,7 @@ async def execute_manual_order(order: ManualOrder, current_user: str = Depends(g
             manual_approval=False,
             return_details=True,
             quantity_override=int(order.quantity or 0) or None,
+            selected_stocks_count=len(getattr(state, "selected_stocks", None) or []),
         )
         filled = bool(details.get("filled", False))
         await state.broadcast({"type": "log", "message": _format_order_log(details), "level": "info" if (result and filled) else ("warning" if result else "error")})

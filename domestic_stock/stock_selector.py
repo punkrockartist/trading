@@ -582,7 +582,9 @@ class StockSelector:
                         if df_filtered.empty:
                             self.last_error_message = (
                                 f"고점 대비 하락추세 제외 조건으로 모두 제외됨 "
-                                f"(max_drawdown={max_dd*100:.1f}% 이상 제외)"
+                                f"(max_drawdown={max_dd*100:.1f}% 이상 제외). "
+                                f"장초 선정 시: drawdown_filter_after_hhmm을 12:00으로 두면 이 필터가 적용되지 않음. "
+                                f"또는 max_drawdown_from_high_ratio를 10~12%로 완화해 보세요."
                             )
             except Exception:
                 pass
