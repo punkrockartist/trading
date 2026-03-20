@@ -869,6 +869,7 @@ def get_dashboard_html(username: str) -> str:
                 <div id="selected_stocks">
                     <p style="color: var(--muted); text-align: center; padding: 20px;">선정된 종목이 없습니다.</p>
                 </div>
+                <div id="stock_selection_debug" style="margin-top:12px;"></div>
             </div>
             <div class="card">
                 <h2>매수 스킵 통계</h2>
@@ -3355,6 +3356,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
             renderSelectedStocks(data.selected_stock_info || data.selected_stocks || []);
             window.__lastStockSelectionCriteria = data.stock_selection_criteria || null;
             window.__selected_stock_info = data.selected_stock_info || data.selected_stocks || [];
+            renderStockSelectionDebug(data.stock_selection_last_debug || null, data.stock_selection_last_error || '');
             if (data.positions != null) updatePositions(data.positions);
             renderBuySkipStats(data.buy_skip_stats || null);
             if (data.enable_auto_rebalance != null) {{
@@ -3554,6 +3556,57 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 return `<span style="display:inline-block; padding:6px 10px; margin:4px; border-radius:var(--radius); background:var(--surface-2); color:var(--text); font-weight:700; font-size:13px; border:1px solid var(--border);">${{label}}</span>`;
             }}).join('');
             container.innerHTML = `<div>${{chips}}</div>`;
+        }}
+
+        function renderStockSelectionDebug(debug, errMsg) {{
+            const el = document.getElementById('stock_selection_debug');
+            if (!el) return;
+            const dbg = (debug && typeof debug === 'object') ? debug : {{}};
+            const keys = Object.keys(dbg || {{}}).sort();
+            const hasKeys = keys.length > 0;
+            const errTxt = (errMsg == null) ? '' : String(errMsg);
+            const hasErr = errTxt.trim().length > 0;
+
+            if (!hasKeys && !hasErr) {{
+                el.innerHTML = '<div class="hint" style="margin-top:6px;">선정 디버그가 없습니다. (선정 시도 후 업데이트)</div>';
+                return;
+            }}
+
+            let html = '';
+            html += '<div class="preflight-box" style="margin-top:0;">';
+            html += '<div style="font-size:12px; color:var(--muted); font-weight:600; margin-bottom:8px;">선정 디버그 (StockSelector)</div>';
+            if (hasErr) {{
+                html += '<div class="hint" style="margin-bottom:8px; color:var(--err);">error: ' + _escapeHtml(errTxt) + '</div>';
+            }}
+            html += '<div style="max-height:140px; overflow:auto;">';
+            html += '<table class="table"><thead><tr><th style="width:45%;">key</th><th>value</th></tr></thead><tbody>';
+            const limit = Math.min(25, keys.length);
+            for (let i = 0; i < limit; i++) {{
+                const k = keys[i];
+                let v = null;
+                try {{
+                    v = dbg[k];
+                }} catch (e) {{
+                    v = null;
+                }}
+                let vStr = '';
+                try {{
+                    if (v == null) vStr = '-';
+                    else if (typeof v === 'object') vStr = JSON.stringify(v);
+                    else vStr = String(v);
+                }} catch (e) {{
+                    vStr = '-';
+                }}
+                html += '<tr><td>' + _escapeHtml(k) + '</td><td>' + _escapeHtml(vStr) + '</td></tr>';
+            }}
+            if (keys.length > limit) {{
+                html += '<tr><td colspan="2" style="color:var(--muted);">... ' + (keys.length - limit) + ' more</td></tr>';
+            }}
+            html += '</tbody></table>';
+            html += '</div>';
+            html += '</div>';
+
+            el.innerHTML = html;
         }}
 
         function criteriaToHtml(criteria) {{
@@ -4438,8 +4491,10 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     relative_strength_margin_pct: parseFloat(document.getElementById('relative_strength_margin_pct')?.value) || 0,
                     advance_ratio_down_market_skip: !!document.getElementById('advance_ratio_down_market_skip')?.checked,
                     use_sap_revert_entry: !!document.getElementById('use_sap_revert_entry')?.checked,
-                    sap_revert_entry_from_pct: parseFloat(document.getElementById('sap_revert_entry_from_pct')?.value) || -1.5,
-                    sap_revert_entry_to_pct: parseFloat(document.getElementById('sap_revert_entry_to_pct')?.value) || -0.5,
+                    // 주의: JS에서 0은 falsy라 `||`로 처리하면 기본값(-0.5)으로 덮어써짐.
+                    // 0도 유효한 설정값이므로 Number.isFinite로만 보정.
+                    sap_revert_entry_from_pct: (() => {{ const v = parseFloat(document.getElementById('sap_revert_entry_from_pct')?.value); return Number.isFinite(v) ? v : -1.5; }})(),
+                    sap_revert_entry_to_pct: (() => {{ const v = parseFloat(document.getElementById('sap_revert_entry_to_pct')?.value); return Number.isFinite(v) ? v : -0.5; }})(),
                 }};
                 const response = await fetch('/api/config/strategy', {{
                     method: 'POST',

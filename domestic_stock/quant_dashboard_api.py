@@ -1312,8 +1312,11 @@ def _apply_strategy_config_to_state(config: "StrategyConfig") -> None:
     state.range_lookback_ticks = int(getattr(config, "range_lookback_ticks", getattr(state, "range_lookback_ticks", 0)) or 0)
     state.min_range_ratio = float(getattr(config, "min_range_ratio", getattr(state, "min_range_ratio", 0.0)) or 0.0)
     state.use_sap_revert_entry = bool(getattr(config, "use_sap_revert_entry", getattr(state, "use_sap_revert_entry", False)))
-    state.sap_revert_entry_from_pct = float(getattr(config, "sap_revert_entry_from_pct", getattr(state, "sap_revert_entry_from_pct", -1.5)) or -1.5)
-    state.sap_revert_entry_to_pct = float(getattr(config, "sap_revert_entry_to_pct", getattr(state, "sap_revert_entry_to_pct", -0.5)) or -0.5)
+    # 주의: `or`는 0.0을 falsy로 간주해서 기본값으로 덮어쓸 수 있음.
+    _sap_from = getattr(config, "sap_revert_entry_from_pct", getattr(state, "sap_revert_entry_from_pct", -1.5))
+    state.sap_revert_entry_from_pct = float(_sap_from if _sap_from is not None else -1.5)
+    _sap_to = getattr(config, "sap_revert_entry_to_pct", getattr(state, "sap_revert_entry_to_pct", -0.5))
+    state.sap_revert_entry_to_pct = float(_sap_to if _sap_to is not None else -0.5)
     state.min_volume_ratio_for_entry = max(0.0, min(5.0, float(getattr(config, "min_volume_ratio_for_entry", 0.0) or 0.0)))
     state.min_trade_amount_ratio_for_entry = max(0.0, min(5.0, float(getattr(config, "min_trade_amount_ratio_for_entry", 0.0) or 0.0)))
     state.skip_buy_first_minutes = max(0, min(30, int(getattr(config, "skip_buy_first_minutes", 0) or 0)))
@@ -2222,6 +2225,13 @@ def _start_trading_engine_thread():
                     selected = state.selected_stocks or []
                     position_codes = list(getattr(state.risk_manager, "positions", {}).keys())
                     stocks = list(dict.fromkeys(selected + position_codes)) if (selected or position_codes) else ["005930", "000660"]
+                    try:
+                        system_log_append(
+                            "info",
+                            f"WS 구독 종목 결정: selected={','.join(selected)} positions={','.join(position_codes)} subscribe={','.join(stocks)}",
+                        )
+                    except Exception:
+                        pass
                     kws.subscribe(request=ccnl_krx, data=stocks)
                     try:
                         kws.subscribe(request=asking_price_krx, data=stocks, kwargs={"env_dv": "demo" if state.is_paper_trading else "real"})
@@ -2885,8 +2895,11 @@ def _start_trading_engine_thread():
                                                     # 선택적 SAP 풀백 진입 모드: 평균가 대비 하단 특정 구간에서만 신규 매수 허용
                                                     try:
                                                         if bool(getattr(state, "use_sap_revert_entry", False)):
-                                                            entry_from = float(getattr(state, "sap_revert_entry_from_pct", -2.5) or -2.5)
-                                                            entry_to = float(getattr(state, "sap_revert_entry_to_pct", -1.0) or -1.0)
+                                                            # 주의: 0.0은 유효값인데 `or` 때문에 falsy로 처리되면 기본값(-1.0 등)으로 덮어써질 수 있음
+                                                            _entry_from = getattr(state, "sap_revert_entry_from_pct", None)
+                                                            entry_from = float(_entry_from) if _entry_from is not None else -2.5
+                                                            _entry_to = getattr(state, "sap_revert_entry_to_pct", None)
+                                                            entry_to = float(_entry_to) if _entry_to is not None else -1.0
                                                             low = min(entry_from, entry_to)
                                                             high = max(entry_from, entry_to)
                                                             dev = float(result[1])
@@ -2895,7 +2908,8 @@ def _start_trading_engine_thread():
                                                                 _record_buy_skip(stock_code, "sap_revert_window")
                                                                 _throttled_skip_log(
                                                                     stock_code,
-                                                                    f"SAP 풀백 범위 밖으로 신규 매수 스킵(dev={dev:.2f}% not in [{low:.1f}%,{high:.1f}%])",
+                                                                    # low/high를 1자리 반올림하지 않고, -0.05 같은 경계값을 정확히 확인할 수 있게 소수 2자리 표시
+                                                                    f"SAP 풀백 범위 밖으로 신규 매수 스킵(dev={dev:.2f}% not in [{low:.2f}%,{high:.2f}%])",
                                                                 )
                                                                 continue
                                                     except Exception:
@@ -3620,6 +3634,8 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
             "selected_stocks": getattr(state, "selected_stocks", []) or [],
             "selected_stock_info": getattr(state, "selected_stock_info", []) or [],
             "stock_selection_criteria": criteria,
+            "stock_selection_last_debug": getattr(getattr(state, "stock_selector", None), "last_debug", {}) or {},
+            "stock_selection_last_error": getattr(getattr(state, "stock_selector", None), "last_error_message", "") or "",
             "short_ma_period": state.strategy.short_ma_period if state.strategy else None,
             "long_ma_period": state.strategy.long_ma_period if state.strategy else None,
             "buy_window_start_hhmm": getattr(state, "buy_window_start_hhmm", "09:05"),
@@ -3681,6 +3697,8 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
         "selected_stock_info": getattr(state, "selected_stock_info", []),
         "short_ma_period": state.strategy.short_ma_period if state.strategy else None,
         "long_ma_period": state.strategy.long_ma_period if state.strategy else None,
+        "stock_selection_last_debug": getattr(getattr(state, "stock_selector", None), "last_debug", {}) or {},
+        "stock_selection_last_error": getattr(getattr(state, "stock_selector", None), "last_error_message", "") or "",
         "buy_window_start_hhmm": getattr(state, "buy_window_start_hhmm", "09:05"),
         "buy_window_end_hhmm": getattr(state, "buy_window_end_hhmm", "11:30"),
         "min_short_ma_slope_ratio": getattr(state, "min_short_ma_slope_ratio", 0.0),
@@ -3843,8 +3861,10 @@ async def _do_start_system(username: str) -> tuple:
             except Exception as e:
                 logger.warning(f"시작 시 저장 설정 적용 실패(무시): {e}")
 
-        # 저장된 종목선정 설정으로 1회 자동 선정 (선정 결과가 있으면 사용, 없으면 이전 유지 또는 디폴트)
-        if getattr(state, "stock_selector", None):
+        # 저장된 종목선정 설정으로 1회 자동 선정
+        # 정책: 사용자가 이미 `state.selected_stocks`를 지정해 둔 경우(종목 재선정 완료 후 시작)는
+        # 시작 시 자동 재선정이 이를 덮어쓰지 않도록 selected가 비어있을 때만 수행합니다.
+        if getattr(state, "stock_selector", None) and not getattr(state, "selected_stocks", None):
             try:
                 selected = state.stock_selector.select_stocks_by_fluctuation()
                 if selected:
@@ -5545,7 +5565,8 @@ async def update_strategy_config(config: StrategyConfig, current_user: str = Dep
                 f"confirm={int(state.buy_confirm_ticks)}tick, "
                 f"time_liq={'on' if state.enable_time_liquidation else 'off'}@{state.liquidate_after_hhmm}, "
                 f"spread<={state.max_spread_ratio*100:.3f}%, "
-                f"range>={state.min_range_ratio*100:.3f}%/N{state.range_lookback_ticks}"
+                f"range>={state.min_range_ratio*100:.3f}%/N{state.range_lookback_ticks}, "
+                f"sapRevert={'on' if getattr(state,'use_sap_revert_entry',False) else 'off'}({getattr(state,'sap_revert_entry_from_pct',0.0):.3f}%~{getattr(state,'sap_revert_entry_to_pct',0.0):.3f}%)"
             ),
             "level": "info"
         })
