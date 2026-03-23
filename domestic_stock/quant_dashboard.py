@@ -68,6 +68,8 @@ class TradingState:
         self.buy_window_end_hhmm: str = "11:30"
         # 실시간 호가(스프레드) 캐시: {code: {"ask": float, "bid": float, "at": iso}}
         self.latest_quotes: Dict[str, Dict] = {}
+        # 장운영 WS(H0STMKO0) VI 적용 여부: 종목코드 -> (active: bool, time.time() 수신시각)
+        self._vi_ws_active: Dict[str, tuple] = {}
         
     async def broadcast(self, message: dict):
         """모든 WebSocket 클라이언트에 메시지 전송. type=log 시 시스템 로그 파일에도 기록."""
@@ -626,6 +628,9 @@ def get_login_html() -> str:
                 
                 const data = await response.json();
                 if (data.success) {
+                    if (data.token) {
+                        try { localStorage.setItem('token', data.token); } catch (e) {}
+                    }
                     window.location.href = '/';
                 } else {
                     errorMsg.textContent = data.detail || '로그인 실패';

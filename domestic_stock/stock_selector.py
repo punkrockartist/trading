@@ -307,23 +307,24 @@ class StockSelector:
                     tr_id = "FHPST01700000"
                     # fid_input_iscd: 0000=전체, 0001=거래소(코스피만), 1001=코스닥, 2001=코스피200
                     fid_input_iscd = "0001" if getattr(self, "kospi_only", False) else "0000"
+                    # /ranking/fluctuation 은 소문자 fid_* (domestic_stock_functions.fluctuation 과 동일).
                     params = {
                         "fid_rsfl_rate2": str(max_change_pct),
                         "fid_cond_mrkt_div_code": "J",
                         "fid_cond_scr_div_code": "20170",
                         "fid_input_iscd": fid_input_iscd,
-                        # KIS는 1자리 코드(예: "0")를 요구하는 경우가 많음
                         "fid_rank_sort_cls_code": "0",
                         "fid_input_cnt_1": str(self.max_stocks * 3),
                         "fid_prc_cls_code": "0",
                         "fid_input_price_1": str(self.min_price),
                         "fid_input_price_2": str(self.max_price),
                         "fid_vol_cnt": str(effective_min_volume),
-                        "fid_trgt_cls_code": "0",
+                        "fid_trgt_cls_code": "000000000",
                         "fid_trgt_exls_cls_code": fid_trgt_exls_cls_code,
                         "fid_div_cls_code": "0",
                         "fid_rsfl_rate1": str(min_change_pct),
                     }
+                    params_for_debug = dict(params)
 
                     res = ka._url_fetch(api_url, tr_id, "", params)
                     ok = False
@@ -331,6 +332,16 @@ class StockSelector:
                         ok = bool(res.isOK())
                     except Exception:
                         ok = False
+
+                    if not ok:
+                        try:
+                            em = str(res.getErrorMessage() or "")
+                            if "OPSQ2002" in em or "FID_RANK_SORT" in em or "INPUT_FILED_SIZE" in em:
+                                params_u = {k.upper(): v for k, v in params.items()}
+                                res = ka._url_fetch(api_url, tr_id, "", params_u)
+                                ok = bool(res.isOK())
+                        except Exception:
+                            pass
 
                     if not ok:
                         try:
@@ -348,13 +359,13 @@ class StockSelector:
                         fields = []
                     self.last_debug["api_body_fields"] = fields
                     self.last_debug["api_params"] = {
-                        "fid_rsfl_rate1": params.get("fid_rsfl_rate1"),
-                        "fid_rsfl_rate2": params.get("fid_rsfl_rate2"),
-                        "fid_input_price_1": params.get("fid_input_price_1"),
-                        "fid_input_price_2": params.get("fid_input_price_2"),
-                        "fid_vol_cnt": params.get("fid_vol_cnt"),
-                        "fid_trgt_exls_cls_code": params.get("fid_trgt_exls_cls_code"),
-                        "fid_input_cnt_1": params.get("fid_input_cnt_1"),
+                        "fid_rsfl_rate1": params_for_debug.get("fid_rsfl_rate1"),
+                        "fid_rsfl_rate2": params_for_debug.get("fid_rsfl_rate2"),
+                        "fid_input_price_1": params_for_debug.get("fid_input_price_1"),
+                        "fid_input_price_2": params_for_debug.get("fid_input_price_2"),
+                        "fid_vol_cnt": params_for_debug.get("fid_vol_cnt"),
+                        "fid_trgt_exls_cls_code": params_for_debug.get("fid_trgt_exls_cls_code"),
+                        "fid_input_cnt_1": params_for_debug.get("fid_input_cnt_1"),
                     }
 
                     output = None

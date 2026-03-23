@@ -1654,11 +1654,11 @@ def get_dashboard_html(username: str) -> str:
                             <div class="hint">예: -1.5 ~ -0.5 → SAP보다 0.5~1.5% 아래 구간에서만 신규 매수 허용(실제 변동폭에 맞춤).</div>
                         </div>
                         <div class="form-group">
-                            <label>진입 거래량 하한(평균 대비 배수, 0=미적용):</label>
+                            <label>진입 거래량 하한(평균 대비 배수, 0=미적용) <code class="setting-var">min_volume_ratio_for_entry</code></label>
                             <input type="number" id="min_volume_ratio_for_entry" value="0" step="0.1" min="0" max="5">
                         </div>
                         <div class="form-group">
-                            <label>진입 거래대금 하한(평균 대비 배수, 0=미적용):</label>
+                            <label>진입 거래대금 하한(평균 대비 배수, 0=미적용) <code class="setting-var">min_trade_amount_ratio_for_entry</code></label>
                             <input type="number" id="min_trade_amount_ratio_for_entry" value="0" step="0.1" min="0" max="5">
                         </div>
                         <div class="form-group">
@@ -3233,7 +3233,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
 
         async function loadPendingSignals() {{
             try {{
-                const response = await fetch('/api/signals/pending');
+                const response = await fetch('/api/signals/pending', withAuth({{}}));
                 const data = await response.json();
                 if (data.success) {{
                     pendingSignals = {{}};
@@ -3249,7 +3249,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
 
         async function approveSignal(signalId) {{
             try {{
-                const response = await fetch(`/api/signals/${{signalId}}/approve`, {{ method: 'POST' }});
+                const response = await fetch(`/api/signals/${{signalId}}/approve`, withAuth({{ method: 'POST' }}));
                 const data = await response.json();
                 if (data.success) {{
                     addLog('신호 승인 완료', 'info');
@@ -3265,7 +3265,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
 
         async function rejectSignal(signalId) {{
             try {{
-                const response = await fetch(`/api/signals/${{signalId}}/reject`, {{ method: 'POST' }});
+                const response = await fetch(`/api/signals/${{signalId}}/reject`, withAuth({{ method: 'POST' }}));
                 const data = await response.json();
                 if (data.success) {{
                     addLog('신호 거절 완료', 'warning');
@@ -3836,7 +3836,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
             try {{
                 const q = new URLSearchParams();
                 if (dateStr) {{ q.set('date_from', dateStr); q.set('date_to', dateStr); }}
-                const resp = await fetch('/api/trades/system?' + q.toString());
+                const resp = await fetch('/api/trades/system?' + q.toString(), withAuth({{}}));
                 const data = await resp.json();
                 systemTradeRows = Array.isArray(data) ? data : [];
                 updateSystemTradeFilters();
@@ -3938,7 +3938,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
             const dateEl = document.getElementById('trades_account_date');
             const dateStr = dateEl ? dateEl.value.replace(/-/g, '') : new Date().toISOString().slice(0, 10).replace(/-/g, '');
             try {{
-                const resp = await fetch('/api/trades/account?date=' + encodeURIComponent(dateStr));
+                const resp = await fetch('/api/trades/account?date=' + encodeURIComponent(dateStr), withAuth({{}}));
                 const data = await resp.json();
                 const tbody = document.getElementById('account_trade_history_body');
                 tbody.innerHTML = '';
@@ -3994,13 +3994,24 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
             return new Intl.NumberFormat('ko-KR').format(num);
         }}
 
+        /** API 호출 시 쿠키 + Bearer(있으면) 전송. localhost/127.0.0.1 혼용·모바일 브라우저에서 인증 누락 방지 */
+        function withAuth(opts) {{
+            const o = Object.assign({{}}, opts || {{}});
+            const headers = Object.assign({{}}, o.headers || {{}});
+            const t = (typeof localStorage !== 'undefined' && localStorage.getItem('token')) || '';
+            if (t) headers['Authorization'] = 'Bearer ' + t;
+            o.credentials = 'include';
+            o.headers = headers;
+            return o;
+        }}
+
         async function setTradingEnv(isPaper) {{
             try {{
-                const response = await fetch('/api/system/set-env', {{
+                const response = await fetch('/api/system/set-env', withAuth({{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
                     body: JSON.stringify({{ is_paper_trading: isPaper }})
-                }});
+                }}));
                 const data = await response.json();
                 if (data.success) {{
                     addLog(data.message || (isPaper ? '모의 투자로 변경됨' : '실전 투자로 변경됨'), 'info');
@@ -4009,17 +4020,17 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     addLog('환경 변경 실패: ' + (data.message || '알 수 없는 오류'), 'error');
                 }}
             }} catch (error) {{
-                addLog('오류: ' + error, 'error');
+                addLog('오류: ' + (error && error.message ? error.message : error), 'error');
             }}
         }}
 
         async function setTradeMode(manualApproval) {{
             try {{
-                const response = await fetch('/api/system/set-trade-mode', {{
+                const response = await fetch('/api/system/set-trade-mode', withAuth({{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
                     body: JSON.stringify({{ manual_approval: manualApproval }})
-                }});
+                }}));
                 const data = await response.json();
                 if (data.success) {{
                     addLog(data.message || (manualApproval ? '수동(승인대기) 모드' : '자동 체결 모드'), 'info');
@@ -4028,7 +4039,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     addLog('매매 모드 변경 실패: ' + (data.message || '알 수 없는 오류'), 'error');
                 }}
             }} catch (error) {{
-                addLog('오류: ' + error, 'error');
+                addLog('오류: ' + (error && error.message ? error.message : error), 'error');
             }}
         }}
 
@@ -4041,7 +4052,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     addLog('시스템 시작 차단(Preflight): issues를 해결한 뒤 다시 시도하세요.', 'error');
                     return;
                 }}
-                const response = await fetch('/api/system/start', {{ method: 'POST' }});
+                const response = await fetch('/api/system/start', withAuth({{ method: 'POST' }}));
                 const data = await response.json();
                 if (data.success) {{
                     addLog('시스템 시작됨', 'info');
@@ -4049,7 +4060,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     addLog('시스템 시작 실패: ' + (data.message || '알 수 없는 오류'), 'error');
                 }}
             }} catch (error) {{
-                addLog('오류: ' + error, 'error');
+                addLog('오류: ' + (error && error.message ? error.message : error), 'error');
             }}
         }}
 
@@ -4074,7 +4085,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
 
         async function stopSystem(liquidate = false) {{
             try {{
-                const response = await fetch(`/api/system/stop?liquidate=${{liquidate ? 'true' : 'false'}}`, {{ method: 'POST' }});
+                const response = await fetch(`/api/system/stop?liquidate=${{liquidate ? 'true' : 'false'}}`, withAuth({{ method: 'POST' }}));
                 const data = await response.json();
                 if (data.success) {{
                     addLog('시스템 중지됨', 'info');
@@ -4082,13 +4093,13 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     addLog('시스템 중지 실패: ' + (data.message || '알 수 없는 오류'), 'error');
                 }}
             }} catch (error) {{
-                addLog('오류: ' + error, 'error');
+                addLog('오류: ' + (error && error.message ? error.message : error), 'error');
             }}
         }}
 
         async function refreshData() {{
             try {{
-                const response = await fetch('/api/system/status?t=' + Date.now());
+                const response = await fetch('/api/system/status?t=' + Date.now(), withAuth({{}}));
                 if (!response.ok) {{
                     renderBuySkipStats(null);
                     return;
@@ -4097,7 +4108,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 updateStatus(data);
             }} catch (error) {{
                 renderBuySkipStats(null);
-                addLog('새로고침 오류: ' + error, 'error');
+                addLog('새로고침 오류: ' + (error && error.message ? error.message : error), 'error');
             }}
         }}
 
@@ -5021,7 +5032,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     return {{ success: false, message: '선정 기준 저장 실패' }};
                 }}
                 if (!silent) addLog('종목 재선정 중...', 'info');
-                const response = await fetch('/api/stocks/select', {{ method: 'POST' }});
+                const response = await fetch('/api/stocks/select', withAuth({{ method: 'POST' }}));
                 const data = await response.json();
                 if (data.success) {{
                     if (!silent) {{
@@ -5154,7 +5165,8 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 return;
             }}
             try {{
-                await fetch('/api/auth/logout', {{ method: 'POST' }});
+                try {{ localStorage.removeItem('token'); }} catch (e) {{}}
+                await fetch('/api/auth/logout', {{ method: 'POST', credentials: 'include' }});
                 window.location.href = '/login';
             }} catch (error) {{
                 window.location.href = '/login';

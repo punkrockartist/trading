@@ -3067,24 +3067,53 @@ def fluctuation(
 
     tr_id = "FHPST01700000"  # 국내주식 등락률 순위
 
-    params = {
+    # FID_RANK_SORT_CLS_CODE: 운영 환경에서 1자리 코드(0/1...)를 요구.
+    # 이전 4자리 강제(0000)는 OPSQ2002 INVALID INPUT_FILED_SIZE를 유발할 수 있다.
+    _rank_sort = (fid_rank_sort_cls_code or "0").strip() or "0"
+    _rank_sort = _rank_sort[0]
+
+    # 대상 구분 9자리 / 제외 구분 10자리
+    _trgt = (fid_trgt_cls_code or "0").strip() or "0"
+    if _trgt.isdigit() and len(_trgt) < 9:
+        _trgt = _trgt.zfill(9)
+    elif len(_trgt) < 9:
+        _trgt = (_trgt + "0" * 9)[:9]
+
+    _exls = (fid_trgt_exls_cls_code or "0").strip() or "0"
+    if _exls.isdigit() and len(_exls) < 10:
+        _exls = _exls.zfill(10)
+    elif len(_exls) < 10:
+        _exls = (_exls + "0" * 10)[:10]
+
+    # /ranking/fluctuation 은 exp_trans_updown 등과 같이 소문자 fid_* 쿼리 키를 씀.
+    # /quotations/volume-rank 는 FID_* 대문자 — 혼용 시 파라미터 누락으로 OPSQ2002 발생할 수 있음.
+    params_lower = {
         "fid_rsfl_rate2": fid_rsfl_rate2,
         "fid_cond_mrkt_div_code": fid_cond_mrkt_div_code,
         "fid_cond_scr_div_code": fid_cond_scr_div_code,
         "fid_input_iscd": fid_input_iscd,
-        "fid_rank_sort_cls_code": fid_rank_sort_cls_code,
+        "fid_rank_sort_cls_code": _rank_sort,
         "fid_input_cnt_1": fid_input_cnt_1,
         "fid_prc_cls_code": fid_prc_cls_code,
         "fid_input_price_1": fid_input_price_1,
         "fid_input_price_2": fid_input_price_2,
         "fid_vol_cnt": fid_vol_cnt,
-        "fid_trgt_cls_code": fid_trgt_cls_code,
-        "fid_trgt_exls_cls_code": fid_trgt_exls_cls_code,
+        "fid_trgt_cls_code": _trgt,
+        "fid_trgt_exls_cls_code": _exls,
         "fid_div_cls_code": fid_div_cls_code,
-        "fid_rsfl_rate1": fid_rsfl_rate1
+        "fid_rsfl_rate1": fid_rsfl_rate1,
     }
+    params_upper = {k.upper(): v for k, v in params_lower.items()}
 
-    res = ka._url_fetch(api_url, tr_id, tr_cont, params)
+    res = ka._url_fetch(api_url, tr_id, tr_cont, params_lower)
+    try:
+        if not res.isOK():
+            b = res.getBody()
+            msg = str(getattr(b, "msg1", "") or "")
+            if "OPSQ2002" in msg or "FID_RANK_SORT_CLS_CODE" in msg or "INPUT_FILED_SIZE" in msg:
+                res = ka._url_fetch(api_url, tr_id, tr_cont, params_upper)
+    except Exception:
+        pass
 
     if res.isOK():
         if hasattr(res.getBody(), 'output'):

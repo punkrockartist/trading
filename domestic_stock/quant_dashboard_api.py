@@ -17,7 +17,7 @@ import os
 import json
 
 import kis_auth as ka
-from domestic_stock_functions_ws import ccnl_krx, asking_price_krx
+from domestic_stock_functions_ws import ccnl_krx, asking_price_krx, market_status_krx
 from domestic_stock_functions import inquire_index_daily_price, inquire_index_price, fluctuation, volume_rank, inquire_vi_status
 
 from quant_dashboard import (
@@ -68,6 +68,9 @@ _index_change_cache_lock = threading.Lock()
 _vi_status_cache: Dict[str, tuple] = {}
 _vi_status_cache_ttl = 60  # 1분
 _vi_status_cache_lock = threading.Lock()
+
+# WS 장운영정보가 이 시간 이상 갱신 없으면 REST로 재판단 (초)
+_VI_WS_STALE_SECONDS = 120
 
 
 def _get_index_ma_ok(index_code: str, period: int) -> bool:
@@ -254,9 +257,61 @@ def _get_exchange_sidecar_risk(market_code: str = "0001") -> tuple:
     return is_risk, change_pct
 
 
+def _vi_cls_code_implies_active(raw) -> bool:
+    """
+    KRX 장운영 VI적용구분코드 등. 0/공백 = 미적용, 그 외 숫자·코드는 적용으로 간주.
+    (정적·동적 VI는 보통 1, 2 — 확장 코드는 0이 아니면 적용으로 처리)
+    """
+    if raw is None:
+        return False
+    s = str(raw).strip()
+    if not s or s.lower() in ("nan", "none"):
+        return False
+    if s.upper() in ("N", "-", "."):
+        return False
+    if s in ("0", "00", "000"):
+        return False
+    if s.isdigit():
+        try:
+            return int(s) != 0
+        except ValueError:
+            return True
+    return True
+
+
+def _rest_vi_dataframe_active(df) -> Optional[bool]:
+    """
+    VI 현황 REST 응답에서 '지금 적용 중'만 True.
+    Returns:
+        True/False — 컬럼으로 판별됨
+        None — VI 관련 컬럼을 못 찾음 (호출부에서 폴백)
+    """
+    if df is None or getattr(df, "empty", True):
+        return False
+    found_signal = False
+    for col in df.columns:
+        cl = str(col).lower().replace(" ", "")
+        if "vi" not in cl:
+            continue
+        if not any(k in cl for k in ("cls", "stts", "stat", "type", "code", "div", "aplc", "yn")):
+            continue
+        found_signal = True
+        for val in df[col].astype(str).str.strip():
+            if not val or val.lower() in ("nan", "none"):
+                continue
+            if _vi_cls_code_implies_active(val):
+                return True
+    if found_signal:
+        return False
+    return None
+
+
 def _get_stock_vi_triggered(stock_code: str) -> bool:
     """
-    종목별 VI(변동성완화장치) 발동 여부. inquire_vi_status로 해당 종목 조회 후 비어있지 않으면 True.
+    종목별 VI(변동성완화장치) 적용 여부.
+    1) 장운영 WS(H0STMKO0) vi_cls_code가 최근 갱신되어 있으면 우선.
+    2) 없거나 오래되면 inquire_vi_status — 행 유무만으로는 판단하지 않고 VI 구분 컬럼으로 판단;
+       컬럼을 못 찾으면 레거시(행 있음=True)로만 폴백.
     캐시 1분.
     """
     if not stock_code or len(str(stock_code).strip()) < 6:
@@ -266,21 +321,32 @@ def _get_stock_vi_triggered(stock_code: str) -> bool:
         ent = _vi_status_cache.get(code)
         if ent is not None and (time.time() - ent[1]) < _vi_status_cache_ttl:
             return ent[0]
+
     triggered = False
     try:
-        tz = timezone(timedelta(hours=9))
-        today_str = datetime.now(tz).strftime("%Y%m%d")
-        df = inquire_vi_status(
-            fid_div_cls_code="0",
-            fid_cond_scr_div_code="20139",
-            fid_mrkt_cls_code="0",
-            fid_input_iscd=code,
-            fid_rank_sort_cls_code="0",
-            fid_input_date_1=today_str,
-            fid_trgt_cls_code="",
-            fid_trgt_exls_cls_code="",
-        )
-        triggered = df is not None and not getattr(df, "empty", True) and len(df) > 0
+        now_ts = time.time()
+        ws_map = getattr(state, "_vi_ws_active", None) or {}
+        ws_ent = ws_map.get(code)
+        if ws_ent is not None and (now_ts - ws_ent[1]) < _VI_WS_STALE_SECONDS:
+            triggered = bool(ws_ent[0])
+        else:
+            tz = timezone(timedelta(hours=9))
+            today_str = datetime.now(tz).strftime("%Y%m%d")
+            df = inquire_vi_status(
+                fid_div_cls_code="0",
+                fid_cond_scr_div_code="20139",
+                fid_mrkt_cls_code="0",
+                fid_input_iscd=code,
+                fid_rank_sort_cls_code="0",
+                fid_input_date_1=today_str,
+                fid_trgt_cls_code="",
+                fid_trgt_exls_cls_code="",
+            )
+            parsed = _rest_vi_dataframe_active(df)
+            if parsed is not None:
+                triggered = parsed
+            else:
+                triggered = df is not None and not getattr(df, "empty", True) and len(df) > 0
     except Exception as e:
         logger.debug("VI status check failed for %s: %s", code, e)
     with _vi_status_cache_lock:
@@ -296,14 +362,14 @@ _advance_ratio_cache_lock = threading.Lock()
 # 등락률 순위 API 공통 파라미터 (20170=등락률 화면)
 _FLUCT_DEFAULT = {
     "fid_cond_scr_div_code": "20170",
-    "fid_rank_sort_cls_code": "0000",
+    "fid_rank_sort_cls_code": "0",
     "fid_input_cnt_1": "500",
     "fid_prc_cls_code": "0",
     "fid_input_price_1": "0",
     "fid_input_price_2": "1000000",
     "fid_vol_cnt": "0",
-    "fid_trgt_cls_code": "0",
-    "fid_trgt_exls_cls_code": "0",
+    "fid_trgt_cls_code": "000000000",
+    "fid_trgt_exls_cls_code": "0000000000",
     "fid_rsfl_rate1": "0",
     "fid_rsfl_rate2": "100",
 }
@@ -2218,7 +2284,7 @@ def _start_trading_engine_thread():
                     break
                 try:
                     # 매 연결마다 구독 목록 초기화 (재선정 시 새 목록만 구독하도록)
-                    for _sub_key in ("ccnl_krx", "asking_price_krx"):
+                    for _sub_key in ("ccnl_krx", "asking_price_krx", "market_status_krx"):
                         getattr(ka, "open_map", {}).pop(_sub_key, None)
                     kws = ka.KISWebSocket(api_url="/tryitout")
                     # 선정 종목 + 보유 포지션 종목 모두 구독 (재선정으로 빠진 보유 종목도 매도 신호 수신 가능)
@@ -2237,6 +2303,10 @@ def _start_trading_engine_thread():
                         kws.subscribe(request=asking_price_krx, data=stocks, kwargs={"env_dv": "demo" if state.is_paper_trading else "real"})
                     except Exception:
                         pass
+                    try:
+                        kws.subscribe(request=market_status_krx, data=stocks)
+                    except Exception as e:
+                        logger.warning("장운영정보(VI) WS 구독 실패: %s", e)
                     first_disconnect_ts = None
 
                     def on_result(ws, tr_id, result, data_info):
@@ -2244,6 +2314,42 @@ def _start_trading_engine_thread():
                             return
                         if result is not None and not result.empty:
                             state._last_tick_at = time.time()
+                        # 장운영/VI(KRX H0STMKO0): vi_cls_code 기준 실시간 반영, VI 해제 시 냉각 타이머 제거
+                        if tr_id == "H0STMKO0" and result is not None and not result.empty:
+                            try:
+                                if not hasattr(state, "_vi_ws_active") or state._vi_ws_active is None:
+                                    state._vi_ws_active = {}
+                                for _, row in result.iterrows():
+                                    code = None
+                                    for key in ("mksc_shrn_iscd", "MKSC_SHRN_ISCD"):
+                                        v = row.get(key)
+                                        if v is not None and str(v).strip():
+                                            code = str(v).strip().zfill(6)
+                                            break
+                                    if not code:
+                                        continue
+                                    vi_raw = row.get("vi_cls_code")
+                                    if vi_raw is None:
+                                        vi_raw = row.get("VI_CLS_CODE")
+                                    vi_active = _vi_cls_code_implies_active(vi_raw)
+                                    prev = state._vi_ws_active.get(code)
+                                    state._vi_ws_active[code] = (vi_active, time.time())
+                                    with _vi_status_cache_lock:
+                                        _vi_status_cache.pop(code, None)
+                                    if prev is not None and prev[0] and not vi_active:
+                                        vi_skip = getattr(state, "_vi_skip_until", None) or {}
+                                        if isinstance(vi_skip, dict) and vi_skip.get(code, 0) > time.time():
+                                            state._vi_skip_until = {k: v for k, v in vi_skip.items() if k != code}
+                                            with _vi_status_cache_lock:
+                                                _vi_status_cache.pop(code, None)
+                                            _run_async_broadcast({
+                                                "type": "log",
+                                                "level": "info",
+                                                "message": f"VI 해제(장운영 WS): {code} → 해당 종목 VI 냉각 해제, 매수 필터 재평가",
+                                            })
+                            except Exception as ex:
+                                logger.debug("H0STMKO0 VI 처리 실패: %s", ex)
+                            return
                         # 호가 TR: 스프레드 계산용 캐시 갱신
                         if tr_id in ["H0STASP0", "H0NXASP0", "H0UNASP0"] and not result.empty:
                             try:
