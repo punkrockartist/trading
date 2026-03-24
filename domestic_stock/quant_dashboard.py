@@ -37,6 +37,65 @@ from auth_manager import auth_manager, AuthManager
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# 대시보드(Uvicorn) 생명주기: system_*.log에 시작/정상 종료/비정상 종료 흔적
+_dashboard_fastapi_shutdown_done: bool = False
+_dashboard_uvicorn_fatal_logged: bool = False
+_dashboard_atexit_registered: bool = False
+
+
+def ensure_dashboard_atexit_registered() -> None:
+    """비정상 종료 추정(atexit) 로그를 한 번만 등록."""
+    global _dashboard_atexit_registered
+    if _dashboard_atexit_registered:
+        return
+    import atexit
+
+    atexit.register(_atexit_dashboard_if_abrupt)
+    _dashboard_atexit_registered = True
+
+
+def _record_dashboard_http_shutdown_graceful() -> None:
+    """FastAPI shutdown 훅에서 호출 (Uvicorn 정상 종료 시)."""
+    global _dashboard_fastapi_shutdown_done
+    if _dashboard_fastapi_shutdown_done:
+        return
+    _dashboard_fastapi_shutdown_done = True
+    try:
+        from system_log import system_log_append
+
+        system_log_append("info", "대시보드 HTTP 서비스 종료 (FastAPI/Uvicorn 정상 shutdown)")
+    except Exception:
+        pass
+
+
+def _record_dashboard_uvicorn_exception(exc: BaseException) -> None:
+    """uvicorn.run()이 예외로 빠질 때 atexit 비정상 추정과 중복되지 않도록 기록."""
+    global _dashboard_uvicorn_fatal_logged, _dashboard_fastapi_shutdown_done
+    _dashboard_uvicorn_fatal_logged = True
+    _dashboard_fastapi_shutdown_done = True
+    try:
+        from system_log import system_log_append
+
+        system_log_append("error", f"대시보드 Uvicorn 실행 예외 종료: {type(exc).__name__}: {exc}")
+    except Exception:
+        pass
+
+
+def _atexit_dashboard_if_abrupt() -> None:
+    """정상 shutdown 로그가 없이 프로세스가 끝나는 경우에만 기록 (강제 종료·크래시 등)."""
+    if _dashboard_fastapi_shutdown_done or _dashboard_uvicorn_fatal_logged:
+        return
+    try:
+        from system_log import system_log_append
+
+        system_log_append(
+            "warning",
+            "대시보드 프로세스 종료: 정상 HTTP shutdown 기록 없음 (강제 종료·크래시·SIGKILL·OS 종료 등 가능)",
+        )
+    except Exception:
+        pass
+
+
 # FastAPI 앱 생성
 app = FastAPI(title="퀀트 매매 시스템 대시보드")
 
@@ -825,9 +884,13 @@ if __name__ == "__main__":
     print("기본 계정: admin / admin123")
     print("종료하려면 Ctrl+C를 누르세요")
     print("=" * 80)
+    ensure_dashboard_atexit_registered()
     try:
         uvicorn.run(app, host="0.0.0.0", port=8000)
     except KeyboardInterrupt:
         print("\n종료합니다.")
+    except Exception as e:
+        _record_dashboard_uvicorn_exception(e)
+        raise
     # Windows에서 Ctrl+C 후 "Exception ignored in: BaseEventLoop.__del__" / "'NoneType' object has no attribute 'close'"
     # 는 asyncio ProactorEventLoop 정리 순서 이슈로, 동작에는 영향 없음. (Python 이슈)

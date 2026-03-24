@@ -1087,17 +1087,17 @@ def get_dashboard_html(username: str) -> str:
                         </select>
                     </div>
                     <div class="form-group">
-                        <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="daily_loss_limit_calendar" checked> 일일 손실 한도 기준일: 캘린더일</label>
+                        <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="daily_loss_limit_calendar" checked> 일일 손실 한도 기준일: 캘린더일 <code class="setting-var">daily_loss_limit_calendar</code></label>
                     </div>
                     <div class="form-group">
-                        <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="daily_profit_limit_calendar" checked> 일일 이익 한도 기준일: 캘린더일</label>
+                        <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="daily_profit_limit_calendar" checked> 일일 이익 한도 기준일: 캘린더일 <code class="setting-var">daily_profit_limit_calendar</code></label>
                     </div>
                     <div class="form-group">
-                        <label>월간 손실 한도(원,0=미적용):</label>
+                        <label>월간 손실 한도(원,0=미적용): <code class="setting-var">monthly_loss_limit</code></label>
                         <input type="number" id="monthly_loss_limit" value="0" min="0" step="100000">
                     </div>
                     <div class="form-group">
-                        <label>누적 손실 한도(원,0=미적용):</label>
+                        <label>누적 손실 한도(원,0=미적용): <code class="setting-var">cumulative_loss_limit</code></label>
                         <input type="number" id="cumulative_loss_limit" value="0" min="0" step="100000">
                     </div>
                     <div class="form-group">
@@ -1107,70 +1107,70 @@ def get_dashboard_html(username: str) -> str:
                     <details>
                         <summary>고급(주문/재시도/사이징/트레일링)</summary>
                         <div class="form-group">
-                            <label>매수 주문 방식:</label>
+                            <label>매수 주문 방식: <code class="setting-var">buy_order_style</code></label>
                             <select id="buy_order_style">
                                 <option value="market">시장가</option>
                                 <option value="best_limit">최우선 지정가</option>
                             </select>
                         </div>
                         <div class="form-group">
-                            <label>매도 주문 방식:</label>
+                            <label>매도 주문 방식: <code class="setting-var">sell_order_style</code></label>
                             <select id="sell_order_style">
                                 <option value="market">시장가</option>
                                 <option value="best_limit">최우선 지정가</option>
                             </select>
                         </div>
                         <div class="form-group">
-                            <label>주문 재시도 횟수:</label>
+                            <label>주문 재시도 횟수: <code class="setting-var">order_retry_count</code></label>
                             <input type="number" id="order_retry_count" value="0" min="0" max="10">
                         </div>
                         <div class="form-group">
-                            <label>재시도 지연(ms):</label>
+                            <label>재시도 지연(ms): <code class="setting-var">order_retry_delay_ms</code></label>
                             <input type="number" id="order_retry_delay_ms" value="300" min="0" max="10000" step="50">
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="order_retry_exponential_backoff" checked>
-                                네트워크 오류 시 지수 백오프
+                                네트워크 오류 시 지수 백오프 <code class="setting-var">order_retry_exponential_backoff</code>
                             </label>
                         </div>
                         <div class="form-group">
-                            <label>백오프 기준 지연(ms):</label>
+                            <label>백오프 기준 지연(ms): <code class="setting-var">order_retry_base_delay_ms</code></label>
                             <input type="number" id="order_retry_base_delay_ms" value="1000" min="200" max="10000" step="100">
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="order_fallback_to_market" checked>
-                                최우선 지정가 실패 시 시장가로 폴백
+                                최우선 지정가 실패 시 시장가로 폴백 <code class="setting-var">order_fallback_to_market</code>
                             </label>
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="enable_volatility_sizing">
-                                변동성 기반 포지션 사이징 사용
+                                변동성 기반 포지션 사이징 사용 <code class="setting-var">enable_volatility_sizing</code>
                             </label>
                         </div>
                         <div class="form-group">
-                            <label>변동성 lookback(N틱):</label>
+                            <label>변동성 lookback(N틱): <code class="setting-var">volatility_lookback_ticks</code></label>
                             <input type="number" id="volatility_lookback_ticks" value="20" min="2" max="300">
                         </div>
                         <div class="form-group">
-                            <label>변동성 stop 배수:</label>
+                            <label>변동성 stop 배수: <code class="setting-var">volatility_stop_mult</code></label>
                             <input type="number" id="volatility_stop_mult" value="1.0" step="0.1" min="0.1" max="10">
                         </div>
                         <div class="form-group">
-                            <label>종목당 최대 손실액(원):</label>
+                            <label>종목당 최대 손실액(원): <code class="setting-var">max_loss_per_stock_krw</code></label>
                             <input type="number" id="max_loss_per_stock_krw" value="0" min="0" step="10000">
                             <div class="hint">0이면 금액 기반. &gt;0이면 포지션 수량 = 이 값 / 손절거리(가격×SL%).</div>
                         </div>
                         <div class="form-group">
-                            <label>슬리피지·체결지연 보정(bps):</label>
+                            <label>슬리피지·체결지연 보정(bps): <code class="setting-var">slippage_bps</code></label>
                             <input type="number" id="slippage_bps" value="20" min="0" max="500" step="5" title="손절/익절 판단 시 매수가 불리하게 체결된 것으로 가정">
                             <div class="hint">한국 시장 10~30bps(0.1~0.3%) 흔함. 0이면 미적용.</div>
                             <div class="hint">0=미적용. 10=0.1%, 50=0.5%. 보수적 손익 판단용.</div>
                         </div>
                         <div class="form-group">
-                            <label>변동성 하한(가격 대비 비율):</label>
+                            <label>변동성 하한(가격 대비 비율): <code class="setting-var">volatility_floor_ratio</code></label>
                             <input type="number" id="volatility_floor_ratio" value="0.005" min="0" max="0.05" step="0.001" title="틱 부족 시 최소 변동성(장 초반 사이징)">
                             <div class="hint">예: 0.005=0.5%. 틱 부족 시 이 비율로 risk 계산.</div>
                         </div>
@@ -1208,7 +1208,7 @@ def get_dashboard_html(username: str) -> str:
                         <details>
                             <summary>레거시(합산 손실 한도)</summary>
                             <div class="form-group">
-                                <label>일일 손실 한도(원) (레거시: 실현+미실현, 전량매도):</label>
+                                <label>일일 손실 한도(원) (레거시: 실현+미실현, 전량매도): <code class="setting-var">daily_total_loss_limit</code></label>
                                 <input type="number" id="daily_total_loss_limit" value="0" min="0" step="10000">
                             </div>
                             <div class="hint" style="margin-top:-6px;">
@@ -1239,16 +1239,16 @@ def get_dashboard_html(username: str) -> str:
                             <div class="hint">체크 시 고정 비율 대신 변동성 배수로 손절/익절 거리 적용</div>
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label>ATR 손절 배수:</label>
-                            <input type="number" id="atr_stop_mult" value="1.5" step="0.1" min="0.5" max="5">
+                            <label>ATR 손절 배수: <code class="setting-var">atr_stop_mult</code></label>
+                            <input type="number" id="atr_stop_mult" value="1.5" step="0.1" min="0.5" max="5" title="손절 거리 = 틱 ATR대용 × 이 배수">
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label>ATR 익절 배수:</label>
-                            <input type="number" id="atr_take_mult" value="2" step="0.1" min="0.5" max="10">
+                            <label>ATR 익절 배수: <code class="setting-var">atr_take_mult</code></label>
+                            <input type="number" id="atr_take_mult" value="2" step="0.1" min="0.5" max="10" title="익절 거리 = 틱 ATR대용 × 이 배수">
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label>ATR lookback(틱):</label>
-                            <input type="number" id="atr_lookback_ticks" value="20" min="2" max="300">
+                            <label>ATR lookback(틱): <code class="setting-var">atr_lookback_ticks</code></label>
+                            <input type="number" id="atr_lookback_ticks" value="20" min="2" max="300" title="손절/익절용 틱 변동성 계산 구간 길이">
                         </div>
                         <div class="form-group">
                             <label>주문 허용 최소 가격 변동(%): <code class="setting-var">min_price_change_ratio</code></label>
@@ -3457,7 +3457,20 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     const mtpd = document.getElementById('max_trades_per_day')?.value || '12';
                     const pt = document.getElementById('partial_tp_pct')?.value || '0';
                     const tr = document.getElementById('trailing_stop_pct')?.value || '0';
+                    const useAtrSt = !!document.getElementById('use_atr_for_stop_take')?.checked;
+                    const asm = document.getElementById('atr_stop_mult')?.value || '1.5';
+                    const atm = document.getElementById('atr_take_mult')?.value || '2';
+                    const alb = document.getElementById('atr_lookback_ticks')?.value || '20';
+                    const atrFilt = !!document.getElementById('atr_filter_enabled')?.checked;
+                    const atrPer = document.getElementById('atr_period')?.value || '14';
+                    const atrMax = document.getElementById('atr_ratio_max_pct')?.value || '0';
                     const legacyLoss = (parseInt(dtl || '0') > 0) ? (' · legacyTotalLoss=' + dtl + '원') : '';
+                    const atrLine = useAtrSt
+                        ? (' · atrStopTk=' + asm + '/' + atm + '×N' + alb)
+                        : '';
+                    const atrFiltLine = atrFilt
+                        ? (' · atrFilt≤' + atrMax + '%(p=' + atrPer + ')')
+                        : '';
                     risk.textContent =
                         'max=' + maxAmt + '원 · ' +
                         'minQty=' + minQty + '주 · ' +
@@ -3467,7 +3480,8 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                         'dailyProfit=' + dpr + '원(' + dpb + ')' +
                         legacyLoss + ' · ' +
                         '부분익절=' + pt + '% · ' +
-                        'trailing=' + tr + '%';
+                        'trailing=' + tr + '%' +
+                        atrLine + atrFiltLine;
                 }}
 
                 const strat = document.getElementById('strategy_summary');
@@ -5101,6 +5115,9 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     <div class="k">max_single</div><div><code>${{_escapeHtml(risk.max_single_trade_amount ?? '-')}}</code></div>
                     <div class="k">daily_loss</div><div><code>${{_escapeHtml(risk.daily_loss_limit ?? '-')}}</code></div>
                     <div class="k">max_pos_ratio</div><div><code>${{_escapeHtml(risk.max_position_size_ratio ?? '-')}}</code></div>
+                    <div class="k">atr_stop_take</div><div><code>${{risk.use_atr_for_stop_take ? ('on ' + (risk.atr_stop_mult ?? '-') + '/' + (risk.atr_take_mult ?? '-') + '×N' + (risk.atr_lookback_ticks ?? '-')) : 'off'}}</code></div>
+                    <div class="k">atr_filter</div><div><code>${{risk.atr_filter_enabled ? ('≤' + (risk.atr_ratio_max_pct ?? '-') + '% p=' + (risk.atr_period ?? '-')) : 'off'}}</code></div>
+                    <div class="k">sap_filter</div><div><code>${{risk.sap_deviation_filter_enabled ? ('≤' + (risk.sap_deviation_max_pct ?? '-') + '%') : 'off'}}</code></div>
                     <div class="k">MA</div><div><code>${{_escapeHtml(strat.short_ma_period ?? '-')}}</code> / <code>${{_escapeHtml(strat.long_ma_period ?? '-')}}</code></div>
                 </div>
             `;
@@ -5172,6 +5189,14 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 window.location.href = '/login';
             }}
         }}
+
+        (function _bindRiskSummaryRefresh() {{
+            const sec = document.getElementById('settings-section-risk');
+            if (!sec) return;
+            const refresh = () => {{ try {{ updateSettingsSummaries(); }} catch (e) {{}} }};
+            sec.addEventListener('input', refresh);
+            sec.addEventListener('change', refresh);
+        }})();
 
         // 초기화
         connectWebSocket();

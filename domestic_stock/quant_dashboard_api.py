@@ -22,7 +22,9 @@ from domestic_stock_functions import inquire_index_daily_price, inquire_index_pr
 
 from quant_dashboard import (
     app, state, get_current_user,
-    RiskConfig, StockSelectionConfig, StrategyConfig, OperationalConfig, ManualOrder
+    RiskConfig, StockSelectionConfig, StrategyConfig, OperationalConfig, ManualOrder,
+    _record_dashboard_http_shutdown_graceful,
+    ensure_dashboard_atexit_registered,
 )
 from auth_manager import auth_manager
 from stock_selector import StockSelector
@@ -39,6 +41,58 @@ except Exception:  # pragma: no cover - 환경 의존
     OpenAI = None  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+# 매도 신호 출처 코드: system_*.log / trade_info["sell_trigger_code"].
+# RiskManager.check_exit_signal 의 trigger_code(risk_*)는 quant_trading_safe.py 와 동일 문자열.
+SELL_TRIG_TIME_LIQUIDATION = "time_liquidation"
+SELL_TRIG_DAILY_PROFIT_LIMIT = "daily_profit_limit"
+SELL_TRIG_DAILY_LOSS_LIMIT_TOTAL = "daily_loss_limit_total"
+SELL_TRIG_DAILY_LOSS_LIMIT_LEGACY = "daily_loss_limit_legacy"
+SELL_TRIG_CIRCUIT_BREAKER = "exchange_circuit_breaker_liquidation"
+SELL_TRIG_SIDECAR = "exchange_sidecar_liquidation"
+SELL_TRIG_MA_DEAD_CROSS = "strategy_ma_dead_cross"
+SELL_TRIG_EMERGENCY_WS = "emergency_ws_disconnect"
+SELL_TRIG_MANUAL_LIQUIDATION = "manual_liquidation_api"
+SELL_TRIG_MANUAL_ORDER = "manual_order_api"
+SELL_TRIG_RECONCILE_PENDING_FILL = "reconcile_pending_fill"
+SELL_TRIG_UNKNOWN = "sell_unknown"
+
+
+def _sell_trigger_audit_message(
+    trigger_code: str,
+    reason: str,
+    stock_code: str,
+    *,
+    verdict: str,
+    qty: Optional[Any] = None,
+    price: Optional[Any] = None,
+    remain: Optional[int] = None,
+) -> str:
+    tc = (trigger_code or "").strip() or SELL_TRIG_UNKNOWN
+    parts = [f"매도 {verdict}", f"trigger={tc}", str(stock_code).strip().zfill(6)]
+    r = (reason or "").strip()
+    if r:
+        parts.append(f"reason={r}")
+    if price is not None:
+        try:
+            parts.append(f"px={float(price):,.0f}")
+        except (TypeError, ValueError):
+            parts.append(f"px={price}")
+    if qty is not None:
+        parts.append(f"qty={qty}")
+    if remain is not None:
+        parts.append(f"remain={remain}")
+    return " | ".join(parts)
+
+
+def _append_sell_trigger_to_order_log(msg: str, signal: str, sell_trigger_code: Optional[str], reason: str) -> str:
+    if str(signal).lower() != "sell":
+        return msg
+    tc = (sell_trigger_code or "").strip() or SELL_TRIG_UNKNOWN
+    r = (reason or "").strip()
+    return f"{msg} | 매도트리거={tc} | 매도사유={r}"
+
+
 pending_signals_lock = threading.Lock()
 DEFAULT_STOCK_INFO = [
     {"code": "005930", "name": "삼성전자"},
@@ -841,6 +895,7 @@ def _reconcile_pending_orders_sync(max_per_run: int = 5, min_check_interval_sec:
                 "pnl": pnl,
                 "env_dv": env_dv,
                 "odno": odno,
+                "sell_trigger_code": str(item.get("sell_trigger_code") or "").strip() if side == "sell" else "",
             })
             checked += 1
 
@@ -1021,10 +1076,16 @@ async def _pending_order_reconciler_loop():
                         env_dv = str(ev.get("env_dv") or "-")
                         pnl = ev.get("pnl")
 
+                        _rec_tc = ""
+                        if side == "sell":
+                            _rec_tc = str(ev.get("sell_trigger_code") or "").strip() or SELL_TRIG_RECONCILE_PENDING_FILL
+                        _rec_msg = f"주문 체결 확인 | {side.upper()} {code} qty={qty} px={px:,.0f} env={env_dv} odno={odno or '-'}"
+                        if side == "sell":
+                            _rec_msg += f" | 매도트리거={_rec_tc} | 매도사유=체결확인(지연)"
                         await state.broadcast({
                             "type": "log",
                             "level": "info",
-                            "message": f"주문 체결 확인 | {side.upper()} {code} qty={qty} px={px:,.0f} env={env_dv} odno={odno or '-'}",
+                            "message": _rec_msg,
                         })
 
                         trade_info = {
@@ -1036,6 +1097,8 @@ async def _pending_order_reconciler_loop():
                             "reason": "체결확인",
                             "order_status": "filled",
                         }
+                        if side == "sell":
+                            trade_info["sell_trigger_code"] = _rec_tc
                         state.add_trade(trade_info)
                         await state.broadcast({"type": "trade", "data": trade_info})
                         await state.broadcast({"type": "position", "data": _build_positions_message()})
@@ -1979,7 +2042,14 @@ def _print_signal_decision(stock_code: str, current_price: float):
     )
 
 
-def _build_pending_signal(stock_code: str, signal: str, price: float, reason: str, suggested_qty_override: Optional[int] = None) -> dict:
+def _build_pending_signal(
+    stock_code: str,
+    signal: str,
+    price: float,
+    reason: str,
+    suggested_qty_override: Optional[int] = None,
+    sell_trigger_code: Optional[str] = None,
+) -> dict:
     signal_id = f"sig_{datetime.now().strftime('%Y%m%d%H%M%S')}_{stock_code}_{uuid.uuid4().hex[:6]}"
     now = datetime.now()
     suggested_qty = 0
@@ -2003,6 +2073,9 @@ def _build_pending_signal(stock_code: str, signal: str, price: float, reason: st
     except Exception:
         stock_name = ""
 
+    stc = ""
+    if str(signal).lower() == "sell":
+        stc = (sell_trigger_code or "").strip() or SELL_TRIG_UNKNOWN
     return {
         "signal_id": signal_id,
         "stock_code": stock_code,
@@ -2011,6 +2084,7 @@ def _build_pending_signal(stock_code: str, signal: str, price: float, reason: st
         "price": price,
         "suggested_qty": suggested_qty,
         "reason": reason,
+        "sell_trigger_code": stc,
         "created_at": now.isoformat(),
         "expires_at": (now.timestamp() + 60),
         "status": "pending",
@@ -2065,11 +2139,25 @@ def _build_positions_message():
     return positions
 
 
-def _handle_signal(stock_code: str, signal: str, price: float, reason: str, suggested_qty_override: Optional[int] = None):
+def _handle_signal(
+    stock_code: str,
+    signal: str,
+    price: float,
+    reason: str,
+    suggested_qty_override: Optional[int] = None,
+    sell_trigger_code: Optional[str] = None,
+):
     """신호 처리: 수동 모드면 승인대기 등록, 자동 모드면 즉시 주문 실행"""
     manual = getattr(state, "manual_approval", True)
     if manual:
-        sig = _build_pending_signal(stock_code=stock_code, signal=signal, price=price, reason=reason, suggested_qty_override=suggested_qty_override)
+        sig = _build_pending_signal(
+            stock_code=stock_code,
+            signal=signal,
+            price=price,
+            reason=reason,
+            suggested_qty_override=suggested_qty_override,
+            sell_trigger_code=sell_trigger_code,
+        )
         created = _create_or_replace_pending_signal(sig)
         if created:
             _run_async_broadcast({"type": "signal_pending", "data": created})
@@ -2089,6 +2177,9 @@ def _handle_signal(stock_code: str, signal: str, price: float, reason: str, sugg
                     if elapsed < min_hold:
                         return
 
+    _stc_kw = None
+    if str(signal).lower() == "sell":
+        _stc_kw = (sell_trigger_code or "").strip() or None
     result, details = safe_execute_order(
         signal=signal,
         stock_code=stock_code,
@@ -2100,6 +2191,7 @@ def _handle_signal(stock_code: str, signal: str, price: float, reason: str, sugg
         return_details=True,
         quantity_override=suggested_qty_override,
         selected_stocks_count=len(getattr(state, "selected_stocks", None) or []),
+        sell_trigger_code=_stc_kw,
     )
     if not result:
         reason = details.get("reason") or ""
@@ -2139,7 +2231,9 @@ def _handle_signal(stock_code: str, signal: str, price: float, reason: str, sugg
                 _run_async_broadcast({"type": "log", "message": f"중복 주문 무시(이미 접수됨) | {(details.get('signal') or '').upper()} {stock_code}", "level": "info"})
                 skip_log = True
         if not skip_log:
-            _run_async_broadcast({"type": "log", "message": _format_order_log(details), "level": "error"})
+            _raw = _format_order_log(details)
+            _msg = _append_sell_trigger_to_order_log(_raw, signal, sell_trigger_code, reason)
+            _run_async_broadcast({"type": "log", "message": _msg, "level": "error"})
         if reason and ("월간 손실 한도" in reason or "누적 손실 한도" in reason):
             try:
                 tz = timezone(timedelta(hours=9))
@@ -2174,7 +2268,9 @@ def _handle_signal(stock_code: str, signal: str, price: float, reason: str, sugg
 
     filled = bool(details.get("filled", False))
     level = "info" if filled else "warning"
-    _run_async_broadcast({"type": "log", "message": _format_order_log(details), "level": level})
+    _raw_ok = _format_order_log(details)
+    _msg_ok = _append_sell_trigger_to_order_log(_raw_ok, signal, sell_trigger_code, reason)
+    _run_async_broadcast({"type": "log", "message": _msg_ok, "level": level})
     if not filled:
         # 주문 접수는 되었으나 체결 미확정/미체결 상태도 거래내역에 남겨, "접수(대기)"와 "체결"을 구분 가능하게 함
         try:
@@ -2192,6 +2288,8 @@ def _handle_signal(stock_code: str, signal: str, price: float, reason: str, sugg
                 "reason": reason or "",
                 "order_status": str(details.get("status") or "accepted_pending"),
             }
+            if str(signal).lower() == "sell":
+                trade_info["sell_trigger_code"] = (sell_trigger_code or "").strip() or SELL_TRIG_UNKNOWN
             state.add_trade(trade_info)
             _run_async_broadcast({"type": "trade", "data": trade_info})
         except Exception:
@@ -2208,10 +2306,14 @@ def _handle_signal(stock_code: str, signal: str, price: float, reason: str, sugg
             except Exception:
                 sold = 0
             if remain > 0 and sold > 0:
+                _tc = (sell_trigger_code or "").strip() or SELL_TRIG_UNKNOWN
                 _run_async_broadcast({
                     "type": "log",
                     "level": "info",
-                    "message": f"부분 매도 체결: {stock_code} sold={sold} remain={remain} ({reason})",
+                    "message": (
+                        f"부분 매도 체결: {stock_code} sold={sold} remain={remain} | "
+                        f"매도트리거={_tc} | 매도사유={reason}"
+                    ),
                 })
     except Exception:
         pass
@@ -2235,10 +2337,22 @@ def _handle_signal(stock_code: str, signal: str, price: float, reason: str, sugg
         "reason": reason or "",
         "order_status": str(details.get("status") or "filled"),
     }
+    if str(signal).lower() == "sell":
+        trade_info["sell_trigger_code"] = (sell_trigger_code or "").strip() or SELL_TRIG_UNKNOWN
     state.add_trade(trade_info)
     _run_async_broadcast({"type": "trade", "data": trade_info})
     _run_async_broadcast({"type": "position", "data": _build_positions_message()})
-    _run_async_broadcast({"type": "log", "message": f"자동 체결: {stock_code} {signal.upper()} {price:,.0f}원", "level": "info"})
+    if str(signal).lower() == "sell":
+        _tc_f = (sell_trigger_code or "").strip() or SELL_TRIG_UNKNOWN
+        _run_async_broadcast({
+            "type": "log",
+            "level": "info",
+            "message": (
+                f"자동 체결: {stock_code} SELL {price:,.0f}원 | 매도트리거={_tc_f} | 매도사유={reason or '-'}"
+            ),
+        })
+    else:
+        _run_async_broadcast({"type": "log", "message": f"자동 체결: {stock_code} {signal.upper()} {price:,.0f}원", "level": "info"})
 
 
 def _start_trading_engine_thread():
@@ -2392,7 +2506,14 @@ def _start_trading_engine_thread():
                                                 px = float(pos.get("buy_price", 0) or 0)
                                             if px <= 0:
                                                 continue
-                                            _handle_signal(code, "sell", px, f"시간기반 청산({liq_hhmm} 이후)", suggested_qty_override=qty)
+                                            _handle_signal(
+                                                code,
+                                                "sell",
+                                                px,
+                                                f"시간기반 청산({liq_hhmm} 이후)",
+                                                suggested_qty_override=qty,
+                                                sell_trigger_code=SELL_TRIG_TIME_LIQUIDATION,
+                                            )
                         except Exception:
                             pass
 
@@ -2437,7 +2558,14 @@ def _start_trading_engine_thread():
                                                         px = float(pos.get("current_price") or rm.last_prices.get(code) or pos.get("buy_price") or 0)
                                                         if px <= 0:
                                                             continue
-                                                        _handle_signal(code, "sell", px, f"일일 이익 한도({limit:,}원) 도달", suggested_qty_override=qty)
+                                                        _handle_signal(
+                                                            code,
+                                                            "sell",
+                                                            px,
+                                                            f"일일 이익 한도({limit:,}원) 도달",
+                                                            suggested_qty_override=qty,
+                                                            sell_trigger_code=SELL_TRIG_DAILY_PROFIT_LIMIT,
+                                                        )
                                                 else:
                                                     _run_async_broadcast({
                                                         "type": "log",
@@ -2488,7 +2616,14 @@ def _start_trading_engine_thread():
                                                     px = float(pos.get("current_price") or rm.last_prices.get(code) or pos.get("buy_price") or 0)
                                                     if px <= 0:
                                                         continue
-                                                    _handle_signal(code, "sell", px, f"일일 손실 한도(total)({limit:,}원) 도달", suggested_qty_override=qty)
+                                                    _handle_signal(
+                                                        code,
+                                                        "sell",
+                                                        px,
+                                                        f"일일 손실 한도(total)({limit:,}원) 도달",
+                                                        suggested_qty_override=qty,
+                                                        sell_trigger_code=SELL_TRIG_DAILY_LOSS_LIMIT_TOTAL,
+                                                    )
                                         else:
                                             state._loss_limit_total_triggered_at = 0.0
                         except Exception:
@@ -2535,7 +2670,14 @@ def _start_trading_engine_thread():
                                                     px = float(pos.get("current_price") or rm.last_prices.get(code) or pos.get("buy_price") or 0)
                                                     if px <= 0:
                                                         continue
-                                                    _handle_signal(code, "sell", px, f"일일 손실 한도(합산)({limit:,}원) 도달", suggested_qty_override=qty)
+                                                    _handle_signal(
+                                                        code,
+                                                        "sell",
+                                                        px,
+                                                        f"일일 손실 한도(합산)({limit:,}원) 도달",
+                                                        suggested_qty_override=qty,
+                                                        sell_trigger_code=SELL_TRIG_DAILY_LOSS_LIMIT_LEGACY,
+                                                    )
                                         else:
                                             state._total_loss_limit_triggered_at = 0.0
                         except Exception:
@@ -2684,7 +2826,15 @@ def _start_trading_engine_thread():
                                 if exit_sig and exit_sig.get("action") == "sell":
                                     qty = int(exit_sig.get("quantity") or 0)
                                     reason = str(exit_sig.get("reason") or "리스크 조건 충족")
-                                    _handle_signal(stock_code, "sell", current_price, reason, suggested_qty_override=qty)
+                                    _xtc = str(exit_sig.get("trigger_code") or "").strip() or SELL_TRIG_UNKNOWN
+                                    _handle_signal(
+                                        stock_code,
+                                        "sell",
+                                        current_price,
+                                        reason,
+                                        suggested_qty_override=qty,
+                                        sell_trigger_code=_xtc,
+                                    )
                                     continue
 
                                 short_ma = state.strategy.calculate_ma(stock_code, state.strategy.short_ma_period)
@@ -2736,7 +2886,14 @@ def _start_trading_engine_thread():
                                                                 continue
                                                             sell_qty = (qty // 2) if action == "liquidate_partial" else qty
                                                             if sell_qty > 0:
-                                                                _handle_signal(code, "sell", px, f"서킷브레이커 구간 {action}", suggested_qty_override=sell_qty)
+                                                                _handle_signal(
+                                                                    code,
+                                                                    "sell",
+                                                                    px,
+                                                                    f"서킷브레이커 구간 {action}",
+                                                                    suggested_qty_override=sell_qty,
+                                                                    sell_trigger_code=SELL_TRIG_CIRCUIT_BREAKER,
+                                                                )
                                                     continue
                                         except Exception:
                                             pass
@@ -2779,7 +2936,14 @@ def _start_trading_engine_thread():
                                                                 continue
                                                             sell_qty = (qty // 2) if action == "liquidate_partial" else qty
                                                             if sell_qty > 0:
-                                                                _handle_signal(code, "sell", px, f"사이드카 구간 {action}", suggested_qty_override=sell_qty)
+                                                                _handle_signal(
+                                                                    code,
+                                                                    "sell",
+                                                                    px,
+                                                                    f"사이드카 구간 {action}",
+                                                                    suggested_qty_override=sell_qty,
+                                                                    sell_trigger_code=SELL_TRIG_SIDECAR,
+                                                                )
                                                     continue
                                         except Exception:
                                             pass
@@ -3414,7 +3578,14 @@ def _start_trading_engine_thread():
                                     if signal_type == "buy" and stock_code not in (state.selected_stocks or []):
                                         signal_type = None
                                     if signal_type:
-                                        _handle_signal(stock_code, signal_type, current_price, "이동평균 크로스 조건 충족")
+                                        _ma_trig = SELL_TRIG_MA_DEAD_CROSS if signal_type == "sell" else None
+                                        _handle_signal(
+                                            stock_code,
+                                            signal_type,
+                                            current_price,
+                                            "이동평균 크로스 조건 충족",
+                                            sell_trigger_code=_ma_trig,
+                                        )
                             except Exception:
                                 continue
 
@@ -3438,7 +3609,14 @@ def _start_trading_engine_thread():
                             px = float(pos.get("current_price") or rm.last_prices.get(code) or pos.get("buy_price") or 0)
                             if px <= 0:
                                 continue
-                            _handle_signal(code, "sell", px, "긴급 청산(WS 장시간 단절)", suggested_qty_override=qty)
+                            _handle_signal(
+                                code,
+                                "sell",
+                                px,
+                                "긴급 청산(WS 장시간 단절)",
+                                suggested_qty_override=qty,
+                                sell_trigger_code=SELL_TRIG_EMERGENCY_WS,
+                            )
                         _run_async_broadcast({"type": "log", "message": "긴급 청산: WebSocket 장시간 단절로 전량 매도 신호 실행", "level": "error"})
                     first_disconnect_ts = None
                 time.sleep(ws_reconnect_sleep)
@@ -3569,6 +3747,15 @@ def _build_settings_snapshot_for_preflight(username: str) -> Dict[str, Any]:
                 "max_trades_per_day": int(getattr(rm, "max_trades_per_day", 0) or 0),
                 "max_trades_per_stock_per_day": int(getattr(rm, "max_trades_per_stock_per_day", 0) or 0),
                 "slippage_bps": int(getattr(rm, "slippage_bps", 0) or 0),
+                "use_atr_for_stop_take": bool(getattr(rm, "use_atr_for_stop_take", False)),
+                "atr_stop_mult": float(getattr(rm, "atr_stop_mult", 1.5) or 1.5),
+                "atr_take_mult": float(getattr(rm, "atr_take_mult", 2.0) or 2.0),
+                "atr_lookback_ticks": int(getattr(rm, "atr_lookback_ticks", 20) or 20),
+                "atr_filter_enabled": bool(getattr(rm, "atr_filter_enabled", False)),
+                "atr_period": int(getattr(rm, "atr_period", 14) or 14),
+                "atr_ratio_max_pct": float(getattr(rm, "atr_ratio_max_pct", 0.0) or 0.0),
+                "sap_deviation_filter_enabled": bool(getattr(rm, "sap_deviation_filter_enabled", False)),
+                "sap_deviation_max_pct": float(getattr(rm, "sap_deviation_max_pct", 3.0) or 3.0),
             }
     except Exception:
         pass
@@ -4334,6 +4521,28 @@ async def _start_auto_schedule():
     logger.info("자동 스케줄 루프 시작 (매일 auto_start_hhmm/auto_stop_hhmm 적용)")
 
 
+@app.on_event("startup")
+async def _dashboard_lifecycle_startup_log():
+    """어떤 방식으로 Uvicorn을 띄우든 system_*.log에 기동 흔적."""
+    ensure_dashboard_atexit_registered()
+    try:
+        system_log_append("info", "대시보드 HTTP 서비스 시작 (FastAPI startup / Uvicorn)")
+    except Exception:
+        pass
+
+
+@app.on_event("shutdown")
+async def _dashboard_http_shutdown_event():
+    """Uvicorn 정상 종료 시 system_*.log에 흔적 남김."""
+    try:
+        _record_dashboard_http_shutdown_graceful()
+    except Exception:
+        try:
+            system_log_append("warning", "대시보드 HTTP shutdown 로그 기록 중 예외 발생")
+        except Exception:
+            pass
+
+
 @app.get("/api/positions")
 async def get_positions(current_user: str = Depends(get_current_user)):
     """현재 포지션 조회"""
@@ -4639,7 +4848,15 @@ async def liquidate_position(body: Optional[dict] = None, current_user: str = De
     if price <= 0:
         return JSONResponse({"success": False, "message": "유효한 가격을 알 수 없습니다. 잠시 후 다시 시도하세요."}, status_code=400)
     try:
-        await asyncio.to_thread(_handle_signal, stock_code, "sell", price, "수동 청산", suggested_qty_override=qty)
+        await asyncio.to_thread(
+            _handle_signal,
+            stock_code,
+            "sell",
+            price,
+            "수동 청산",
+            suggested_qty_override=qty,
+            sell_trigger_code=SELL_TRIG_MANUAL_LIQUIDATION,
+        )
         await state.broadcast({"type": "position", "data": _build_positions_message()})
         await send_status_update()
         return JSONResponse({"success": True, "message": f"{stock_code} 전량 매도 신호 처리됨(수동 청산)"})
@@ -5354,6 +5571,9 @@ async def approve_signal(signal_id: str, current_user: str = Depends(get_current
             signal_data["status"] = "expired"
             return JSONResponse({"success": False, "message": "만료된 신호입니다."})
 
+    _ap_stc = None
+    if str(signal_data.get("signal") or "").lower() == "sell":
+        _ap_stc = str(signal_data.get("sell_trigger_code") or "").strip() or None
     result, details = safe_execute_order(
         signal=signal_data["signal"],
         stock_code=signal_data["stock_code"],
@@ -5365,9 +5585,14 @@ async def approve_signal(signal_id: str, current_user: str = Depends(get_current
         return_details=True,
         quantity_override=int(signal_data.get("suggested_qty") or 0) or None,
         selected_stocks_count=len(getattr(state, "selected_stocks", None) or []),
+        sell_trigger_code=_ap_stc,
     )
     filled = bool(details.get("filled", False))
-    await state.broadcast({"type": "log", "message": _format_order_log(details), "level": "info" if (result and filled) else ("warning" if result else "error")})
+    _raw_ap = _format_order_log(details)
+    _ap_reason = str(signal_data.get("reason") or "")
+    _ap_trig = str(signal_data.get("sell_trigger_code") or "").strip() or None
+    _msg_ap = _append_sell_trigger_to_order_log(_raw_ap, signal_data.get("signal") or "", _ap_trig, _ap_reason)
+    await state.broadcast({"type": "log", "message": _msg_ap, "level": "info" if (result and filled) else ("warning" if result else "error")})
     if not result:
         sc = str(signal_data.get("stock_code") or "").strip().zfill(6)
         if details.get("rejection_reason") == "vi" and sc:
@@ -5399,10 +5624,14 @@ async def approve_signal(signal_id: str, current_user: str = Depends(get_current
                 except Exception:
                     sold = 0
                 if remain > 0 and sold > 0:
+                    _tc_ap = str(signal_data.get("sell_trigger_code") or "").strip() or SELL_TRIG_UNKNOWN
                     await state.broadcast({
                         "type": "log",
                         "level": "info",
-                        "message": f"부분 매도 체결: {code} sold={sold} remain={remain} ({signal_data.get('reason', '')})",
+                        "message": (
+                            f"부분 매도 체결: {code} sold={sold} remain={remain} | "
+                            f"매도트리거={_tc_ap} | 매도사유={signal_data.get('reason', '')}"
+                        ),
                     })
     except Exception:
         pass
@@ -5432,6 +5661,10 @@ async def approve_signal(signal_id: str, current_user: str = Depends(get_current
             "pnl": None,
             "reason": signal_data.get("reason") or "승인체결",
         }
+        if str(signal_data.get("signal") or "").lower() == "sell":
+            trade_info["sell_trigger_code"] = (
+                str(signal_data.get("sell_trigger_code") or "").strip() or SELL_TRIG_UNKNOWN
+            )
         state.add_trade(trade_info)
         await state.broadcast({"type": "trade", "data": trade_info})
         await send_status_update()
@@ -6077,6 +6310,7 @@ async def execute_manual_order(order: ManualOrder, current_user: str = Depends(g
                     msg = f"{msg} (detail: {detail})"
                 return JSONResponse({"success": False, "message": msg})
         
+        _mo_stc = SELL_TRIG_MANUAL_ORDER if str(order.order_type or "").lower() == "sell" else None
         result, details = safe_execute_order(
             signal=order.order_type,
             stock_code=order.stock_code,
@@ -6088,9 +6322,17 @@ async def execute_manual_order(order: ManualOrder, current_user: str = Depends(g
             return_details=True,
             quantity_override=int(order.quantity or 0) or None,
             selected_stocks_count=len(getattr(state, "selected_stocks", None) or []),
+            sell_trigger_code=_mo_stc,
         )
         filled = bool(details.get("filled", False))
-        await state.broadcast({"type": "log", "message": _format_order_log(details), "level": "info" if (result and filled) else ("warning" if result else "error")})
+        _raw_mo = _format_order_log(details)
+        _mo_msg = _append_sell_trigger_to_order_log(
+            _raw_mo,
+            str(order.order_type or ""),
+            SELL_TRIG_MANUAL_ORDER if str(order.order_type or "").lower() == "sell" else None,
+            "수동주문",
+        )
+        await state.broadcast({"type": "log", "message": _mo_msg, "level": "info" if (result and filled) else ("warning" if result else "error")})
         if not result:
             sc = str(order.stock_code or "").strip().zfill(6)
             if details.get("rejection_reason") == "vi" and sc:
@@ -6125,7 +6367,10 @@ async def execute_manual_order(order: ManualOrder, current_user: str = Depends(g
                         await state.broadcast({
                             "type": "log",
                             "level": "info",
-                            "message": f"부분 매도 체결: {code} sold={sold} remain={remain} (수동주문)",
+                            "message": (
+                                f"부분 매도 체결: {code} sold={sold} remain={remain} | "
+                                f"매도트리거={SELL_TRIG_MANUAL_ORDER} | 매도사유=수동주문"
+                            ),
                         })
         except Exception:
             pass
@@ -6144,6 +6389,8 @@ async def execute_manual_order(order: ManualOrder, current_user: str = Depends(g
                 "pnl": None,
                 "reason": "수동주문",
             }
+            if str(order.order_type or "").lower() == "sell":
+                trade_info["sell_trigger_code"] = SELL_TRIG_MANUAL_ORDER
             state.add_trade(trade_info)
             await state.broadcast({"type": "trade", "data": trade_info})
             await send_status_update()

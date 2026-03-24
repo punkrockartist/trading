@@ -359,6 +359,7 @@ class RiskManager:
         env_dv: str,
         odno: str = "",
         reason: str = "",
+        sell_trigger_code: str = "",
     ) -> None:
         with self._lock:
             self._prune_pending_orders()
@@ -374,6 +375,7 @@ class RiskManager:
                 "env_dv": str(env_dv or ""),
                 "odno": str(odno or "").strip(),
                 "reason": str(reason or ""),
+                "sell_trigger_code": str(sell_trigger_code or "").strip() if str(side).lower() == "sell" else "",
             }
 
     def clear_pending_order(self, stock_code: str, side: Optional[str] = None) -> None:
@@ -691,7 +693,8 @@ class RiskManager:
         """
         포지션 청산/부분익절/보호 로직을 통합해서 판단.
         Returns:
-            {"action":"sell","quantity":int,"reason":str} or None
+            {"action":"sell","quantity":int,"reason":str,"trigger_code":str} or None
+            trigger_code는 quant_dashboard_api 의 매도 로그·trade_info와 1:1 매핑용.
         """
         if stock_code not in self.positions:
             return None
@@ -725,16 +728,26 @@ class RiskManager:
                 # 진입 직후 변동성이 작으면 손절선이 매수가에 붙어 즉시 터지는 것 방지: 손절선이 매수가의 0.2% 미만 아래면 인정
                 min_stop_pct = 0.002
                 if stop_price < effective_buy * (1.0 - min_stop_pct) and float(current_price) <= stop_price:
-                    return {"action": "sell", "quantity": qty, "reason": "손절(ATR)"}
+                    return {
+                        "action": "sell",
+                        "quantity": qty,
+                        "reason": "손절(ATR)",
+                        "trigger_code": "risk_atr_stop_loss",
+                    }
                 min_take_pct = 0.002
                 if take_price > effective_buy * (1.0 + min_take_pct) and float(current_price) >= take_price:
-                    return {"action": "sell", "quantity": qty, "reason": "익절(ATR)"}
+                    return {
+                        "action": "sell",
+                        "quantity": qty,
+                        "reason": "익절(ATR)",
+                        "trigger_code": "risk_atr_take_profit",
+                    }
             else:
                 use_atr = False
         if not use_atr:
             # 손절 (비율)
             if self.stop_loss_ratio and change_ratio <= -float(self.stop_loss_ratio):
-                return {"action": "sell", "quantity": qty, "reason": "손절"}
+                return {"action": "sell", "quantity": qty, "reason": "손절", "trigger_code": "risk_stop_loss_ratio"}
 
         # 부분 익절
         try:
@@ -751,13 +764,13 @@ class RiskManager:
                     sell_qty = min(sell_qty, qty - 1)
                 else:
                     sell_qty = qty
-                return {"action": "sell", "quantity": sell_qty, "reason": "부분익절"}
+                return {"action": "sell", "quantity": sell_qty, "reason": "부분익절", "trigger_code": "risk_partial_take_profit"}
         except Exception:
             pass
 
         # 익절(전량) — ATR 모드가 아닐 때만 비율 적용
         if not use_atr and self.take_profit_ratio and change_ratio >= float(self.take_profit_ratio):
-            return {"action": "sell", "quantity": qty, "reason": "익절"}
+            return {"action": "sell", "quantity": qty, "reason": "익절", "trigger_code": "risk_take_profit_ratio"}
 
         # 트레일링 스탑
         try:
@@ -767,7 +780,7 @@ class RiskManager:
                     gain = (highest - buy_price) / buy_price
                     if gain >= float(self.trailing_activation_ratio or 0.0):
                         if float(current_price) <= highest * (1.0 - float(self.trailing_stop_ratio)):
-                            return {"action": "sell", "quantity": qty, "reason": "트레일링스탑"}
+                            return {"action": "sell", "quantity": qty, "reason": "트레일링스탑", "trigger_code": "risk_trailing_stop"}
         except Exception:
             pass
 
@@ -1168,6 +1181,7 @@ def safe_execute_order(
     return_details: bool = False,
     quantity_override: Optional[int] = None,
     selected_stocks_count: Optional[int] = None,  # 선정 종목 수(1~2일 때 잔고 활용 확대)
+    sell_trigger_code: Optional[str] = None,  # 매도 시 system 로그·pending 추적용(매수는 무시)
 ):
     """
     안전한 주문 실행
@@ -1192,12 +1206,16 @@ def safe_execute_order(
     # 환경 설정 확인
     env_dv = "demo" if is_paper_trading else "real"
     
+    _sell_tc = ""
+    if signal == "sell" and sell_trigger_code:
+        _sell_tc = str(sell_trigger_code).strip()
     details = {
         "signal": signal,
         "stock_code": stock_code,
         "price": price,
         "is_paper_trading": is_paper_trading,
         "env_dv": "demo" if is_paper_trading else "real",
+        "sell_trigger_code": _sell_tc,
     }
     # 기본 입력 검증: 비정상 값이면 주문 자체를 막아 예기치 않은 주문/예외를 방지
     try:
@@ -1406,6 +1424,7 @@ def safe_execute_order(
                         env_dv=details["env_dv"],
                         odno=odno_final,
                         reason="accepted_pending",
+                        sell_trigger_code="",
                     )
                 except Exception:
                     pass
@@ -1662,6 +1681,7 @@ def safe_execute_order(
                         env_dv=details["env_dv"],
                         odno=odno_final,
                         reason="accepted_pending",
+                        sell_trigger_code=str(details.get("sell_trigger_code") or ""),
                     )
                 except Exception:
                     pass
