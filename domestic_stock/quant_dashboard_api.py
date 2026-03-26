@@ -94,6 +94,7 @@ def _append_sell_trigger_to_order_log(msg: str, signal: str, sell_trigger_code: 
 
 
 pending_signals_lock = threading.Lock()
+reselect_sequence_lock = threading.Lock()
 DEFAULT_STOCK_INFO = [
     {"code": "005930", "name": "삼성전자"},
     {"code": "000660", "name": "SK하이닉스"},
@@ -990,6 +991,7 @@ async def _pending_order_reconciler_loop():
     last_rebalance_ts = 0.0
     last_recommend_ts = 0.0
     last_advance_ratio_log_ts = 0.0
+    last_low_selected_reselect_ts = float(getattr(state, "_last_low_selected_reselect_ts", 0.0) or 0.0)
     BALANCE_CHECK_INTERVAL_SEC = 60.0
     ADVANCE_RATIO_LOG_INTERVAL_SEC = 300  # 5분
 
@@ -1015,6 +1017,117 @@ async def _pending_order_reconciler_loop():
                     })
                 except Exception as e:
                     logger.warning(f"자동 리밸런싱 오류(무시): {e}")
+
+            # (요청사항) selected_stocks가 너무 적게 잡히는 경우, 실행 중에도 안전하게 재선정
+            # - 조건: selected_stocks <= 3
+            # - 주기: 설정값(reselect_interval_when_low_selected_minutes, 기본 10분)
+            # - 안전장치: 대기 신호(pending_signals)와 대기 주문(pending_orders)이 비어 있을 때만
+            enable_low_reselect = bool(getattr(state, "enable_reselect_when_low_selected", False))
+            low_reselect_min = int(getattr(state, "reselect_interval_when_low_selected_minutes", 10) or 10)
+            low_reselect_min = max(1, min(60, low_reselect_min))
+            low_threshold = 3  # 요청 고정값
+
+            if enable_low_reselect and (now_ts - last_low_selected_reselect_ts) >= (low_reselect_min * 60.0):
+                selected_count = len(getattr(state, "selected_stocks", None) or [])
+                if selected_count <= low_threshold:
+                    # in-flight 주문/대기 신호가 없을 때만 재선정 시퀀스를 수행(로직 흐름 꼬임 방지)
+                    with pending_signals_lock:
+                        pending_signals_empty = not bool(getattr(state, "pending_signals", None))
+                    rm = getattr(state, "risk_manager", None)
+                    pending_orders = getattr(rm, "_pending_orders", None) if rm else None
+                    pending_orders_empty = (not pending_orders) or (len(pending_orders) == 0)
+
+                    if pending_signals_empty and pending_orders_empty:
+                        if reselect_sequence_lock.acquire(blocking=False):
+                            try:
+                                username = getattr(state, "trading_username", None) or "admin"
+                                state._reselect_in_progress = True
+                                state._reselect_internal_restart = False
+                                last_low_selected_reselect_ts = now_ts
+                                state._last_low_selected_reselect_ts = now_ts
+
+                                await state.broadcast({
+                                    "type": "log",
+                                    "level": "warning",
+                                    "message": f"자동 재선정(저선정): selected_count={selected_count}<= {low_threshold} | {low_reselect_min}분 주기 | 중지→재선정→재시작",
+                                })
+
+                                # (1) 엔진/상태 정지 (WS 닫아 kws.start 블로킹 해제 → 이후 스레드 종료·재구독)
+                                state.is_running = False
+                                _request_active_kis_ws_close()
+                                state.engine_running = False
+                                # 엔진 스레드가 남아 있는 동안에는 pending_signals가 다시 생길 수 있어 짧게 종료를 대기
+                                for _ in range(16):
+                                    try:
+                                        et = getattr(state, "engine_thread", None)
+                                        if not (et and et.is_alive()):
+                                            break
+                                    except Exception:
+                                        break
+                                    await asyncio.sleep(0.5)
+                                with pending_signals_lock:
+                                    state.pending_signals = {}
+                                try:
+                                    if getattr(state, "risk_manager", None) and hasattr(state.risk_manager, "_pending_orders"):
+                                        state.risk_manager._pending_orders = {}
+                                except Exception:
+                                    pass
+                                try:
+                                    await state.broadcast({"type": "signal_snapshot", "data": []})
+                                except Exception:
+                                    pass
+
+                                # (2) 재선정
+                                if not getattr(state, "stock_selector", None) or not getattr(state, "trenv", None):
+                                    ok = _ensure_initialized()
+                                    if not ok or not getattr(state, "stock_selector", None) or not getattr(state, "trenv", None):
+                                        raise RuntimeError("종목 재선정에 필요한 초기화가 되어 있지 않습니다.")
+
+                                keep_prev = bool(getattr(state, "keep_previous_on_empty_selection", True))
+                                selected = await asyncio.to_thread(state.stock_selector.select_stocks_by_fluctuation)
+                                if not selected:
+                                    if keep_prev and getattr(state, "selected_stocks", None):
+                                        await state.broadcast({
+                                            "type": "log",
+                                            "level": "warning",
+                                            "message": f"자동 재선정(저선정): 선정 결과 없음 → 이전 목록 유지({len(state.selected_stocks)}개)",
+                                        })
+                                    else:
+                                        state.selected_stocks = []
+                                        state.selected_stock_info = []
+                                else:
+                                    state.selected_stocks = selected
+                                    state.selected_stock_info = getattr(
+                                        state.stock_selector,
+                                        "last_selected_stock_info",
+                                        [{"code": c, "name": c} for c in selected],
+                                    )
+
+                                # (3) 재시작(내부 재시작이므로 guard 우회)
+                                state._reselect_internal_restart = True
+                                ok, msg = await _do_start_system(username)
+                                state._reselect_internal_restart = False
+
+                                level = "info" if ok else "error"
+                                await state.broadcast({"type": "log", "level": level, "message": f"자동 재선정(저선정) 결과: {msg}"})
+
+                                continue
+                            except Exception as e:
+                                logger.exception("자동 재선정(저선정) 실패")
+                                try:
+                                    await state.broadcast({"type": "log", "level": "error", "message": f"자동 재선정(저선정) 실패: {e}"})
+                                except Exception:
+                                    pass
+                            finally:
+                                try:
+                                    state._reselect_in_progress = False
+                                    state._reselect_internal_restart = False
+                                except Exception:
+                                    pass
+                                try:
+                                    reselect_sequence_lock.release()
+                                except Exception:
+                                    pass
 
             # 성과 기반 자동 추천: 설정 시 N분마다 권장 문구를 로그로 브로드캐스트
             enable_rec = bool(getattr(state, "enable_performance_auto_recommend", False))
@@ -1110,14 +1223,21 @@ async def _pending_order_reconciler_loop():
             now_ts = time.time()
             if getattr(state, "is_running", False):
                 last_tick = getattr(state, "_last_tick_at", 0) or 0
+                last_ws = getattr(state, "_last_ws_nonempty_at", 0) or 0
+                last_cnt = getattr(state, "_last_h0stcnt_at", 0) or 0
                 if last_tick > 0 and (now_ts - last_tick) > 120:
                     last_alert = getattr(state, "_last_tick_alerted_ts", 0) or 0
                     if last_alert == 0 or (now_ts - last_alert) > 300:
                         state._last_tick_alerted_ts = now_ts
+                        parts = [f"전략틱갱신 {int(now_ts - last_tick)}초 전"]
+                        if last_ws > 0:
+                            parts.append(f"WS비데이터수신 {int(now_ts - last_ws)}초 전")
+                        if last_cnt > 0:
+                            parts.append(f"체결틱(H0STCNT) {int(now_ts - last_cnt)}초 전")
                         _run_async_broadcast({
                             "type": "log",
                             "level": "warning",
-                            "message": f"엔진 헬스체크: 틱 미수 {int(now_ts - last_tick)}초 (WebSocket 끊김 가능성)",
+                            "message": "엔진 헬스체크: " + ", ".join(parts) + " (WS 끊김·구독실패·전략비가동 등 가능)",
                         })
             if now_ts - last_balance_check_ts >= BALANCE_CHECK_INTERVAL_SEC:
                 last_balance_check_ts = now_ts
@@ -1304,6 +1424,10 @@ def _apply_risk_config_dict_to_state(d: dict) -> None:
             rm.sap_deviation_max_pct = max(0.1, min(20.0, float(d.get("sap_deviation_max_pct") or 3.0)))
         if "max_position_size_ratio" in d:
             rm.max_position_size_ratio = float(d.get("max_position_size_ratio") or 0.1)
+        if "expand_position_ratio_1_stock" in d:
+            rm.expand_position_ratio_1_stock = max(0.0, min(1.0, float(d.get("expand_position_ratio_1_stock") or 1.0)))
+        if "expand_position_ratio_2_stocks" in d:
+            rm.expand_position_ratio_2_stocks = max(0.0, min(1.0, float(d.get("expand_position_ratio_2_stocks") or 0.5)))
         if "use_atr_for_stop_take" in d:
             rm.use_atr_for_stop_take = bool(d.get("use_atr_for_stop_take", False))
         if "atr_stop_mult" in d:
@@ -1316,6 +1440,8 @@ def _apply_risk_config_dict_to_state(d: dict) -> None:
             rm.max_positions_count = max(0, min(50, int(d.get("max_positions_count") or 0)))
         if "expand_position_when_few_stocks" in d:
             rm.expand_position_when_few_stocks = bool(d.get("expand_position_when_few_stocks", True))
+        if "daily_max_buy_amount_krw" in d:
+            rm.daily_max_buy_amount_krw = max(0, int(d.get("daily_max_buy_amount_krw") or 0))
     except Exception as e:
         logger.warning(f"저장된 리스크 설정 적용 중 오류(무시): {e}")
 
@@ -1329,6 +1455,12 @@ def _apply_operational_config_dict_to_state(d: dict) -> None:
             state.enable_auto_rebalance = bool(d.get("enable_auto_rebalance", False))
         if "auto_rebalance_interval_minutes" in d:
             state.auto_rebalance_interval_minutes = max(5, min(120, int(d.get("auto_rebalance_interval_minutes") or 30)))
+        if "enable_reselect_when_low_selected" in d:
+            state.enable_reselect_when_low_selected = bool(d.get("enable_reselect_when_low_selected", False))
+        if "reselect_interval_when_low_selected_minutes" in d:
+            state.reselect_interval_when_low_selected_minutes = max(
+                1, min(60, int(d.get("reselect_interval_when_low_selected_minutes") or 10))
+            )
         if "enable_performance_auto_recommend" in d:
             state.enable_performance_auto_recommend = bool(d.get("enable_performance_auto_recommend", False))
         if "performance_recommend_interval_minutes" in d:
@@ -1435,6 +1567,9 @@ def _apply_strategy_config_to_state(config: "StrategyConfig") -> None:
     state.trade_value_concentration_denom_n = max(state.trade_value_concentration_top_n + 1, min(50, int(getattr(config, "trade_value_concentration_denom_n", getattr(state, "trade_value_concentration_denom_n", 30)) or 30)))
     state.trade_value_concentration_max_pct = max(10.0, min(80.0, float(getattr(config, "trade_value_concentration_max_pct", getattr(state, "trade_value_concentration_max_pct", 45.0)) or 45.0)))
     state.buy_confirm_ticks = int(getattr(config, "buy_confirm_ticks", getattr(state, "buy_confirm_ticks", 1)) or 1)
+    state.dead_cross_confirm_ticks = max(0, min(10, int(getattr(config, "dead_cross_confirm_ticks", getattr(state, "dead_cross_confirm_ticks", 0)) or 0)))
+    if getattr(state, "strategy", None):
+        state.strategy.dead_cross_confirm_ticks = int(state.dead_cross_confirm_ticks or 0)
     state.enable_time_liquidation = bool(getattr(config, "enable_time_liquidation", getattr(state, "enable_time_liquidation", False)))
     state.liquidate_after_hhmm = str(getattr(config, "liquidate_after_hhmm", getattr(state, "liquidate_after_hhmm", "11:55")) or "11:55")
     state.max_spread_ratio = float(getattr(config, "max_spread_ratio", getattr(state, "max_spread_ratio", 0.0)) or 0.0)
@@ -2355,11 +2490,22 @@ def _handle_signal(
         _run_async_broadcast({"type": "log", "message": f"자동 체결: {stock_code} {signal.upper()} {price:,.0f}원", "level": "info"})
 
 
+def _request_active_kis_ws_close() -> None:
+    """엔진 스레드가 kws.start()에 블로킹된 경우 WS를 닫아 세션을 끊는다(재선정·중지 시 새 구독 목록 반영)."""
+    try:
+        kws = getattr(state, "_active_kws", None)
+        if kws is not None and hasattr(kws, "request_close"):
+            kws.request_close()
+    except Exception:
+        pass
+
+
 def _start_trading_engine_thread():
     """실시간 체결 수신 -> 신호 생성 -> 승인 대기 등록. 선정 종목 목록은 구독 시점의 state.selected_stocks 사용."""
     # 이전 엔진 스레드가 아직 살아 있으면(중지 후 WS가 아직 끊기지 않은 경우) 종료될 때까지 대기
     engine_thread = getattr(state, "engine_thread", None)
     if engine_thread is not None and engine_thread.is_alive():
+        _request_active_kis_ws_close()
         state.engine_running = False
         for _ in range(16):
             time.sleep(0.5)
@@ -2382,7 +2528,7 @@ def _start_trading_engine_thread():
         except Exception as e:
             logger.warning("WS 재연결 후 포지션 동기화 실패: %s", e)
         try:
-            _run_async_broadcast({"type": "log", "message": "WebSocket 재연결 후 상태 동기화 완료", "level": "info"})
+            _run_async_broadcast({"type": "log", "message": "WS 세션 종료 후 잔고·포지션 동기화 완료 (재구독 루프)", "level": "info"})
             _run_async_broadcast({"type": "position", "data": _build_positions_message()})
         except Exception:
             pass
@@ -2422,8 +2568,32 @@ def _start_trading_engine_thread():
                     except Exception as e:
                         logger.warning("장운영정보(VI) WS 구독 실패: %s", e)
                     first_disconnect_ts = None
+                    state._ws_session_seq = int(getattr(state, "_ws_session_seq", 0) or 0) + 1
+                    state._ws_logged_first_rx = False
+                    _ws_sess_t0 = time.time()
+                    try:
+                        system_log_append(
+                            "info",
+                            f"WS 세션 시작 seq={state._ws_session_seq} 구독종목수={len(stocks)} paper={bool(state.is_paper_trading)}",
+                        )
+                    except Exception:
+                        pass
 
                     def on_result(ws, tr_id, result, data_info):
+                        try:
+                            if result is not None and not result.empty:
+                                state._last_ws_nonempty_at = time.time()
+                                if not getattr(state, "_ws_logged_first_rx", False):
+                                    state._ws_logged_first_rx = True
+                                    try:
+                                        system_log_append(
+                                            "info",
+                                            f"WS 첫 데이터 수신 seq={getattr(state, '_ws_session_seq', 0)} tr_id={tr_id} rows={len(result)}",
+                                        )
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
                         if not state.is_running or not state.strategy or not state.risk_manager:
                             return
                         if result is not None and not result.empty:
@@ -2483,6 +2653,7 @@ def _start_trading_engine_thread():
 
                         if tr_id not in ["H0STCNT0", "H0STCNT1"] or result.empty:
                             return
+                        state._last_h0stcnt_at = time.time()
 
                         # 시간 기반 청산 (오늘 1회만)
                         try:
@@ -3524,14 +3695,58 @@ def _start_trading_engine_thread():
 
                                         signal_type = "buy"
                                     elif short_ma < long_ma and stock_code in state.risk_manager.positions:
-                                        signal_type = "sell"
+                                        try:
+                                            dc = max(0, min(10, int(getattr(state, "dead_cross_confirm_ticks", 0) or 0)))
+                                            if dc <= 0:
+                                                signal_type = "sell"
+                                            else:
+                                                if not hasattr(state, "_dead_cross_confirm_counts"):
+                                                    state._dead_cross_confirm_counts = {}
+                                                cnt = int(state._dead_cross_confirm_counts.get(stock_code) or 0) + 1
+                                                state._dead_cross_confirm_counts[stock_code] = cnt
+                                                if cnt < dc:
+                                                    _throttled_skip_log(
+                                                        stock_code,
+                                                        f"데드크로스 확인 대기({cnt}/{dc}틱)",
+                                                        ttl_sec=10,
+                                                    )
+                                                    continue
+                                                state._dead_cross_confirm_counts[stock_code] = 0
+                                                signal_type = "sell"
+                                        except Exception:
+                                            signal_type = "sell"
                                     else:
                                         # buy 조건이 깨지면 confirm 카운트 리셋
                                         try:
                                             if hasattr(state, "_buy_confirm_counts"):
                                                 state._buy_confirm_counts[stock_code] = 0
+                                            if hasattr(state, "_dead_cross_confirm_counts") and stock_code in state._dead_cross_confirm_counts:
+                                                state._dead_cross_confirm_counts[stock_code] = 0
                                         except Exception:
                                             pass
+                                else:
+                                    # 선정 종목만: 가격 틱은 오나 min_history_length·MA 전에는 BUY/스킵 로그가 없음 (재선정 직후 공백 설명)
+                                    try:
+                                        if stock_code in (state.selected_stocks or []):
+                                            hist = state.strategy.price_history.get(stock_code) if state.strategy else None
+                                            hlen = len(hist) if hist is not None else 0
+                                            need = int(getattr(state.strategy, "min_history_length", 0) or 0) if state.strategy else 0
+                                            if not hasattr(state, "_warmup_status_log_at"):
+                                                state._warmup_status_log_at = {}
+                                            now_w = time.time()
+                                            last_w = float((state._warmup_status_log_at or {}).get(stock_code) or 0.0)
+                                            if now_w - last_w >= 60.0:
+                                                state._warmup_status_log_at[stock_code] = now_w
+                                                _run_async_broadcast({
+                                                    "type": "log",
+                                                    "level": "info",
+                                                    "message": (
+                                                        f"감시 워밍업 | {stock_code} | 누적틱 {hlen}/{need} "
+                                                        f"(min_history_length) — 충족 전에는 BUY·필터 스킵 로그 없음"
+                                                    ),
+                                                })
+                                    except Exception:
+                                        pass
                                 if signal_type:
                                     # 신규 매수 시간대 제한 (KST 기준). 매도는 항상 허용.
                                     if signal_type == "buy":
@@ -3589,10 +3804,45 @@ def _start_trading_engine_thread():
                             except Exception:
                                 continue
 
-                    kws.start(on_result=on_result)
+                    state._active_kws = kws
+                    try:
+                        kws.start(on_result=on_result)
+                    except Exception as e:
+                        logger.error(f"트레이딩 엔진 오류: {e}")
+                        _run_async_broadcast({"type": "log", "message": f"트레이딩 엔진 오류: {e}", "level": "error"})
+                        try:
+                            system_log_append(
+                                "error",
+                                f"WS 세션 asyncio 예외 seq={getattr(state, '_ws_session_seq', 0)}: {type(e).__name__}: {e}",
+                            )
+                        except Exception:
+                            pass
+                    finally:
+                        try:
+                            if getattr(state, "_active_kws", None) is kws:
+                                state._active_kws = None
+                        except Exception:
+                            pass
+                        _dur = time.time() - _ws_sess_t0
+                        if getattr(state, "engine_running", False) and getattr(state, "is_running", False):
+                            try:
+                                system_log_append(
+                                    "warning",
+                                    f"WS 세션 종료(kis_auth asyncio.run 반환) seq={getattr(state, '_ws_session_seq', 0)} "
+                                    f"유지약{_dur:.0f}초 → {ws_reconnect_sleep}초 후 재구독",
+                                )
+                            except Exception:
+                                pass
                 except Exception as e:
-                    logger.error(f"트레이딩 엔진 오류: {e}")
-                    _run_async_broadcast({"type": "log", "message": f"트레이딩 엔진 오류: {e}", "level": "error"})
+                    logger.error(f"트레이딩 엔진 준비/구독 오류: {e}")
+                    _run_async_broadcast({"type": "log", "message": f"트레이딩 엔진 준비/구독 오류: {e}", "level": "error"})
+                    try:
+                        system_log_append(
+                            "error",
+                            f"WS 준비 실패(구독 전): {type(e).__name__}: {e}",
+                        )
+                    except Exception:
+                        pass
                 if first_disconnect_ts is None:
                     first_disconnect_ts = time.time()
                 try:
@@ -3619,6 +3869,8 @@ def _start_trading_engine_thread():
                             )
                         _run_async_broadcast({"type": "log", "message": "긴급 청산: WebSocket 장시간 단절로 전량 매도 신호 실행", "level": "error"})
                     first_disconnect_ts = None
+                if not getattr(state, "engine_running", True):
+                    break
                 time.sleep(ws_reconnect_sleep)
         finally:
             state.engine_running = False
@@ -3651,6 +3903,8 @@ async def send_status_update():
     """상태 업데이트 전송"""
     if state.risk_manager:
         await _refresh_kis_account_balance(force=False, ttl_sec=60)
+        _crit_user = getattr(state, "trading_username", None) or "admin"
+        _criteria = _get_stock_selection_criteria(_crit_user)
         await state.broadcast({
             "type": "status",
             "data": {
@@ -3660,11 +3914,20 @@ async def send_status_update():
                 "env_name": "모의투자" if state.is_paper_trading else "실전투자",
                 "account_balance": _get_display_account_balance(),
                 "daily_pnl": state.risk_manager.daily_pnl,
-                "daily_trades": state.risk_manager.daily_trades
-                ,
+                "daily_trades": state.risk_manager.daily_trades,
+                "daily_buy_notional": float(getattr(state.risk_manager, "daily_buy_notional", 0.0) or 0.0),
+                "daily_max_buy_amount_krw": int(getattr(state.risk_manager, "daily_max_buy_amount_krw", 0) or 0),
                 "buy_window_start_hhmm": getattr(state, "buy_window_start_hhmm", "09:05"),
                 "buy_window_end_hhmm": getattr(state, "buy_window_end_hhmm", "11:30"),
                 "buy_skip_stats": _get_buy_skip_stats_summary(top_n=5),
+                # 폴링 /api/system/status 와 동일하게 맞춤: WS만 쓰는 클라이언트도 재선정·재시작 후 선정 목록 갱신
+                "selected_stocks": list(getattr(state, "selected_stocks", []) or []),
+                "selected_stock_info": list(getattr(state, "selected_stock_info", []) or []),
+                "stock_selection_criteria": _criteria,
+                "stock_selection_last_debug": getattr(getattr(state, "stock_selector", None), "last_debug", {}) or {},
+                "stock_selection_last_error": getattr(getattr(state, "stock_selector", None), "last_error_message", "") or "",
+                "short_ma_period": state.strategy.short_ma_period if state.strategy else None,
+                "long_ma_period": state.strategy.long_ma_period if state.strategy else None,
             }
         })
         
@@ -3737,6 +4000,11 @@ def _build_settings_snapshot_for_preflight(username: str) -> Dict[str, Any]:
                 "account_balance": float(getattr(rm, "account_balance", 0) or 0),
                 "max_single_trade_amount": int(getattr(rm, "max_single_trade_amount", 0) or 0),
                 "max_position_size_ratio": float(getattr(rm, "max_position_size_ratio", 0.0) or 0.0),
+                "expand_position_when_few_stocks": bool(getattr(rm, "expand_position_when_few_stocks", True)),
+                "expand_position_ratio_1_stock": float(getattr(rm, "expand_position_ratio_1_stock", 1.0) or 1.0),
+                "expand_position_ratio_2_stocks": float(getattr(rm, "expand_position_ratio_2_stocks", 0.5) or 0.5),
+                "daily_max_buy_amount_krw": int(getattr(rm, "daily_max_buy_amount_krw", 0) or 0),
+                "daily_buy_notional": float(getattr(rm, "daily_buy_notional", 0.0) or 0.0),
                 "max_positions_count": int(getattr(rm, "max_positions_count", 0) or 0),
                 "min_order_quantity": int(getattr(rm, "min_order_quantity", 1) or 1),
                 "stop_loss_ratio": float(getattr(rm, "stop_loss_ratio", 0.0) or 0.0),
@@ -3819,18 +4087,35 @@ def _preflight_check(username: str) -> Dict[str, Any]:
                 warnings.append("계좌 잔고(account_balance)가 0 이하입니다. (잔고 조회 실패/초기화 문제 가능)")
         except Exception:
             warnings.append("account_balance 파싱 실패")
+        msa = 0
         try:
             msa = int(getattr(rm, "max_single_trade_amount", 0) or 0)
             if msa <= 0:
                 issues.append("max_single_trade_amount가 0 이하입니다. (주문 상한 미설정)")
         except Exception:
             issues.append("max_single_trade_amount 파싱 실패")
+            msa = 0
+        try:
+            dmb = int(getattr(rm, "daily_max_buy_amount_krw", 0) or 0)
+            if dmb > 0 and msa > 0 and dmb < msa:
+                warnings.append(
+                    "일일 매수 누적 한도(daily_max_buy_amount_krw)가 1회 매수 상한(max_single)보다 작습니다. 첫 매수부터 한도에 걸릴 수 있습니다."
+                )
+        except Exception:
+            pass
         try:
             mpsr = float(getattr(rm, "max_position_size_ratio", 0.0) or 0.0)
             if mpsr <= 0 or mpsr > 1.0:
                 issues.append("max_position_size_ratio가 비정상입니다. (0 < ratio <= 1 이어야 함)")
         except Exception:
             issues.append("max_position_size_ratio 파싱 실패")
+        try:
+            e1 = float(getattr(rm, "expand_position_ratio_1_stock", 1.0) or 1.0)
+            e2 = float(getattr(rm, "expand_position_ratio_2_stocks", 0.5) or 0.5)
+            if e1 < 0 or e1 > 1 or e2 < 0 or e2 > 1:
+                warnings.append("expand_position_ratio_1_stock / expand_position_ratio_2_stocks는 0~1 권장입니다.")
+        except Exception:
+            warnings.append("확대 포지션 비율 파싱 실패")
         try:
             sl = float(getattr(rm, "stop_loss_ratio", 0.0) or 0.0)
             tp = float(getattr(rm, "take_profit_ratio", 0.0) or 0.0)
@@ -3871,6 +4156,91 @@ def _preflight_check(username: str) -> Dict[str, Any]:
         "warnings": warnings,
         "snapshot": snap,
     }
+
+
+def _replay_daily_buy_notional_from_rows(rows: List[dict]) -> float:
+    """
+    당일 거래를 시간순 재생해 일매수 한도 소모분을 복원.
+    매수: +(가격×수량), 매도: 보유분이 있으면 -(평단×매도수량), 없으면 -(매도가×수량) 근사.
+    """
+    if not rows:
+        return 0.0
+    try:
+        def _sort_key(r: dict) -> tuple:
+            return (str(r.get("date") or ""), str(r.get("time") or ""), str(r.get("timestamp") or ""))
+
+        sorted_rows = sorted(rows, key=_sort_key)
+        pos_qty: Dict[str, int] = {}
+        pos_avg: Dict[str, float] = {}
+        net = 0.0
+        for t in sorted_rows:
+            ot = (t.get("order_type") or "").strip().lower()
+            code = str(t.get("stock_code") or "").strip().zfill(6)
+            q = int(t.get("quantity") or 0)
+            px = float(t.get("price") or 0)
+            if q <= 0 or px <= 0:
+                continue
+            if ot == "buy":
+                net += px * q
+                oq = int(pos_qty.get(code, 0) or 0)
+                oa = float(pos_avg.get(code, 0.0) or 0.0)
+                nq = oq + q
+                navg = ((oa * oq) + (px * q)) / float(nq) if nq > 0 else px
+                pos_qty[code] = nq
+                pos_avg[code] = navg
+            elif ot == "sell":
+                oq = int(pos_qty.get(code, 0) or 0)
+                oa = float(pos_avg.get(code, 0.0) or 0.0)
+                if oq > 0:
+                    actual = min(q, oq)
+                    net -= oa * float(actual)
+                    nq = oq - actual
+                    if nq > 0:
+                        pos_qty[code] = nq
+                    else:
+                        pos_qty.pop(code, None)
+                        pos_avg.pop(code, None)
+                else:
+                    net -= px * float(q)
+        return max(0.0, float(net))
+    except Exception:
+        return 0.0
+
+
+def _load_today_daily_buy_notional(current_user: str) -> Optional[float]:
+    """당일 user_hist를 시간순 재생한 일매수 한도 소모분. 저장소 없거나 실패 시 None."""
+    if not current_user:
+        return None
+    tz = timezone(timedelta(hours=9))
+    today = datetime.now(tz).strftime("%Y%m%d")
+    try:
+        from user_hist_store import get_user_hist_store
+
+        hist = get_user_hist_store()
+        if hist and getattr(hist, "enabled", False):
+            rows = hist.get_trades(current_user, today, today)
+            if not rows:
+                return 0.0
+            return _replay_daily_buy_notional_from_rows(rows)
+    except Exception:
+        pass
+    return None
+
+
+def _restore_daily_buy_notional_from_hist(username: str) -> None:
+    """재시작·상태 조회 시 오늘 매수 누적을 히스토리와 맞춤."""
+    rm = getattr(state, "risk_manager", None)
+    if not rm or not username:
+        return
+    n = _load_today_daily_buy_notional(username)
+    if n is None:
+        return
+    try:
+        tz = timezone(timedelta(hours=9))
+        rm._daily_buy_notional_date = datetime.now(tz).strftime("%Y%m%d")
+        rm.daily_buy_notional = float(n)
+    except Exception:
+        pass
 
 
 def _load_today_daily_stats(current_user: str) -> tuple:
@@ -3916,6 +4286,13 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
                 daily_pnl, daily_trades = float(pnl), int(cnt)
         except Exception:
             pass
+        dbn_stop = 0.0
+        try:
+            n = _load_today_daily_buy_notional(current_user)
+            if n is not None:
+                dbn_stop = float(n)
+        except Exception:
+            pass
         return JSONResponse({
             "is_running": False,
             "is_paper_trading": getattr(state, "is_paper_trading", True),
@@ -3924,6 +4301,8 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
             "account_balance": 0,
             "daily_pnl": daily_pnl,
             "daily_trades": daily_trades,
+            "daily_buy_notional": dbn_stop,
+            "daily_max_buy_amount_krw": 0,
             "selected_stocks": getattr(state, "selected_stocks", []) or [],
             "selected_stock_info": getattr(state, "selected_stock_info", []) or [],
             "stock_selection_criteria": criteria,
@@ -3938,6 +4317,7 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
             "min_momentum_ratio": getattr(state, "min_momentum_ratio", 0.0),
             "reentry_cooldown_seconds": getattr(state, "reentry_cooldown_seconds", 0),
             "buy_confirm_ticks": getattr(state, "buy_confirm_ticks", 1),
+            "dead_cross_confirm_ticks": getattr(state, "dead_cross_confirm_ticks", 0),
             "enable_time_liquidation": getattr(state, "enable_time_liquidation", False),
             "liquidate_after_hhmm": getattr(state, "liquidate_after_hhmm", "11:55"),
             "max_spread_ratio": getattr(state, "max_spread_ratio", 0.0),
@@ -3946,6 +4326,8 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
             "buy_skip_stats": _get_buy_skip_stats_summary(top_n=5),
             "enable_auto_rebalance": getattr(state, "enable_auto_rebalance", False),
             "auto_rebalance_interval_minutes": int(getattr(state, "auto_rebalance_interval_minutes", 30) or 30),
+            "enable_reselect_when_low_selected": getattr(state, "enable_reselect_when_low_selected", False),
+            "reselect_interval_when_low_selected_minutes": int(getattr(state, "reselect_interval_when_low_selected_minutes", 10) or 10),
             "enable_performance_auto_recommend": getattr(state, "enable_performance_auto_recommend", False),
             "performance_recommend_interval_minutes": int(getattr(state, "performance_recommend_interval_minutes", 5) or 5),
             "auto_schedule_enabled": getattr(state, "auto_schedule_enabled", False),
@@ -3974,6 +4356,7 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
                         state.session_start_balance = float(kis_bal) - float(pnl)
     except Exception:
         pass
+    _restore_daily_buy_notional_from_hist(current_user)
     kis_balance = int(getattr(state, "kis_account_balance", 0) or 0)
     kis_balance_ok = bool(getattr(state, "kis_account_balance_ok", False))
     return JSONResponse({
@@ -3986,6 +4369,8 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
         "kis_account_balance_ok": kis_balance_ok,
         "daily_pnl": state.risk_manager.daily_pnl,
         "daily_trades": state.risk_manager.daily_trades,
+        "daily_buy_notional": float(getattr(state.risk_manager, "daily_buy_notional", 0.0) or 0.0),
+        "daily_max_buy_amount_krw": int(getattr(state.risk_manager, "daily_max_buy_amount_krw", 0) or 0),
         "selected_stocks": state.selected_stocks,
         "selected_stock_info": getattr(state, "selected_stock_info", []),
         "short_ma_period": state.strategy.short_ma_period if state.strategy else None,
@@ -3999,6 +4384,7 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
         "min_momentum_ratio": getattr(state, "min_momentum_ratio", 0.0),
         "reentry_cooldown_seconds": getattr(state, "reentry_cooldown_seconds", 0),
         "buy_confirm_ticks": getattr(state, "buy_confirm_ticks", 1),
+        "dead_cross_confirm_ticks": getattr(state, "dead_cross_confirm_ticks", 0),
         "enable_time_liquidation": getattr(state, "enable_time_liquidation", False),
         "liquidate_after_hhmm": getattr(state, "liquidate_after_hhmm", "11:55"),
         "max_spread_ratio": getattr(state, "max_spread_ratio", 0.0),
@@ -4007,6 +4393,8 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
         "buy_skip_stats": _get_buy_skip_stats_summary(top_n=5),
         "enable_auto_rebalance": getattr(state, "enable_auto_rebalance", False),
         "auto_rebalance_interval_minutes": int(getattr(state, "auto_rebalance_interval_minutes", 30) or 30),
+        "enable_reselect_when_low_selected": getattr(state, "enable_reselect_when_low_selected", False),
+        "reselect_interval_when_low_selected_minutes": int(getattr(state, "reselect_interval_when_low_selected_minutes", 10) or 10),
         "enable_performance_auto_recommend": getattr(state, "enable_performance_auto_recommend", False),
         "performance_recommend_interval_minutes": int(getattr(state, "performance_recommend_interval_minutes", 5) or 5),
         "auto_schedule_enabled": getattr(state, "auto_schedule_enabled", False),
@@ -4123,6 +4511,8 @@ async def get_account_status(current_user: str = Depends(get_current_user)):
 async def _do_start_system(username: str) -> tuple:
     """시스템 시작 내부 로직. (success: bool, message: str) 반환."""
     try:
+        if getattr(state, "_reselect_in_progress", False) and not bool(getattr(state, "_reselect_internal_restart", False)):
+            return False, "자동 재선정(저선정) 진행 중입니다. 잠시 후 다시 시작하세요."
         if state.is_running:
             return False, "이미 실행 중입니다."
 
@@ -4247,6 +4637,7 @@ async def _do_start_system(username: str) -> tuple:
                         state.session_start_balance = float(kis_bal) - float(pnl)
         except Exception:
             pass
+        _restore_daily_buy_notional_from_hist(username)
 
         # 안전장치: 실전(real) + 자동(즉시 체결) 조합은 기본적으로 차단 (환경변수로만 해제)
         # - 실수로 실전 자동매매를 켜서 손실이 나는 사고 방지 목적
@@ -4368,6 +4759,7 @@ async def _do_stop_system(username: str, liquidate: bool) -> tuple:
     """시스템 중지 내부 로직. (success: bool, message: str) 반환."""
     try:
         state.is_running = False
+        _request_active_kis_ws_close()
         # 엔진 스레드가 다음 WebSocket 끊김 시 루프를 빠져나가도록 설정 (재시작 시 새 선정 목록으로 구독하려면 필수)
         state.engine_running = False
         try:
@@ -5803,9 +6195,16 @@ async def update_risk_config(config: RiskConfig, current_user: str = Depends(get
             state.risk_manager.sap_deviation_max_pct = 3.0
         state.risk_manager.max_trades_per_day = config.max_trades_per_day
         state.risk_manager.max_trades_per_stock_per_day = max(0, min(20, int(getattr(config, "max_trades_per_stock_per_day", 0) or 0)))
-        state.risk_manager.max_position_size_ratio = config.max_position_size_ratio
+        state.risk_manager.max_position_size_ratio = float(config.max_position_size_ratio)
         state.risk_manager.max_positions_count = max(0, min(50, int(getattr(config, "max_positions_count", 0) or 0)))
         state.risk_manager.expand_position_when_few_stocks = bool(getattr(config, "expand_position_when_few_stocks", True))
+        state.risk_manager.expand_position_ratio_1_stock = max(
+            0.0, min(1.0, float(getattr(config, "expand_position_ratio_1_stock", 1.0) or 1.0))
+        )
+        state.risk_manager.expand_position_ratio_2_stocks = max(
+            0.0, min(1.0, float(getattr(config, "expand_position_ratio_2_stocks", 0.5) or 0.5))
+        )
+        state.risk_manager.daily_max_buy_amount_krw = max(0, int(getattr(config, "daily_max_buy_amount_krw", 0) or 0))
         state.risk_manager.trailing_stop_ratio = getattr(config, "trailing_stop_ratio", 0.0) or 0.0
         state.risk_manager.trailing_activation_ratio = getattr(config, "trailing_activation_ratio", 0.0) or 0.0
         state.risk_manager.partial_take_profit_ratio = getattr(config, "partial_take_profit_ratio", 0.0) or 0.0
@@ -5902,6 +6301,7 @@ async def update_strategy_config(config: StrategyConfig, current_user: str = Dep
                 f"regimeSplit={'on' if getattr(state,'enable_morning_regime_split',False) else 'off'}@{getattr(state,'morning_regime_early_end_hhmm','09:10')}, "
                 f"cooldown={state.reentry_cooldown_seconds}s, "
                 f"confirm={int(state.buy_confirm_ticks)}tick, "
+                f"dcConfirm={int(getattr(state, 'dead_cross_confirm_ticks', 0) or 0)}tick, "
                 f"time_liq={'on' if state.enable_time_liquidation else 'off'}@{state.liquidate_after_hhmm}, "
                 f"spread<={state.max_spread_ratio*100:.3f}%, "
                 f"range>={state.min_range_ratio*100:.3f}%/N{state.range_lookback_ticks}, "
@@ -5991,6 +6391,10 @@ async def update_operational_config(config: OperationalConfig, current_user: str
     try:
         state.enable_auto_rebalance = bool(config.enable_auto_rebalance)
         state.auto_rebalance_interval_minutes = max(5, min(120, int(config.auto_rebalance_interval_minutes or 30)))
+        state.enable_reselect_when_low_selected = bool(getattr(config, "enable_reselect_when_low_selected", False))
+        state.reselect_interval_when_low_selected_minutes = max(
+            1, min(60, int(getattr(config, "reselect_interval_when_low_selected_minutes", 10) or 10))
+        )
         state.enable_performance_auto_recommend = bool(config.enable_performance_auto_recommend)
         state.performance_recommend_interval_minutes = max(1, min(60, int(config.performance_recommend_interval_minutes or 5)))
         state.ws_reconnect_sleep_sec = max(3, min(60, int(getattr(config, "ws_reconnect_sleep_sec", 5) or 5)))
@@ -6198,6 +6602,13 @@ async def update_profile(
 async def select_stocks(current_user: str = Depends(get_current_user)):
     """종목 재선정. 실행 중에는 변경 불가(중지 → 재선정 → 재시작으로 통일)."""
     try:
+        if getattr(state, "_reselect_in_progress", False):
+            msg = "자동 재선정(저선정) 시퀀스 진행 중이라 종목 재선정을 수행할 수 없습니다. 잠시 후 다시 시도하세요."
+            try:
+                await state.broadcast({"type": "log", "level": "warning", "message": msg})
+            except Exception:
+                pass
+            return JSONResponse({"success": False, "message": msg})
         if getattr(state, "is_running", False):
             msg = "실행 중에는 종목을 재선정할 수 없습니다. 시스템을 중지 → 종목 재선정 → 시스템 시작 순서로 진행하세요."
             try:

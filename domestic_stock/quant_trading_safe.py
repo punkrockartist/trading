@@ -53,6 +53,9 @@ class RiskManager:
         self.max_position_size_ratio = 0.1  # 10% (매우 보수적)
         self.max_single_trade_amount = 1000000  # 최대 100만원
         self.expand_position_when_few_stocks = True  # True: 선정 1~2종목일 때 잔고 활용 확대
+        # 확대 시 종목당 계좌 대비 최대 비율(0~1). 기본은 구버전과 동일(1종 100%, 2종 각 50%).
+        self.expand_position_ratio_1_stock = 1.0
+        self.expand_position_ratio_2_stocks = 0.5
         # 최소 매수 수량 (0/1이면 사실상 제한 없음)
         self.min_order_quantity = 1
         
@@ -117,6 +120,10 @@ class RiskManager:
         # 거래 제한
         self.max_trades_per_day = 12  # 하루 최대 거래 횟수 (매수+매도=1회). 5→12 휩쏘 대응
         self.max_trades_per_stock_per_day = 0  # 종목당 하루 최대 거래 횟수. 0=미적용
+        # 당일 일매수 한도용 소모분: 매수 시 +(체결가×수량), 매도 시 -(평단×매도수량)으로 줄어듦.
+        self.daily_max_buy_amount_krw = 0
+        self.daily_buy_notional = 0.0
+        self._daily_buy_notional_date = ""
         self.max_positions_count = 0  # 동시 보유 종목 수 상한. 0이면 제한 없음
         self.min_price_change_ratio = 0.0  # 직전 틱 대비 최소 변동률. 0=미적용, 0.01=1% 이상 변동 시만 거래(급등 순간 위주)
         # 진입 변동성 상한: 틱 변동성(가격 대비)이 이 비율 초과면 매수 스킵. 0이면 미적용
@@ -153,15 +160,28 @@ class RiskManager:
         """
         선정 종목 수에 따른 종목당 허용 포지션 비율.
         - expand_position_when_few_stocks False면 항상 max_position_size_ratio.
-        - True일 때: 1종목 100%, 2종목 50% each, 3종목 이상 max_position_size_ratio(기본 10%).
+        - True일 때: 1종목 expand_position_ratio_1_stock, 2종목 expand_position_ratio_2_stocks(종목당),
+          3종목 이상 max_position_size_ratio.
         """
         if not bool(getattr(self, "expand_position_when_few_stocks", True)):
             return float(getattr(self, "max_position_size_ratio", 0.1) or 0.1)
         n = int(selected_count) if selected_count is not None and selected_count > 0 else 999
         base = float(getattr(self, "max_position_size_ratio", 0.1) or 0.1)
-        if n <= 2:
-            return min(1.0, 1.0 / n)
+        if n == 1:
+            r = float(getattr(self, "expand_position_ratio_1_stock", 1.0) or 1.0)
+            return max(0.0, min(1.0, r))
+        if n == 2:
+            r = float(getattr(self, "expand_position_ratio_2_stocks", 0.5) or 0.5)
+            return max(0.0, min(1.0, r))
         return base
+
+    def _roll_daily_buy_notional_if_new_day(self, today_key: str) -> None:
+        """KST 캘린더일이 바뀌면 당일 매수 누적 금액을 0으로 리셋."""
+        if not today_key:
+            return
+        if str(getattr(self, "_daily_buy_notional_date", "") or "") != today_key:
+            self._daily_buy_notional_date = today_key
+            self.daily_buy_notional = 0.0
         
     def can_trade(self, stock_code: str, price: float, quantity: int, selected_count: Optional[int] = None) -> Tuple[bool, str]:
         """
@@ -178,6 +198,8 @@ class RiskManager:
         except Exception:
             today_key = ""
             ym_key = ""
+
+        self._roll_daily_buy_notional_if_new_day(today_key)
 
         # 0. 캘린더일 기준 일일 리셋
         if today_key:
@@ -259,6 +281,16 @@ class RiskManager:
         
         # 3. 거래 금액 체크
         trade_amount = price * quantity
+        try:
+            dmax_buy = int(getattr(self, "daily_max_buy_amount_krw", 0) or 0)
+        except Exception:
+            dmax_buy = 0
+        if dmax_buy > 0:
+            cur_buy = float(getattr(self, "daily_buy_notional", 0.0) or 0.0)
+            if cur_buy + float(trade_amount) > float(dmax_buy) + 1e-3:
+                return False, (
+                    f"일일 매수 한도 소모분 초과 (현재 소모 {cur_buy:,.0f}원 + 이번 {float(trade_amount):,.0f}원 > {dmax_buy:,}원)"
+                )
         if trade_amount > self.max_single_trade_amount:
             return False, f"거래 금액 초과 (최대: {self.max_single_trade_amount:,}원)"
         
@@ -529,6 +561,11 @@ class RiskManager:
 
     def _update_position_impl(self, stock_code: str, price: float, quantity: int, action: str):
         if action == "buy":
+            try:
+                tz = timezone(timedelta(hours=9))
+                self._roll_daily_buy_notional_if_new_day(datetime.now(tz).strftime("%Y%m%d"))
+            except Exception:
+                pass
             # 추가 매수 지원: 기존 포지션이 있으면 수량 누적 + 평단 갱신
             now_dt = datetime.now()
             try:
@@ -579,6 +616,10 @@ class RiskManager:
                 per_stock = self._daily_trades_per_stock
             per_stock[stock_code] = per_stock.get(stock_code, 0) + 1
             self.last_prices[stock_code] = float(px)
+            try:
+                self.daily_buy_notional = float(getattr(self, "daily_buy_notional", 0.0) or 0.0) + float(px) * float(q)
+            except Exception:
+                pass
         elif action == "sell":
             if stock_code in self.positions:
                 pos = self.positions[stock_code]
@@ -597,6 +638,13 @@ class RiskManager:
                 self.daily_pnl += pnl
                 self._cumulative_pnl_since = float(getattr(self, "_cumulative_pnl_since", 0.0) or 0.0) + pnl
                 self._monthly_pnl = float(getattr(self, "_monthly_pnl", 0.0) or 0.0) + pnl
+                try:
+                    released = float(buy_price) * float(actual_qty)
+                    self.daily_buy_notional = max(
+                        0.0, float(getattr(self, "daily_buy_notional", 0.0) or 0.0) - released
+                    )
+                except Exception:
+                    pass
 
                 remain = pos_qty - actual_qty
                 if remain > 0:
@@ -858,6 +906,9 @@ class QuantStrategy:
         self.min_history_length = self.long_ma_period  # 최소 히스토리 길이
         # 휩쏘 완화: 진입 후 N초 이내 데드크로스 매도 방지
         self.min_hold_seconds = 60  # 0=미적용
+        # 데드크로스 MA 매도: short<long 이 N틱 연속일 때만 매도. 0=즉시(대시보드 엔진과 동일 의미)
+        self.dead_cross_confirm_ticks = 0
+        self._dead_cross_sell_confirm_counts: Dict[str, int] = {}
         # 단기 MA 기울기 최소 비율 (가격 대비, 예: 0.001 = 0.1%/틱). 매수 시 단기 상승 추세 확인
         self.min_short_ma_slope_ratio = 0.0  # 0=미적용
         # 매수 시 가격이 short_ma 위로 최소 이격 (예: 0.001 = 0.1%). 살짝만 넘었다 내려가는 휩쏘 완화
@@ -970,6 +1021,15 @@ class QuantStrategy:
                         return None
             return "buy"
         
+        # 데드크로스 연속 확인 카운터: 포지션 없음 또는 MA가 데드크로스가 아니면 리셋
+        try:
+            if stock_code not in self.risk_manager.positions:
+                self._dead_cross_sell_confirm_counts.pop(stock_code, None)
+            elif short_ma >= long_ma:
+                self._dead_cross_sell_confirm_counts.pop(stock_code, None)
+        except Exception:
+            pass
+
         # ----- 매도 신호 (데드크로스) -----
         if short_ma < long_ma and stock_code in self.risk_manager.positions:
             min_hold = int(getattr(self, "min_hold_seconds", 0) or 0)
@@ -980,6 +1040,14 @@ class QuantStrategy:
                     elapsed = (datetime.now() - buy_time).total_seconds()
                     if elapsed < min_hold:
                         return None
+            dc = max(0, min(10, int(getattr(self, "dead_cross_confirm_ticks", 0) or 0)))
+            if dc <= 0:
+                return "sell"
+            cnt = int(self._dead_cross_sell_confirm_counts.get(stock_code) or 0) + 1
+            self._dead_cross_sell_confirm_counts[stock_code] = cnt
+            if cnt < dc:
+                return None
+            self._dead_cross_sell_confirm_counts[stock_code] = 0
             return "sell"
         
         return None

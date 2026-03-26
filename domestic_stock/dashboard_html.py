@@ -105,9 +105,36 @@ def get_dashboard_html(username: str) -> str:
         .card h2 {{
             color: var(--text);
             font-size: 16px;
-            margin-bottom: 12px;
+            margin-bottom: 6px;
             padding-bottom: 8px;
             border-bottom: 1px solid var(--border);
+        }}
+        .settings-tab-tagline {{
+            font-size: 12px;
+            color: var(--muted);
+            line-height: 1.4;
+            margin: 0 0 12px 0;
+        }}
+        h3.settings-block-title {{
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text);
+            margin: 20px 0 10px 0;
+            padding-top: 12px;
+            border-top: 1px solid var(--border);
+        }}
+        h3.settings-block-title:first-of-type {{
+            border-top: none;
+            padding-top: 0;
+            margin-top: 4px;
+        }}
+        details h3.settings-block-title {{
+            margin-top: 16px;
+        }}
+        details > summary + h3.settings-block-title {{
+            margin-top: 10px;
+            border-top: none;
+            padding-top: 0;
         }}
         .metric {{
             display: flex;
@@ -762,8 +789,8 @@ def get_dashboard_html(username: str) -> str:
             <div class="topbar-sub-inner">
                 <div class="subtabs">
                     <button type="button" class="subtab active" id="subtab-preset" onclick="showSettingsSection('preset')">프리셋</button>
-                    <button type="button" class="subtab" id="subtab-risk" onclick="showSettingsSection('risk')">리스크</button>
-                    <button type="button" class="subtab" id="subtab-strategy" onclick="showSettingsSection('strategy')">전략</button>
+                    <button type="button" class="subtab" id="subtab-risk" onclick="showSettingsSection('risk')" title="한도·포지션·손익 절단·주문 안전">리스크</button>
+                    <button type="button" class="subtab" id="subtab-strategy" onclick="showSettingsSection('strategy')" title="신호·진입 필터·전략 청산(MA)·시간">전략</button>
                     <button type="button" class="subtab" id="subtab-stocks" onclick="showSettingsSection('stocks')">종목선정</button>
                     <button type="button" class="subtab" id="subtab-operational" onclick="showSettingsSection('operational')">운영</button>
                     <button type="button" class="subtab" id="subtab-help" onclick="showSettingsSection('help')">도움말</button>
@@ -842,6 +869,10 @@ def get_dashboard_html(username: str) -> str:
                     <span class="metric-label">일일 거래 횟수:</span>
                     <span class="metric-value" id="daily_trades">-</span>
                 </div>
+                <div class="metric">
+                    <span class="metric-label">일일 매수 누적:</span>
+                    <span class="metric-value" id="daily_buy_notional">-</span>
+                </div>
                 <div class="btn-group">
                     <button class="btn" onclick="startSystem()">시작</button>
                     <button class="btn btn-danger" onclick="openStopModal()">중지</button>
@@ -898,6 +929,10 @@ def get_dashboard_html(username: str) -> str:
                     <div class="metric">
                         <span class="metric-label">일일 거래 횟수:</span>
                         <span class="metric-value" id="pos_daily_trades">-</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">일일 매수 누적:</span>
+                        <span class="metric-value" id="pos_daily_buy_notional">-</span>
                     </div>
                 </div>
                 <div id="positions">
@@ -1028,15 +1063,57 @@ def get_dashboard_html(username: str) -> str:
             <div id="settings-section-risk" class="settings-section">
             <div class="card">
                 <h2>리스크 관리</h2>
-                    <div class="hint" id="risk_summary"></div>
+                <p class="settings-tab-tagline">한도·포지션·손익 절단·주문 안전 — 매수 상한과 청산 규칙이 함께 있습니다.</p>
+                <div class="hint" id="risk_summary"></div>
+
+                <h3 class="settings-block-title">A. 매수·포지션·활동 상한</h3>
                 <div class="form-group">
-                    <label>최대 거래 금액 (원): <code class="setting-var">max_single_trade_amount</code></label>
-                    <input type="number" id="max_trade_amount" value="1000000">
+                    <label>1회 매수 최대 금액 (원): <code class="setting-var">max_single_trade_amount</code></label>
+                    <input type="number" id="max_trade_amount" value="1000000" min="1" step="10000" title="한 번의 매수 주문에 쓸 수 있는 금액 상한">
+                    <div class="hint">실제 매수 규모는 <strong>min(이 금액, 잔고×종목당 허용비율)</strong>입니다. 잔고를 거의 다 쓰려면 이 값을 그만큼 크게 두고, 아래 종목당 포지션 비율(확대·3종목 이상 %)도 함께 맞추세요. 잔고는 실행 중 KIS 조회값이 리스크 매니저에 반영됩니다.</div>
                 </div>
-                    <div class="form-group">
-                        <label>최소 매수 수량(주): <code class="setting-var">min_order_quantity</code></label>
-                        <input type="number" id="min_order_quantity" value="1" min="1" max="1000">
-                    </div>
+                <div class="form-group">
+                    <label>일일 매수 누적 한도 (원, 0=미적용): <code class="setting-var">daily_max_buy_amount_krw</code></label>
+                    <input type="number" id="daily_max_buy_amount_krw" value="0" min="0" step="100000" title="당일 매수 체결 누적(가격×수량)이 이 금액을 넘기 전까지만 신규 매수 허용">
+                    <div class="hint">예: 5000000 → 오늘 <strong>일매수 한도 소모분</strong>(매수는 +체결가×수량, 매도는 −평단×매도수량)이 500만을 넘기 전까지만 신규 매수. 매도하면 그만큼 소모분이 줄어 같은 날 다시 매수 여유가 생깁니다. 재시작 시 히스토리가 있으면 당일 거래를 재생해 소모분을 복원합니다.</div>
+                </div>
+                <div class="form-group">
+                    <label>최소 매수 수량(주): <code class="setting-var">min_order_quantity</code></label>
+                    <input type="number" id="min_order_quantity" value="1" min="1" max="1000">
+                </div>
+                <div class="form-group">
+                    <label>일일 최대 거래 횟수 (매수+매도=1회): <code class="setting-var">max_trades_per_day</code></label>
+                    <input type="number" id="max_trades_per_day" value="12" min="1" max="50">
+                </div>
+                <div class="form-group">
+                    <label>종목별 일일 최대 거래 횟수 (0=미적용): <code class="setting-var">max_trades_per_stock_per_day</code></label>
+                    <input type="number" id="max_trades_per_stock_per_day" value="0" min="0" max="20" title="각 종목당 오늘 N회까지 매수 허용. 0이면 전역만 적용">
+                    <div class="hint">0=미적용(전역 max_trades_per_day만 적용). 1~2 권장. 한 종목이 휩쏘로 횟수를 다 쓰는 것 방지.</div>
+                </div>
+                <div class="form-group">
+                    <label>동시 보유 종목 수 상한 (0=제한 없음): <code class="setting-var">max_positions_count</code></label>
+                    <input type="number" id="max_positions_count" value="0" min="0" max="50">
+                </div>
+                <div class="form-group">
+                    <label>종목당 최대 포지션 비율 (%, 3종목 이상 선정 시): <code class="setting-var">max_position_size_ratio</code></label>
+                    <input type="number" id="max_position_size_ratio_pct" value="10" step="0.5" min="0.5" max="100" title="선정 3종목 이상일 때 종목당 계좌 잔고 대비 상한">
+                    <div class="hint">예: 10 → 종목당 최대 약 10% of 잔고. 확대 옵션을 끄면 1·2종목일 때도 이 비율만 적용됩니다.</div>
+                </div>
+                <div class="form-group">
+                    <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="expand_position_when_few_stocks" checked> 선정 1~2종목일 때 잔고 활용 확대 <code class="setting-var">expand_position_when_few_stocks</code></label>
+                    <div class="hint">켜면 아래 비율이 1·2종목 선정 시 적용됩니다. 끄면 항상 위 <code class="setting-var">max_position_size_ratio</code>만 사용.</div>
+                </div>
+                <div class="form-group" style="margin-left:12px;">
+                    <label>확대 시 · 1종목 선정 종목당 최대 비율 (%): <code class="setting-var">expand_position_ratio_1_stock</code></label>
+                    <input type="number" id="expand_position_ratio_1_pct" value="100" step="1" min="0" max="100">
+                </div>
+                <div class="form-group" style="margin-left:12px;">
+                    <label>확대 시 · 2종목 선정 시 종목당 최대 비율 (%): <code class="setting-var">expand_position_ratio_2_stocks</code></label>
+                    <input type="number" id="expand_position_ratio_2_pct" value="50" step="1" min="0" max="100">
+                    <div class="hint">예: 50이면 두 종목 각각 잔고의 최대 50%까지(이론상 합 100%). <code class="setting-var">max_single_trade_amount</code>와 함께 최종 수량이 결정됩니다.</div>
+                </div>
+
+                <h3 class="settings-block-title">B. 손익 절단·일·월·누적 한도</h3>
                 <div class="form-group">
                     <label>손절매 비율 (%): <code class="setting-var">stop_loss_ratio</code></label>
                     <input type="number" id="stop_loss" value="0.5" step="0.1" min="0.1" max="10" title="오전 단타는 0.5~1.2% 권장">
@@ -1050,62 +1127,46 @@ def get_dashboard_html(username: str) -> str:
                     <label>일일 손실 한도 (원): <code class="setting-var">daily_loss_limit</code></label>
                     <input type="number" id="daily_loss_limit" value="50000" min="0" step="10000">
                 </div>
-                    <div class="form-group">
-                        <label>일일 손실 한도 기준: <code class="setting-var">daily_loss_limit_basis</code></label>
-                        <select id="daily_loss_limit_basis">
-                            <option value="realized">실현(체결 손익)</option>
-                            <option value="total">실현+미실현(가정)</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>일일 최대 거래 횟수 (매수+매도=1회): <code class="setting-var">max_trades_per_day</code></label>
-                        <input type="number" id="max_trades_per_day" value="12" min="1" max="50">
-                    </div>
-                    <div class="form-group">
-                        <label>종목별 일일 최대 거래 횟수 (0=미적용): <code class="setting-var">max_trades_per_stock_per_day</code></label>
-                        <input type="number" id="max_trades_per_stock_per_day" value="0" min="0" max="20" title="각 종목당 오늘 N회까지 매수 허용. 0이면 전역만 적용">
-                        <div class="hint">0=미적용(전역 max_trades_per_day만 적용). 1~2 권장. 한 종목이 휩쏘로 횟수를 다 쓰는 것 방지.</div>
-                    </div>
-                    <div class="form-group">
-                        <label>동시 보유 종목 수 상한 (0=제한 없음): <code class="setting-var">max_positions_count</code></label>
-                        <input type="number" id="max_positions_count" value="0" min="0" max="50">
-                    </div>
-                    <div class="form-group">
-                        <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="expand_position_when_few_stocks" checked> 선정 1~2종목일 때 잔고 활용 확대 <code class="setting-var">expand_position_when_few_stocks</code></label>
-                        <div class="hint">켜면: 1종목 100%, 2종목 50% each. 끄면 항상 종목당 max_position_size_ratio(기본 10%)만 사용.</div>
-                    </div>
-                    <div class="form-group">
-                        <label>일일 이익 한도(원) (전량매도 트리거): <code class="setting-var">daily_profit_limit</code></label>
-                        <input type="number" id="daily_profit_limit" value="50000" min="0" step="10000">
-                        <div class="hint">dailyProfit ≥ dailyLoss 권장(대칭 한도). 예: 5만/5만.</div>
-                    </div>
-                    <div class="form-group">
-                        <label>일일 이익 한도 기준: <code class="setting-var">daily_profit_limit_basis</code></label>
-                        <select id="daily_profit_limit_basis">
-                            <option value="total">실현+미실현(가정)</option>
-                            <option value="realized">실현(체결 손익)</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="daily_loss_limit_calendar" checked> 일일 손실 한도 기준일: 캘린더일 <code class="setting-var">daily_loss_limit_calendar</code></label>
-                    </div>
-                    <div class="form-group">
-                        <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="daily_profit_limit_calendar" checked> 일일 이익 한도 기준일: 캘린더일 <code class="setting-var">daily_profit_limit_calendar</code></label>
-                    </div>
-                    <div class="form-group">
-                        <label>월간 손실 한도(원,0=미적용): <code class="setting-var">monthly_loss_limit</code></label>
-                        <input type="number" id="monthly_loss_limit" value="0" min="0" step="100000">
-                    </div>
-                    <div class="form-group">
-                        <label>누적 손실 한도(원,0=미적용): <code class="setting-var">cumulative_loss_limit</code></label>
-                        <input type="number" id="cumulative_loss_limit" value="0" min="0" step="100000">
-                    </div>
-                    <div class="form-group">
-                        <label style="color:var(--muted);">팁: “실현+미실현” 기반 손실 제한은 위의 ‘일일 손실 한도 기준’을 <strong>total</strong>로 바꾸면 됩니다.</label>
-            </div>
+                <div class="form-group">
+                    <label>일일 손실 한도 기준: <code class="setting-var">daily_loss_limit_basis</code></label>
+                    <select id="daily_loss_limit_basis">
+                        <option value="realized">실현(체결 손익)</option>
+                        <option value="total">실현+미실현(가정)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>일일 이익 한도(원) (전량매도 트리거): <code class="setting-var">daily_profit_limit</code></label>
+                    <input type="number" id="daily_profit_limit" value="50000" min="0" step="10000">
+                    <div class="hint">dailyProfit ≥ dailyLoss 권장(대칭 한도). 예: 5만/5만.</div>
+                </div>
+                <div class="form-group">
+                    <label>일일 이익 한도 기준: <code class="setting-var">daily_profit_limit_basis</code></label>
+                    <select id="daily_profit_limit_basis">
+                        <option value="total">실현+미실현(가정)</option>
+                        <option value="realized">실현(체결 손익)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="daily_loss_limit_calendar" checked> 일일 손실 한도 기준일: 캘린더일 <code class="setting-var">daily_loss_limit_calendar</code></label>
+                </div>
+                <div class="form-group">
+                    <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="daily_profit_limit_calendar" checked> 일일 이익 한도 기준일: 캘린더일 <code class="setting-var">daily_profit_limit_calendar</code></label>
+                </div>
+                <div class="form-group">
+                    <label>월간 손실 한도(원,0=미적용): <code class="setting-var">monthly_loss_limit</code></label>
+                    <input type="number" id="monthly_loss_limit" value="0" min="0" step="100000">
+                </div>
+                <div class="form-group">
+                    <label>누적 손실 한도(원,0=미적용): <code class="setting-var">cumulative_loss_limit</code></label>
+                    <input type="number" id="cumulative_loss_limit" value="0" min="0" step="100000">
+                </div>
+                <div class="form-group">
+                    <label style="color:var(--muted);">팁: “실현+미실현” 기반 손실 제한은 위의 ‘일일 손실 한도 기준’을 <strong>total</strong>로 바꾸면 됩니다.</label>
+                </div>
 
                     <details>
                         <summary>고급(주문/재시도/사이징/트레일링)</summary>
+                        <p class="hint" style="margin:0 0 10px 0;">주문 방식·재시도, 체결 기준 손익(트레일링·ATR 손익), 포지션 사이징과 <strong>진입용</strong> 변동성/ATR/SAP 필터가 한 블록에 있습니다. 전략 탭의 진입 필터와 역할이 겹쳐 보이면 위 표를 참고하세요.</p>
                         <div class="form-group">
                             <label>매수 주문 방식: <code class="setting-var">buy_order_style</code></label>
                             <select id="buy_order_style">
@@ -1263,8 +1324,11 @@ def get_dashboard_html(username: str) -> str:
 
             <div id="settings-section-strategy" class="settings-section">
                 <div class="card">
-                    <h2>전략 설정 (이동평균)</h2>
+                    <h2>전략 설정</h2>
+                    <p class="settings-tab-tagline">신호·진입 필터·전략 청산(MA)·시간 — 리스크 탭의 손절·한도와 함께 동작합니다.</p>
                     <div class="hint" id="strategy_summary"></div>
+
+                    <h3 class="settings-block-title">이동평균·신호 (골든=매수, 데드=전략 매도)</h3>
                     <div class="form-group">
                         <label>프리셋:</label>
                         <select id="strategy_preset_select" onchange="onStrategyPresetChange()">
@@ -1292,10 +1356,13 @@ def get_dashboard_html(username: str) -> str:
                         <label>장기 이동평균 (틱): <code class="setting-var">long_ma_period</code></label>
                         <input type="number" id="long_ma_period" value="10" min="3" max="200">
                     </div>
+                    <p class="hint" style="margin:-4px 0 12px 0;">단기/장기 MA는 <strong>같은 틱 시계열</strong>로 골든크로스(진입)와 데드크로스(전략 매도)에 공통 사용됩니다.</p>
+
+                    <h3 class="settings-block-title">매수 시간·최소 보유</h3>
                     <div class="form-group">
                         <label>진입 후 최소 보유 시간(초): <code class="setting-var">min_hold_seconds</code></label>
                         <input type="number" id="min_hold_seconds" value="0" min="0" max="600" title="매수 직후 데드크로스로 즉시 매도되는 것 방지. 0=미적용, 30~60 권장">
-                        <span class="hint">0=미적용. 30~60초 권장(같은 가격에 매수→매도 반복 방지)</span>
+                        <span class="hint">0=미적용. 30~60초 권장(같은 가격에 매수→매도 반복 방지). 데드크로스만 틱으로 지연하려면 고급 → <strong>전략 청산·확인</strong>의 <code>dead_cross_confirm_ticks</code>를 사용하세요.</span>
                     </div>
                     <div class="form-group">
                         <label>신규 매수 허용 시작 (HH:MM, KST): <code class="setting-var">buy_window_start_hhmm</code></label>
@@ -1308,6 +1375,7 @@ def get_dashboard_html(username: str) -> str:
 
                     <details>
                         <summary>고급(필터/쿨다운/보강/레짐/청산)</summary>
+                        <h3 class="settings-block-title">진입·시장 필터</h3>
                         <div class="form-group">
                             <label>단기MA 기울기 최소(%/틱): <code class="setting-var">min_short_ma_slope_ratio</code></label>
                             <input type="number" id="min_short_ma_slope_pct" value="0" step="0.001" min="0" max="5">
@@ -1622,7 +1690,7 @@ def get_dashboard_html(username: str) -> str:
                             <input type="number" id="trade_value_concentration_max_pct" value="45" min="10" max="80" step="5">
                         </div>
                         <div class="form-group">
-                            <label>진입 확인(연속 틱 수):</label>
+                            <label>진입 확인(연속 틱 수): <code class="setting-var">buy_confirm_ticks</code></label>
                             <input type="number" id="buy_confirm_ticks" value="1" min="1" max="10">
                         </div>
                         <div class="form-group">
@@ -1690,6 +1758,13 @@ def get_dashboard_html(username: str) -> str:
                         <div class="form-group" style="margin-left:12px;">
                             <label>margin(%):</label>
                             <input type="number" id="relative_strength_margin_pct" value="0" step="0.1">
+                        </div>
+
+                        <h3 class="settings-block-title">전략 청산·확인 틱·시간</h3>
+                        <div class="form-group">
+                            <label>데드크로스 확인(연속 틱 수): <code class="setting-var">dead_cross_confirm_ticks</code></label>
+                            <input type="number" id="dead_cross_confirm_ticks" value="0" min="0" max="10" title="보유 중 단기MA&lt;장기MA가 이 틱 수만큼 연속일 때만 MA 매도. 0=즉시. 손절·트레일링 등 리스크 청산은 변함없음">
+                            <span class="hint">0=즉시 매도. 2~3이면 계단형 하락·휩쏘성 데드크로스 완화. 같은 틱에서는 리스크 청산(손절 등)이 먼저 평가됩니다.</span>
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
@@ -1929,8 +2004,12 @@ def get_dashboard_html(username: str) -> str:
                         <summary>리스크 관리</summary>
                         <div class="help-grid">
                             <div class="help-item">
-                                <strong>최대 거래 금액 (원) (<code>max_single_trade_amount</code>)</strong>
-                                한 번의 매수에서 쓸 수 있는 최대 금액입니다. 이 값을 넘는 주문은 실행되지 않습니다. 너무 크면 종목당 손익 변동이 커지므로, 단타에서는 50~200만 원 구간을 많이 씁니다.
+                                <strong>일일 매수 누적 한도 (원) (<code>daily_max_buy_amount_krw</code>)</strong>
+                                0이면 미적용. 매수 체결마다 (가격×수량)만큼 “소모분”이 늘고, 매도 시 (당시 평단×매도수량)만큼 소모분이 줄어듭니다. 소모분이 한도를 넘기 전까지만 신규 매수합니다. 1회 상한·포지션 비율과 함께 적용됩니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>1회 매수 최대 금액 (원) (<code>max_single_trade_amount</code>)</strong>
+                                한 번의 매수 주문에서 쓸 수 있는 금액 상한입니다. 시스템은 수량을 잡을 때 <strong>이 상한과 (잔고×종목당 비율) 중 더 작은 쪽</strong>을 씁니다. 잔고 전액을 한 종목에 태우려면 이 값을 잔고 이상으로 두고, 선정 종목 수에 맞는 포지션 비율(위 항목)도 100% 등으로 맞춰야 합니다. 단타에서는 50~200만 원대를 많이 씁니다.
                             </div>
                             <div class="help-item">
                                 <strong>최소 매수 수량(주) (<code>min_order_quantity</code>)</strong>
@@ -1947,6 +2026,14 @@ def get_dashboard_html(username: str) -> str:
                             <div class="help-item">
                                 <strong>동시 보유 종목 수 상한 (<code>max_positions_count</code>)</strong>
                                 동시에 보유할 수 있는 종목 수의 상한입니다. 0이면 제한 없음, 1~2로 두면 한두 종목만 보유하는 집중 운영이 됩니다. 리스크 분산을 원하면 3~5 정도로 넉넉히 둡니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>종목당 최대 포지션 비율 — 3종목 이상 (<code>max_position_size_ratio</code>)</strong>
+                                선정 종목이 3개 이상이거나, 「잔고 활용 확대」를 끈 상태에서는 종목당 계좌 잔고 대비 이 비율이 상한입니다. 최종 매수 금액은 <code>max_single_trade_amount</code>와 함께 더 작은 쪽으로 잘립니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>잔고 활용 확대 및 1·2종목 비율 (<code>expand_position_when_few_stocks</code>, <code>expand_position_ratio_1_stock</code>, <code>expand_position_ratio_2_stocks</code>)</strong>
+                                확대를 켜면 선정이 1종목·2종목일 때 각각 설정한 종목당 최대 비율(%)을 씁니다. 2종목일 때 예를 들어 50%면 종목마다 잔고의 최대 50%까지 허용됩니다. 확대를 끄면 1·2종목이어도 항상 <code>max_position_size_ratio</code>만 적용됩니다.
                             </div>
                             <div class="help-item">
                                 <strong>손절매 비율(%) (<code>stop_loss_ratio</code>)</strong>
@@ -2087,6 +2174,10 @@ def get_dashboard_html(username: str) -> str:
                             <div class="help-item">
                                 <strong>진입 확인(연속 틱 수) (<code>buy_confirm_ticks</code>)</strong>
                                 매수 조건(MA 크로스·추세·보강 조건 등)이 연속으로 이 틱 수만큼 유지될 때만 실제 매수 주문을 냅니다. 1이면 조건 만족 즉시, 2 이상이면 더 확실한 추세일 때만 진입합니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>데드크로스 확인(연속 틱 수) (<code>dead_cross_confirm_ticks</code>)</strong>
+                                보유 중 단기 MA &lt; 장기 MA(데드크로스) 상태가 이 틱 수만큼 <em>연속</em>으로 유지될 때만 전략 MA 매도 신호를 냅니다. 0이면 기존과 같이 조건 충족 틱에서 즉시 매도합니다. 한 틱만 스쳐 지나가는 교차(휩쏘)를 줄이려면 2~3을 검토하세요. 손절·ATR·트레일링·시간청산 등 리스크 측 청산은 이 설정과 무관하며, 틱 처리 순서상 리스크 청산이 먼저 평가됩니다.
                             </div>
                             <div class="help-item">
                                 <strong>최대 스프레드(%) (<code>max_spread_ratio</code>)</strong>
@@ -3329,6 +3420,15 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
             document.getElementById('daily_pnl').textContent = formatNumber(data.daily_pnl) + '원';
             document.getElementById('daily_pnl').className = 'metric-value ' + (data.daily_pnl >= 0 ? 'positive' : 'negative');
             document.getElementById('daily_trades').textContent = data.daily_trades + '회';
+            (function() {{
+                const dmax = data.daily_max_buy_amount_krw != null ? Number(data.daily_max_buy_amount_krw) : 0;
+                const dbn = data.daily_buy_notional != null ? Number(data.daily_buy_notional) : 0;
+                const txt = (dmax > 0) ? (formatNumber(dbn) + ' / ' + formatNumber(dmax) + '원') : (formatNumber(dbn) + '원');
+                const el = document.getElementById('daily_buy_notional');
+                if (el) el.textContent = txt;
+                const pel = document.getElementById('pos_daily_buy_notional');
+                if (pel) pel.textContent = txt;
+            }})();
             const posBalance = document.getElementById('pos_balance');
             if (posBalance) {{ posBalance.textContent = formatNumber(data.account_balance) + '원'; }}
             const posPnl = document.getElementById('pos_daily_pnl');
@@ -3471,8 +3571,17 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     const atrFiltLine = atrFilt
                         ? (' · atrFilt≤' + atrMax + '%(p=' + atrPer + ')')
                         : '';
+                    const mpsr = document.getElementById('max_position_size_ratio_pct')?.value || '10';
+                    const expOn = !!document.getElementById('expand_position_when_few_stocks')?.checked;
+                    const e1 = document.getElementById('expand_position_ratio_1_pct')?.value || '100';
+                    const e2 = document.getElementById('expand_position_ratio_2_pct')?.value || '50';
+                    const posLine = 'pos≥3종목=' + mpsr + '%/종' + (expOn ? (' · 확대1=' + e1 + '% · 확대2=' + e2 + '%/종') : '');
+                    const dmaxBuy = document.getElementById('daily_max_buy_amount_krw')?.value || '0';
+                    const dmaxLine = (parseInt(dmaxBuy, 10) > 0) ? ('일매수≤' + dmaxBuy + '원 · ') : '';
                     risk.textContent =
                         'max=' + maxAmt + '원 · ' +
+                        dmaxLine +
+                        posLine + ' · ' +
                         'minQty=' + minQty + '주 · ' +
                         'SL=' + sl + '%/TP=' + tp + '% · ' +
                         'dailyLoss=' + dly + '원(' + dlb + ') · ' +
@@ -3496,6 +3605,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     const ec = !!document.getElementById('entry_confirm_enabled')?.checked;
                     const cd = document.getElementById('reentry_cooldown_seconds')?.value || '240';
                     const conf = document.getElementById('buy_confirm_ticks')?.value || '1';
+                    const dcConf = document.getElementById('dead_cross_confirm_ticks')?.value ?? '0';
                     const spr = document.getElementById('max_spread_pct')?.value || '0';
                     const n = document.getElementById('range_lookback_ticks')?.value || '0';
                     const rr = document.getElementById('min_range_pct')?.value || '0';
@@ -3521,6 +3631,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                         (advOn ? '상승비율≥' + advMin + '% · ' : '') +
                         (tvcOn ? '거래대금집중<' + tvcMax + '%(상위' + tvcTop + ') · ' : '') +
                         'confirm=' + conf + ' · ' +
+                        'dcConfirm=' + dcConf + ' · ' +
                         'spr≤' + spr + '% · ' +
                         'range≥' + rr + '%/N' + n + ' · ' +
                         'timeLiq=' + (liqOn ? 'on' : 'off') + '@' + liqAt;
@@ -4144,6 +4255,10 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
 
                 if (risk) {{
                     if (risk.max_single_trade_amount != null && risk.max_single_trade_amount !== undefined) document.getElementById('max_trade_amount').value = String(risk.max_single_trade_amount);
+                    if (risk.daily_max_buy_amount_krw != null && risk.daily_max_buy_amount_krw !== undefined) {{
+                        const el = document.getElementById('daily_max_buy_amount_krw');
+                        if (el) el.value = String(risk.daily_max_buy_amount_krw);
+                    }}
                     if (risk.min_order_quantity != null) document.getElementById('min_order_quantity').value = risk.min_order_quantity;
                     if (risk.stop_loss_ratio != null) document.getElementById('stop_loss').value = (risk.stop_loss_ratio * 100).toFixed(1);
                     if (risk.take_profit_ratio != null) document.getElementById('take_profit').value = (risk.take_profit_ratio * 100).toFixed(1);
@@ -4154,7 +4269,19 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     if (risk.max_trades_per_day != null) document.getElementById('max_trades_per_day').value = risk.max_trades_per_day;
                     if (risk.max_trades_per_stock_per_day != null) document.getElementById('max_trades_per_stock_per_day').value = risk.max_trades_per_stock_per_day;
                     if (risk.max_positions_count != null) document.getElementById('max_positions_count').value = risk.max_positions_count;
+                    if (risk.max_position_size_ratio != null && risk.max_position_size_ratio !== undefined) {{
+                        const el = document.getElementById('max_position_size_ratio_pct');
+                        if (el) el.value = String(Number(risk.max_position_size_ratio) * 100);
+                    }}
                     if (risk.expand_position_when_few_stocks !== undefined && risk.expand_position_when_few_stocks !== null) {{ const el = document.getElementById('expand_position_when_few_stocks'); if (el) el.checked = !!risk.expand_position_when_few_stocks; }}
+                    if (risk.expand_position_ratio_1_stock != null && risk.expand_position_ratio_1_stock !== undefined) {{
+                        const el = document.getElementById('expand_position_ratio_1_pct');
+                        if (el) el.value = String(Number(risk.expand_position_ratio_1_stock) * 100);
+                    }}
+                    if (risk.expand_position_ratio_2_stocks != null && risk.expand_position_ratio_2_stocks !== undefined) {{
+                        const el = document.getElementById('expand_position_ratio_2_pct');
+                        if (el) el.value = String(Number(risk.expand_position_ratio_2_stocks) * 100);
+                    }}
                     if (risk.daily_profit_limit_basis != null) document.getElementById('daily_profit_limit_basis').value = risk.daily_profit_limit_basis;
                     if (risk.buy_order_style != null) document.getElementById('buy_order_style').value = risk.buy_order_style;
                     if (risk.sell_order_style != null) document.getElementById('sell_order_style').value = risk.sell_order_style;
@@ -4259,6 +4386,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     if (strat.trade_value_concentration_denom_n != null) document.getElementById('trade_value_concentration_denom_n').value = strat.trade_value_concentration_denom_n;
                     if (strat.trade_value_concentration_max_pct != null) document.getElementById('trade_value_concentration_max_pct').value = strat.trade_value_concentration_max_pct;
                     if (strat.buy_confirm_ticks != null) document.getElementById('buy_confirm_ticks').value = strat.buy_confirm_ticks;
+                    if (strat.dead_cross_confirm_ticks != null) {{ const el = document.getElementById('dead_cross_confirm_ticks'); if (el) el.value = strat.dead_cross_confirm_ticks; }}
                     if (strat.enable_time_liquidation != null) document.getElementById('enable_time_liquidation').checked = !!strat.enable_time_liquidation;
                     if (strat.liquidate_after_hhmm != null) document.getElementById('liquidate_after_hhmm').value = strat.liquidate_after_hhmm;
                     if (strat.max_spread_ratio != null) document.getElementById('max_spread_pct').value = (strat.max_spread_ratio * 100).toFixed(2);
@@ -4370,6 +4498,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
             try {{
                 const config = {{
                     max_single_trade_amount: parseInt(document.getElementById('max_trade_amount').value),
+                    daily_max_buy_amount_krw: Math.max(0, parseInt(document.getElementById('daily_max_buy_amount_krw')?.value) || 0),
                     min_order_quantity: parseInt(document.getElementById('min_order_quantity').value) || 1,
                     stop_loss_ratio: parseFloat(document.getElementById('stop_loss').value) / 100,
                     take_profit_ratio: parseFloat(document.getElementById('take_profit').value) / 100,
@@ -4405,7 +4534,9 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     max_trades_per_stock_per_day: parseInt(document.getElementById('max_trades_per_stock_per_day')?.value) || 0,
                     max_positions_count: parseInt(document.getElementById('max_positions_count')?.value) || 0,
                     expand_position_when_few_stocks: !!document.getElementById('expand_position_when_few_stocks')?.checked,
-                    max_position_size_ratio: 0.1,
+                    max_position_size_ratio: Math.min(1, Math.max(0, (parseFloat(document.getElementById('max_position_size_ratio_pct')?.value) || 10) / 100)),
+                    expand_position_ratio_1_stock: Math.min(1, Math.max(0, (parseFloat(document.getElementById('expand_position_ratio_1_pct')?.value) || 100) / 100)),
+                    expand_position_ratio_2_stocks: Math.min(1, Math.max(0, (parseFloat(document.getElementById('expand_position_ratio_2_pct')?.value) || 50) / 100)),
                     trailing_stop_ratio: (parseFloat(document.getElementById('trailing_stop_pct').value) || 0) / 100,
                     trailing_activation_ratio: (parseFloat(document.getElementById('trailing_activation_pct').value) || 0) / 100,
                     partial_take_profit_ratio: (parseFloat(document.getElementById('partial_tp_pct').value) || 0) / 100,
@@ -4501,6 +4632,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     trade_value_concentration_denom_n: parseInt(document.getElementById('trade_value_concentration_denom_n').value) || 30,
                     trade_value_concentration_max_pct: parseFloat(document.getElementById('trade_value_concentration_max_pct').value) || 45,
                     buy_confirm_ticks: parseInt(document.getElementById('buy_confirm_ticks').value) || 1,
+                    dead_cross_confirm_ticks: Math.max(0, Math.min(10, parseInt(document.getElementById('dead_cross_confirm_ticks')?.value, 10) || 0)),
                     enable_time_liquidation: !!document.getElementById('enable_time_liquidation').checked,
                     liquidate_after_hhmm: (document.getElementById('liquidate_after_hhmm').value || '11:55').trim(),
                     max_spread_ratio: (parseFloat(document.getElementById('max_spread_pct').value) || 0) / 100,
@@ -4797,6 +4929,14 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 document.getElementById('enable_volatility_sizing').checked = true;
                 document.getElementById('volatility_lookback_ticks').value = 20;
                 document.getElementById('volatility_stop_mult').value = 1.0;
+                const mpsrEl = document.getElementById('max_position_size_ratio_pct');
+                if (mpsrEl) mpsrEl.value = 10;
+                const ex1 = document.getElementById('expand_position_ratio_1_pct');
+                if (ex1) ex1.value = 100;
+                const ex2 = document.getElementById('expand_position_ratio_2_pct');
+                if (ex2) ex2.value = 50;
+                const expChk = document.getElementById('expand_position_when_few_stocks');
+                if (expChk) expChk.checked = true;
                 await updateRiskConfig();
 
                 // 전략(빠른 MA + 신규 매수 시간 제한 + 진입 후 최소 보유로 즉시 매도 방지)
@@ -5113,8 +5253,9 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     <div class="k">환경</div><div><code>${{_escapeHtml(snap.is_paper_trading ? '모의' : '실전')}}</code> / <code>${{_escapeHtml(snap.manual_approval ? '수동' : '자동')}}</code></div>
                     <div class="k">감시 종목</div><div><code>${{_escapeHtml(sel.join(', ') || '-')}}</code></div>
                     <div class="k">max_single</div><div><code>${{_escapeHtml(risk.max_single_trade_amount ?? '-')}}</code></div>
+                    <div class="k">일매수한도</div><div><code>${{_escapeHtml(risk.daily_max_buy_amount_krw ?? 0)}}</code> / 누적 <code>${{_escapeHtml(risk.daily_buy_notional ?? 0)}}</code></div>
                     <div class="k">daily_loss</div><div><code>${{_escapeHtml(risk.daily_loss_limit ?? '-')}}</code></div>
-                    <div class="k">max_pos_ratio</div><div><code>${{_escapeHtml(risk.max_position_size_ratio ?? '-')}}</code></div>
+                    <div class="k">max_pos_ratio</div><div><code>${{_escapeHtml(risk.max_position_size_ratio ?? '-')}}</code> ${{risk.expand_position_when_few_stocks ? ('· exp1=' + (risk.expand_position_ratio_1_stock ?? '-') + ' exp2=' + (risk.expand_position_ratio_2_stocks ?? '-')) : ''}}</div>
                     <div class="k">atr_stop_take</div><div><code>${{risk.use_atr_for_stop_take ? ('on ' + (risk.atr_stop_mult ?? '-') + '/' + (risk.atr_take_mult ?? '-') + '×N' + (risk.atr_lookback_ticks ?? '-')) : 'off'}}</code></div>
                     <div class="k">atr_filter</div><div><code>${{risk.atr_filter_enabled ? ('≤' + (risk.atr_ratio_max_pct ?? '-') + '% p=' + (risk.atr_period ?? '-')) : 'off'}}</code></div>
                     <div class="k">sap_filter</div><div><code>${{risk.sap_deviation_filter_enabled ? ('≤' + (risk.sap_deviation_max_pct ?? '-') + '%') : 'off'}}</code></div>

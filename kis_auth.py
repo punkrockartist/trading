@@ -21,6 +21,7 @@ import requests
 
 # 웹 소켓 모듈을 선언한다.
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 # pip install PyYAML (패키지설치)
 import yaml
@@ -697,51 +698,101 @@ class KISWebSocket:
     def __init__(self, api_url: str, max_retries: int = 3):
         self.api_url = api_url
         self.max_retries = max_retries
+        # 다른 스레드(엔진 중지·재선정)에서 True로 설정 → 수신 루프에서 ws.close() 후 asyncio.run 반환
+        self._force_close_requested: bool = False
+        self._closed_by_client: bool = False
+
+    def request_close(self) -> None:
+        """엔진 중지/재선정 시 호출: kws.start()가 블로킹된 상태에서 WS를 닫아 루프를 빠져나오게 함."""
+        self._force_close_requested = True
 
     # private
     async def __subscriber(self, ws: websockets.ClientConnection):
-        async for raw in ws:
-            logging.debug("received message >> %s" % raw)
-            show_result = False
+        try:
+            async for raw in ws:
+                logging.debug("received message >> %s" % raw)
+                show_result = False
 
-            df = pd.DataFrame()
+                df = pd.DataFrame()
 
-            if raw[0] in ["0", "1"]:
-                d1 = raw.split("|")
-                if len(d1) < 4:
-                    raise ValueError("data not found...")
+                if raw[0] in ["0", "1"]:
+                    d1 = raw.split("|")
+                    if len(d1) < 4:
+                        raise ValueError("data not found...")
 
-                tr_id = d1[1]
+                    tr_id = d1[1]
 
-                dm = data_map[tr_id]
-                d = d1[3]
-                if dm.get("encrypt", None) == "Y":
-                    d = aes_cbc_base64_dec(dm["key"], dm["iv"], d)
+                    dm = data_map[tr_id]
+                    d = d1[3]
+                    if dm.get("encrypt", None) == "Y":
+                        d = aes_cbc_base64_dec(dm["key"], dm["iv"], d)
 
-                df = pd.read_csv(
-                    StringIO(d), header=None, sep="^", names=dm["columns"], dtype=object
-                )
+                    df = pd.read_csv(
+                        StringIO(d), header=None, sep="^", names=dm["columns"], dtype=object
+                    )
 
-                show_result = True
-
-            else:
-                rsp = system_resp(raw)
-
-                tr_id = rsp.tr_id
-                add_data_map(
-                    tr_id=rsp.tr_id, encrypt=rsp.encrypt, key=rsp.ekey, iv=rsp.iv
-                )
-
-                if rsp.isPingPong:
-                    print(f"### RECV [PINGPONG] [{raw}]")
-                    await ws.pong(raw)
-                    print(f"### SEND [PINGPONG] [{raw}]")
-
-                if self.result_all_data:
                     show_result = True
 
-            if show_result is True and self.on_result is not None:
-                self.on_result(ws, tr_id, df, data_map[tr_id])
+                else:
+                    rsp = system_resp(raw)
+
+                    tr_id = rsp.tr_id
+                    add_data_map(
+                        tr_id=rsp.tr_id, encrypt=rsp.encrypt, key=rsp.ekey, iv=rsp.iv
+                    )
+
+                    if rsp.isPingPong:
+                        print(f"### RECV [PINGPONG] [{raw}]")
+                        await ws.pong(raw)
+                        print(f"### SEND [PINGPONG] [{raw}]")
+
+                    if self.result_all_data:
+                        show_result = True
+
+                if show_result is True and self.on_result is not None:
+                    self.on_result(ws, tr_id, df, data_map[tr_id])
+        except ConnectionClosed as e:
+            if getattr(self, "_closed_by_client", False):
+                logging.info(
+                    "KIS WS 수신 루프 정상 종료(엔진 중지 요청): code=%s reason=%r",
+                    getattr(e, "code", None),
+                    getattr(e, "reason", "") or "",
+                )
+                return
+            logging.warning(
+                "KIS WS 수신 루프 종료(ConnectionClosed): code=%s reason=%r",
+                getattr(e, "code", None),
+                getattr(e, "reason", "") or "",
+            )
+            raise
+        except Exception as e:
+            logging.warning(
+                "KIS WS 수신 루프 종료 예외: %s: %s",
+                type(e).__name__,
+                e,
+            )
+            raise
+
+    async def __session_recv_loop(self, ws: websockets.ClientConnection) -> None:
+        """실시간 수신 + 엔진 중지 시 ws.close() 워처를 병행."""
+        self._closed_by_client = False
+
+        async def _watch_force_close() -> None:
+            while True:
+                await asyncio.sleep(0.2)
+                if self._force_close_requested:
+                    self._force_close_requested = False
+                    self._closed_by_client = True
+                    try:
+                        await ws.close(code=1000, reason="engine stop")
+                    except Exception:
+                        pass
+                    return
+
+        await asyncio.gather(
+            self.__subscriber(ws),
+            _watch_force_close(),
+        )
 
     async def __runner(self):
         if len(open_map.keys()) > 40:
@@ -793,33 +844,47 @@ class KISWebSocket:
                 if additional_headers:
                     async with websockets.connect(url, additional_headers=additional_headers) as ws:
                         print("[WebSocket 연결 성공!]")
+                        self.retry_count = 0
                         # request subscribe
                         for name, obj in open_map.items():
                             await self.send_multiple(
                                 ws, obj["func"], "1", obj["items"], obj["kwargs"]
                             )
 
-                        # subscriber
-                        await asyncio.gather(
-                            self.__subscriber(ws),
-                        )
+                        await self.__session_recv_loop(ws)
+                        if self._closed_by_client:
+                            logging.info("KIS WS __runner: 엔진 중지 요청으로 세션 종료(재시도 없음)")
+                            break
                 else:
                     async with websockets.connect(url) as ws:
                         print("[WebSocket 연결 성공! (헤더 없음)]")
+                        self.retry_count = 0
                         # request subscribe
                         for name, obj in open_map.items():
                             await self.send_multiple(
                                 ws, obj["func"], "1", obj["items"], obj["kwargs"]
                             )
 
-                        # subscriber
-                        await asyncio.gather(
-                            self.__subscriber(ws),
-                        )
+                        await self.__session_recv_loop(ws)
+                        if self._closed_by_client:
+                            logging.info("KIS WS __runner: 엔진 중지 요청으로 세션 종료(재시도 없음)")
+                            break
             except Exception as e:
                 print("Connection exception >> ", e)
+                logging.warning(
+                    "KIS WS 연결/세션 예외 (retry_count→%s, max=%s): %s: %s",
+                    self.retry_count + 1,
+                    self.max_retries,
+                    type(e).__name__,
+                    e,
+                )
                 self.retry_count += 1
                 await asyncio.sleep(1)
+        if self.retry_count >= self.max_retries:
+            logging.error(
+                "KIS WS __runner 종료: 재시도 한도(%s회) 소진 — 상위(kws.start)에서 재구독 루프로 복귀",
+                self.max_retries,
+            )
 
     # func
     @classmethod

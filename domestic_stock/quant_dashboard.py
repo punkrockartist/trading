@@ -245,7 +245,12 @@ class RiskConfig(BaseModel):
     max_trades_per_stock_per_day: int = 0  # 종목당 일일 최대 거래 횟수. 0=미적용
     max_position_size_ratio: float
     max_positions_count: int = 0  # 동시 보유 종목 수 상한. 0=제한 없음
-    expand_position_when_few_stocks: bool = True  # True: 선정 1~2종목일 때 잔고 활용 확대(100%/50%), False: 항상 max_position_size_ratio
+    expand_position_when_few_stocks: bool = True  # True: 선정 1~2종목일 때 잔고 활용 확대, False: 항상 max_position_size_ratio
+    # 확대 시 종목당 최대 비율(0~1). 3종목 이상은 항상 max_position_size_ratio.
+    expand_position_ratio_1_stock: float = 1.0
+    expand_position_ratio_2_stocks: float = 0.5
+    # 당일 매수 한도 소모분 상한. 0=미적용. 매수 +가격×수량, 매도 −평단×매도수량.
+    daily_max_buy_amount_krw: int = 0
     trailing_stop_ratio: float = 0.0
     trailing_activation_ratio: float = 0.0
     partial_take_profit_ratio: float = 0.0
@@ -390,6 +395,8 @@ class StrategyConfig(BaseModel):
     trade_value_concentration_denom_n: int = 30
     trade_value_concentration_max_pct: float = 45.0  # 상위 top_n / 상위 denom_n 비율이 이 값 초과면 스킵
     buy_confirm_ticks: int = 1
+    # 데드크로스(MA 매도) 연속 확인: short<long 이 N틱 연속일 때만 매도. 0=즉시(기존 동작)
+    dead_cross_confirm_ticks: int = 0
     enable_time_liquidation: bool = False
     liquidate_after_hhmm: str = "11:55"
     # 스프레드/횡보장 필터(0이면 사용 안 함)
