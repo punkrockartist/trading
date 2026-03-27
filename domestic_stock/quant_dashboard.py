@@ -19,6 +19,11 @@ import logging
 from datetime import datetime
 from pydantic import BaseModel
 import uvicorn
+import os
+import signal
+import threading
+import traceback
+import faulthandler
 
 # 퀀트 매매 시스템 import
 import sys
@@ -41,6 +46,9 @@ logger = logging.getLogger(__name__)
 _dashboard_fastapi_shutdown_done: bool = False
 _dashboard_uvicorn_fatal_logged: bool = False
 _dashboard_atexit_registered: bool = False
+_dashboard_signal_handlers_registered: bool = False
+_dashboard_excepthook_registered: bool = False
+_dashboard_fault_log_opened = None
 
 
 def ensure_dashboard_atexit_registered() -> None:
@@ -94,6 +102,94 @@ def _atexit_dashboard_if_abrupt() -> None:
         )
     except Exception:
         pass
+
+
+def _log_system_event(level: str, message: str) -> None:
+    try:
+        from system_log import system_log_append
+        system_log_append(level, message)
+    except Exception:
+        pass
+
+
+def _install_dashboard_fault_handler() -> None:
+    global _dashboard_fault_log_opened
+    if _dashboard_fault_log_opened is not None:
+        return
+    try:
+        log_dir = os.path.join(os.path.dirname(__file__), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fault_path = os.path.join(log_dir, f"dashboard_fault_{ts}.log")
+        fp = open(fault_path, "a", encoding="utf-8")
+        faulthandler.enable(file=fp, all_threads=True)
+        _dashboard_fault_log_opened = fp
+        _log_system_event("info", f"faulthandler 활성화: {fault_path}")
+    except Exception as e:
+        _log_system_event("warning", f"faulthandler 활성화 실패: {type(e).__name__}: {e}")
+
+
+def _register_dashboard_signal_handlers() -> None:
+    global _dashboard_signal_handlers_registered
+    if _dashboard_signal_handlers_registered:
+        return
+
+    def _handler(signum, _frame):
+        sig_name = getattr(signal, "Signals", None)
+        if sig_name:
+            try:
+                name = signal.Signals(signum).name
+            except Exception:
+                name = str(signum)
+        else:
+            name = str(signum)
+        _log_system_event("warning", f"대시보드 종료 시그널 수신: {name}({signum})")
+
+    for s in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None), getattr(signal, "SIGBREAK", None)):
+        if s is None:
+            continue
+        try:
+            signal.signal(s, _handler)
+        except Exception:
+            continue
+
+    _dashboard_signal_handlers_registered = True
+
+
+def _register_dashboard_excepthooks() -> None:
+    global _dashboard_excepthook_registered
+    if _dashboard_excepthook_registered:
+        return
+
+    def _sys_excepthook(exc_type, exc_value, exc_tb):
+        tb = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        _log_system_event("error", f"대시보드 미처리 예외(sys.excepthook): {exc_type.__name__}: {exc_value}\n{tb}")
+
+    def _thread_excepthook(args):
+        tb = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+        _log_system_event(
+            "error",
+            f"대시보드 스레드 미처리 예외(threading.excepthook): thread={getattr(args.thread, 'name', '?')} "
+            f"{args.exc_type.__name__}: {args.exc_value}\n{tb}",
+        )
+
+    try:
+        sys.excepthook = _sys_excepthook
+    except Exception:
+        pass
+
+    try:
+        threading.excepthook = _thread_excepthook
+    except Exception:
+        pass
+
+    _dashboard_excepthook_registered = True
+
+
+def initialize_dashboard_runtime_guards() -> None:
+    _install_dashboard_fault_handler()
+    _register_dashboard_signal_handlers()
+    _register_dashboard_excepthooks()
 
 
 # FastAPI 앱 생성
@@ -892,6 +988,7 @@ if __name__ == "__main__":
     print("종료하려면 Ctrl+C를 누르세요")
     print("=" * 80)
     ensure_dashboard_atexit_registered()
+    initialize_dashboard_runtime_guards()
     try:
         uvicorn.run(app, host="0.0.0.0", port=8000)
     except KeyboardInterrupt:
