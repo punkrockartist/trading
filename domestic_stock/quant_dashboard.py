@@ -13,11 +13,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depe
 from starlette.requests import Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import json
 import logging
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
 import os
 import signal
@@ -225,7 +225,15 @@ class TradingState:
         self.latest_quotes: Dict[str, Dict] = {}
         # 장운영 WS(H0STMKO0) VI 적용 여부: 종목코드 -> (active: bool, time.time() 수신시각)
         self._vi_ws_active: Dict[str, tuple] = {}
-        
+        # 통합 시장 레짐: 저장 베이스(오버레이 없음) + 현재 라벨
+        self._strategy_config_snapshot: Dict[str, Any] = {}
+        self._unified_regime_base_strategy: Dict[str, Any] = {}
+        self._unified_regime_base_risk: Dict[str, Any] = {}
+        self.unified_regime_active_label: str = "neutral"
+        self._unified_regime_pending_label: Optional[str] = None
+        self._unified_regime_pending_streak: int = 0
+        self._unified_regime_last_eval_ts: float = 0.0
+
     async def broadcast(self, message: dict):
         """모든 WebSocket 클라이언트에 메시지 전송. type=log 시 시스템 로그 파일에도 기록."""
         if isinstance(message, dict) and message.get("type") == "log":
@@ -281,6 +289,29 @@ class TradingState:
                 if pnl < 0:
                     self.consecutive_losses = getattr(self, "consecutive_losses", 0) + 1
                     self.last_consecutive_loss_time = _time.time()
+                    # 임계 도달 시 1회: 전역 매수 스킵(연속손실쿨다운)이 켜짐을 로그에 남김 — 스킵 로그의 종목코드는 '후보'일 뿐 손실 원인 종목이 아님
+                    try:
+                        thresh = max(2, min(5, int(getattr(self, "consecutive_loss_count_threshold", 2) or 2)))
+                        if (
+                            bool(getattr(self, "consecutive_loss_cooldown_enabled", False))
+                            and self.consecutive_losses == thresh
+                        ):
+                            base_cd = int(getattr(self, "reentry_cooldown_seconds", 0) or 0)
+                            mult = float(getattr(self, "consecutive_loss_cooldown_mult", 2.0) or 2.0)
+                            required = int(base_cd * mult) if base_cd > 0 else 0
+                            msg = (
+                                f"연속 손실 {self.consecutive_losses}회 도달 → 연속손실쿨다운 적용(신규 매수 전역 대기 약 {required}s, "
+                                f"reentry_cooldown_seconds×배수). 이후 로그의 'BUY 스킵 | 종목코드 | 연속 손실 쿨다운'에서 종목코드는 해당 틱의 매수 후보이며 손실 원인 종목을 뜻하지 않습니다."
+                            )
+                            logger.warning(msg)
+                            try:
+                                from system_log import system_log_append
+
+                                system_log_append("warning", msg)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                 else:
                     self.consecutive_losses = 0
                     self.last_consecutive_loss_time = None
@@ -392,6 +423,84 @@ class StockSelectionConfig(BaseModel):
     max_drawdown_from_high_ratio: float = 0.12  # 12%; 실전에서는 10~12% 이상이어야 종목이 선정되는 경우 많음
     drawdown_filter_after_hhmm: str = "12:00"
     kospi_only: bool = False  # True: 코스피만(코스닥 제외)
+
+
+def _default_unified_regime_profile_trend() -> "UnifiedRegimeProfile":
+    """추세장: 넓은 손절·트레일링, 진입 다소 보수(확인 틱), 데드크로스 지연."""
+    return UnifiedRegimeProfile(
+        strategy={
+            "min_short_ma_slope_ratio": 0.0001,
+            "buy_confirm_ticks": 2,
+            "dead_cross_confirm_ticks": 2,
+            "minute_trend_enabled": True,
+            "range_lookback_ticks": 6,
+            "min_range_ratio": 0.001,
+        },
+        risk={
+            "stop_loss_ratio": 0.028,
+            "trailing_stop_ratio": 0.014,
+            "trailing_activation_ratio": 0.007,
+            "partial_take_profit_ratio": 0.015,
+            "atr_filter_enabled": False,
+            "atr_ratio_max_pct": 0.0,
+        },
+    )
+
+
+def _default_unified_regime_profile_range() -> "UnifiedRegimeProfile":
+    """박스권: 타이트 스탑·빠른 청산, ATR 필터 강화, 짧은 확인."""
+    return UnifiedRegimeProfile(
+        strategy={
+            "min_short_ma_slope_ratio": 0.00025,
+            "buy_confirm_ticks": 1,
+            "dead_cross_confirm_ticks": 0,
+            "minute_trend_enabled": False,
+            "range_lookback_ticks": 12,
+            "min_range_ratio": 0.0012,
+        },
+        risk={
+            "stop_loss_ratio": 0.014,
+            "trailing_stop_ratio": 0.006,
+            "trailing_activation_ratio": 0.012,
+            "partial_take_profit_ratio": 0.008,
+            "atr_filter_enabled": True,
+            "atr_period": 14,
+            "atr_ratio_max_pct": 2.5,
+        },
+    )
+
+
+def _default_unified_regime_profile_neutral() -> "UnifiedRegimeProfile":
+    return UnifiedRegimeProfile(strategy={}, risk={})
+
+
+class UnifiedRegimeProfile(BaseModel):
+    """레짐별 전략/리스크 덮어쓰기. 키는 StrategyConfig / RiskConfig 필드명과 동일."""
+
+    strategy: Dict[str, Any] = Field(default_factory=dict)
+    risk: Dict[str, Any] = Field(default_factory=dict)
+
+
+class UnifiedRegimeSwitchConfig(BaseModel):
+    """통합 레짐 스위치: 지수·상승비율·지수변동률·거래대금 집중으로 trend|range|neutral → 프로필 적용."""
+
+    enabled: bool = False
+    eval_interval_sec: int = 60
+    hysteresis_streak: int = 2
+    index_ma_code: str = "1001"
+    trend_require_index_bull: bool = True
+    advance_ratio_market: str = "1001"
+    trend_min_advance_ratio: float = 0.48
+    range_max_advance_ratio: float = 0.46
+    circuit_breaker_market_for_vol: str = "0001"
+    volatility_index_change_trend_min: float = 0.12
+    volatility_index_change_range_max: float = 0.35
+    trade_value_concentration_market: str = "1001"
+    concentration_implies_range: bool = True
+    decision_margin: float = 0.8
+    profile_trend: UnifiedRegimeProfile = Field(default_factory=_default_unified_regime_profile_trend)
+    profile_range: UnifiedRegimeProfile = Field(default_factory=_default_unified_regime_profile_range)
+    profile_neutral: UnifiedRegimeProfile = Field(default_factory=_default_unified_regime_profile_neutral)
 
 
 class OperationalConfig(BaseModel):
@@ -519,6 +628,18 @@ class StrategyConfig(BaseModel):
     # 예: -1.5~-0.5 구간(실제 변동폭에 맞춤). -2.5~-1.0은 변동 작을 때 진입 안 나옴
     sap_revert_entry_from_pct: float = -1.5
     sap_revert_entry_to_pct: float = -0.5
+    # 듀얼 레짐(지수 MA + 종목 분봉 박스): 추세(MA 골든) vs 횡보(MR) 분기
+    regime_dual_switch_enabled: bool = True  # 단타 기본: 지수+종목 박스로 횡보 추세진입 완화
+    regime_block_ma_buy_when_index_bear: bool = True  # 지수 < N일 MA 이면 MA 추세 매수 후보 제외(기존 index_ma_filter와 별도로 동작)
+    regime_block_ma_buy_when_stock_range: bool = True  # 분봉 박스가 좁으면 MA 추세 매수 제외
+    regime_stock_range_lookback_minutes: int = 15  # 단타: 12~20분대 권장(프리셋별 조정)
+    regime_stock_range_max_ratio: float = 0.0065  # (고-저)/현재가; ~0.65% 미만이면 좁은 박스
+    regime_mr_buy_enabled: bool = False  # 오전·보수는 끔, 전일·오후·공격만 켜는 것을 권장
+    regime_mr_max_zone_pct: float = 0.32  # 박스 하단 32% 구간
+    regime_mr_require_index_bull: bool = True  # MR도 지수 >= MA 요구 시 True
+    # 통합 시장 레짐(trend|range|neutral): 저장된 베이스 전략/리스크 위에 런타임 오버레이
+    unified_regime: UnifiedRegimeSwitchConfig = Field(default_factory=UnifiedRegimeSwitchConfig)
+
 
 class ManualOrder(BaseModel):
     stock_code: str
@@ -985,12 +1106,13 @@ if __name__ == "__main__":
     print("=" * 80)
     print("웹 브라우저에서 http://localhost:8000 접속")
     print("기본 계정: admin / admin123")
-    print("종료하려면 Ctrl+C를 누르세요")
+    print("종료하려면 Ctrl+C를 누르세요 (한 번에 안 꺼지면 잠시 대기 후 다시 Ctrl+C 또는 프로세스 종료)")
     print("=" * 80)
     ensure_dashboard_atexit_registered()
     initialize_dashboard_runtime_guards()
     try:
-        uvicorn.run(app, host="0.0.0.0", port=8000)
+        # None이면 진행 중 요청·WebSocket 정리에 시간 제한 없이 대기해 '안 꺼지는 것처럼' 보일 수 있음.
+        uvicorn.run(app, host="0.0.0.0", port=8000, timeout_graceful_shutdown=10)
     except KeyboardInterrupt:
         print("\n종료합니다.")
     except Exception as e:

@@ -23,9 +23,11 @@ from domestic_stock_functions import inquire_index_daily_price, inquire_index_pr
 from quant_dashboard import (
     app, state, get_current_user,
     RiskConfig, StockSelectionConfig, StrategyConfig, OperationalConfig, ManualOrder,
+    UnifiedRegimeSwitchConfig,
     _record_dashboard_http_shutdown_graceful,
     ensure_dashboard_atexit_registered,
 )
+from unified_regime import merge_strategy_risk
 from auth_manager import auth_manager
 from stock_selector import StockSelector
 from stock_selection_presets import get_preset, list_presets
@@ -204,6 +206,64 @@ def _get_index_ma_ok(index_code: str, period: int) -> bool:
         with _index_ma_cache_lock:
             _index_ma_cache[key] = (None, None, time.time())
         return True
+
+
+def _stock_minute_range_box(
+    bars: list,
+    current_price: float,
+    lookback_minutes: int,
+) -> Optional[tuple]:
+    """
+    최근 N개 1분봉(내부 누적) 기준 고저 박스.
+    반환: (high, low, range_ratio) 또는 None. range_ratio = (high-low)/current_price.
+    """
+    if not bars or current_price <= 0:
+        return None
+    try:
+        n = max(2, min(120, int(lookback_minutes or 20)))
+        if len(bars) < n:
+            return None
+        window = bars[-n:]
+        hi = max(float(b.get("h") or 0) for b in window)
+        lo = min(float(b.get("l") or 0) for b in window)
+        if hi <= 0 or lo < 0 or hi < lo:
+            return None
+        rr = (hi - lo) / float(current_price)
+        return (hi, lo, rr)
+    except Exception:
+        return None
+
+
+def _mr_buy_signal_ok(state, stock_code: str, current_price: float, bars: list) -> bool:
+    """
+    듀얼 레짐: 분봉 박스가 좁고(횡보), 현재가가 박스 하단부일 때 역추세(MR) 매수 후보.
+    index_ma_code/period는 지수 MA와 동일 소스(_get_index_ma_ok) 사용.
+    """
+    if not bool(getattr(state, "regime_dual_switch_enabled", False)):
+        return False
+    if not bool(getattr(state, "regime_mr_buy_enabled", False)):
+        return False
+    lb = max(2, min(120, int(getattr(state, "regime_stock_range_lookback_minutes", 15) or 15)))
+    max_rr = float(getattr(state, "regime_stock_range_max_ratio", 0.0065) or 0.0065)
+    box = _stock_minute_range_box(bars, float(current_price), lb)
+    if box is None:
+        return False
+    hi, lo, rr = box
+    if rr >= max_rr:
+        return False
+    if hi <= lo:
+        return False
+    zone = float(getattr(state, "regime_mr_max_zone_pct", 0.32) or 0.32)
+    zone = max(0.01, min(0.98, zone))
+    pos = (float(current_price) - lo) / (hi - lo)
+    if pos > zone:
+        return False
+    if bool(getattr(state, "regime_mr_require_index_bull", True)):
+        idx_code = str(getattr(state, "index_ma_code", "1001") or "1001")
+        idx_period = max(5, min(60, int(getattr(state, "index_ma_period", 20) or 20)))
+        if not _get_index_ma_ok(idx_code, idx_period):
+            return False
+    return True
 
 
 def _get_exchange_circuit_breaker_risk(
@@ -569,6 +629,206 @@ def _get_trade_value_concentration_ok(
         return True
 
 
+def _build_risk_config_dict_from_rm() -> dict:
+    """RiskManager에서 RiskConfig 키와 동일한 dict 생성 (통합 레짐 베이스)."""
+    rm = getattr(state, "risk_manager", None)
+    if not rm:
+        return {}
+    out: Dict[str, Any] = {}
+    try:
+        for k in RiskConfig.model_fields:
+            if hasattr(rm, k):
+                out[k] = getattr(rm, k)
+    except Exception:
+        pass
+    return out
+
+
+def _compute_unified_regime_label(ur: UnifiedRegimeSwitchConfig) -> str:
+    """지수 MA·상승비율·지수 변동률·거래대금 집중으로 trend | range | neutral."""
+    idx_code = str(getattr(ur, "index_ma_code", "1001") or "1001")
+    idx_period = max(5, min(60, int(getattr(state, "index_ma_period", 20) or 20)))
+    t_score = 0.0
+    r_score = 0.0
+    try:
+        idx_bull = _get_index_ma_ok(idx_code, idx_period)
+    except Exception:
+        idx_bull = True
+    if bool(getattr(ur, "trend_require_index_bull", True)):
+        if idx_bull:
+            t_score += 2.0
+        else:
+            r_score += 2.0
+    else:
+        if idx_bull:
+            t_score += 1.0
+    mkt_adv = str(getattr(ur, "advance_ratio_market", "1001") or "1001")
+    try:
+        ratio = _get_advance_ratio(mkt_adv)
+    except Exception:
+        ratio = None
+    if ratio is not None:
+        tr_min = float(getattr(ur, "trend_min_advance_ratio", 0.48) or 0.48)
+        rg_max = float(getattr(ur, "range_max_advance_ratio", 0.46) or 0.46)
+        if ratio >= tr_min:
+            t_score += 2.0
+        elif ratio <= rg_max:
+            r_score += 2.0
+    mkt_cb = str(getattr(ur, "circuit_breaker_market_for_vol", "0001") or "0001")
+    try:
+        _, chg = _get_exchange_circuit_breaker_risk(mkt_cb, -20.0)
+    except Exception:
+        chg = None
+    if chg is not None:
+        abs_c = abs(float(chg))
+        v_trend = float(getattr(ur, "volatility_index_change_trend_min", 0.12) or 0.12)
+        v_range = float(getattr(ur, "volatility_index_change_range_max", 0.35) or 0.35)
+        if abs_c >= v_trend:
+            t_score += 1.0
+        if abs_c <= v_range:
+            r_score += 1.0
+    if bool(getattr(ur, "concentration_implies_range", True)):
+        try:
+            mkt_c = str(getattr(ur, "trade_value_concentration_market", "1001") or "1001")
+            top_n = max(2, min(20, int(getattr(state, "trade_value_concentration_top_n", 10) or 10)))
+            denom_n = max(top_n + 1, min(50, int(getattr(state, "trade_value_concentration_denom_n", 30) or 30)))
+            max_pct = float(getattr(state, "trade_value_concentration_max_pct", 45.0) or 45.0)
+            conc_ok = _get_trade_value_concentration_ok(mkt_c, top_n, denom_n, max_pct)
+            if not conc_ok:
+                r_score += 2.0
+            else:
+                t_score += 0.5
+        except Exception:
+            pass
+    margin = float(getattr(ur, "decision_margin", 0.8) or 0.8)
+    if t_score >= r_score + margin:
+        return "trend"
+    if r_score >= t_score + margin:
+        return "range"
+    return "neutral"
+
+
+def _apply_unified_regime_merged_overlay() -> bool:
+    """베이스 전략/리스크 + 현재 라벨 프로필을 state에 적용 (스냅샷은 유지)."""
+    snap = getattr(state, "_strategy_config_snapshot", None) or {}
+    ur_raw = snap.get("unified_regime") or {}
+    if not ur_raw.get("enabled"):
+        return False
+    base_s = getattr(state, "_unified_regime_base_strategy", None) or {}
+    base_r = getattr(state, "_unified_regime_base_risk", None) or {}
+    if not base_s or not base_r:
+        return False
+    try:
+        ur = UnifiedRegimeSwitchConfig.model_validate(ur_raw)
+    except Exception as e:
+        logger.warning("unified_regime overlay validate: %s", e)
+        return False
+    label = str(getattr(state, "unified_regime_active_label", "neutral") or "neutral")
+    prof_map = {"trend": ur.profile_trend, "range": ur.profile_range, "neutral": ur.profile_neutral}
+    prof = prof_map.get(label, ur.profile_neutral)
+    ms, mr = merge_strategy_risk(base_s, base_r, prof.strategy, prof.risk)
+    full_sc = {**ms, "unified_regime": ur.model_dump()}
+    try:
+        sc = StrategyConfig.model_validate(full_sc)
+    except Exception as e:
+        logger.warning("unified regime StrategyConfig merge failed: %s", e)
+        return False
+    _apply_strategy_config_to_state(sc, update_unified_snapshot=False)
+    _apply_risk_config_dict_to_state(mr, update_unified_risk_base=False)
+    return True
+
+
+def _sync_unified_regime_label_from_market_and_apply() -> None:
+    """저장/로드 직후: 시장 기준 라벨 산출 후 오버레이 적용."""
+    snap = getattr(state, "_strategy_config_snapshot", None) or {}
+    ur_raw = snap.get("unified_regime") or {}
+    if not ur_raw.get("enabled"):
+        return
+    if not getattr(state, "_unified_regime_base_strategy", None):
+        return
+    if not getattr(state, "_unified_regime_base_risk", None):
+        state._unified_regime_base_risk = _build_risk_config_dict_from_rm()
+    if not state._unified_regime_base_risk:
+        return
+    try:
+        ur = UnifiedRegimeSwitchConfig.model_validate(ur_raw)
+    except Exception as e:
+        logger.warning("unified_regime sync validate: %s", e)
+        return
+    raw = _compute_unified_regime_label(ur)
+    state.unified_regime_active_label = str(raw)
+    state._unified_regime_pending_label = None
+    state._unified_regime_pending_streak = 0
+    _apply_unified_regime_merged_overlay()
+
+
+async def _sync_unified_regime_periodic() -> None:
+    """실행 중 주기 평가 + 히스테리시스 후 라벨 변경 시 오버레이."""
+    snap = getattr(state, "_strategy_config_snapshot", None) or {}
+    ur_raw = snap.get("unified_regime") or {}
+    if not ur_raw.get("enabled") or not getattr(state, "is_running", False):
+        return
+    try:
+        ur = UnifiedRegimeSwitchConfig.model_validate(ur_raw)
+    except Exception:
+        return
+    interval = max(15.0, min(600.0, float(getattr(ur, "eval_interval_sec", 60) or 60)))
+    now = time.time()
+    last = float(getattr(state, "_unified_regime_last_eval_ts", 0.0) or 0.0)
+    if now - last < interval:
+        return
+    if not getattr(state, "_unified_regime_base_strategy", None) or not getattr(state, "_unified_regime_base_risk", None):
+        return
+    state._unified_regime_last_eval_ts = now
+    raw = await asyncio.to_thread(_compute_unified_regime_label, ur)
+    raw = str(raw or "neutral")
+    stable = str(getattr(state, "unified_regime_active_label", "neutral") or "neutral")
+    need = max(1, min(10, int(getattr(ur, "hysteresis_streak", 2) or 2)))
+    if raw == stable:
+        state._unified_regime_pending_label = None
+        state._unified_regime_pending_streak = 0
+        return
+    pend = getattr(state, "_unified_regime_pending_label", None)
+    streak = int(getattr(state, "_unified_regime_pending_streak", 0) or 0)
+    if pend == raw:
+        streak += 1
+    else:
+        pend = raw
+        streak = 1
+    state._unified_regime_pending_label = pend
+    state._unified_regime_pending_streak = streak
+    if streak < need:
+        return
+    prev = stable
+    state.unified_regime_active_label = pend
+    state._unified_regime_pending_label = None
+    state._unified_regime_pending_streak = 0
+    if _apply_unified_regime_merged_overlay():
+        try:
+            await state.broadcast({
+                "type": "log",
+                "level": "info",
+                "message": f"통합 레짐 전환: {prev} → {state.unified_regime_active_label} (관측={raw})",
+            })
+        except Exception:
+            pass
+        try:
+            system_log_append("info", f"통합 레짐 전환: {prev} → {state.unified_regime_active_label}")
+        except Exception:
+            pass
+        await send_status_update()
+
+
+def _unified_regime_status_payload() -> dict:
+    snap = getattr(state, "_strategy_config_snapshot", None) or {}
+    ur = snap.get("unified_regime") or {}
+    return {
+        "unified_regime_enabled": bool(ur.get("enabled")),
+        "unified_regime_label": getattr(state, "unified_regime_active_label", "neutral") or "neutral",
+        "unified_regime_last_eval_ts": float(getattr(state, "_unified_regime_last_eval_ts", 0.0) or 0.0),
+    }
+
+
 def _get_atr_ratio_from_minute_bars(bars: list, current_price: float, period: int = 14) -> Optional[float]:
     """
     분봉 리스트에서 ATR(period) 계산 후 현재가 대비 비율 반환. bars는 [{"m", "o","h","l","c"}, ...] 시간순.
@@ -662,36 +922,75 @@ def _pick_first(row: dict, keys: list):
 
 
 def _extract_exec_from_ccld_df(df, fallback_qty: int, fallback_px: float) -> dict:
-    """체결조회 output1에서 체결수량/가격을 최대한 안전하게 추정."""
+    """체결조회 output1에서 체결수량/가격을 최대한 안전하게 추정.
+
+    한국투자 일별체결조회는 동일 주문(ODNO)에 대해 행별 `CCLD_QTY`(분할체결 1건)와
+    주문 누적 `TOT_CCLD_QTY`가 함께 올 수 있다. 첫 행의 `CCLD_QTY`만 보면 1주로
+    착각하는 경우가 있어, 누적 합계 필드를 우선하고 없으면 행별 체결량을 합산한다.
+    """
+    qty_keys_total = [
+        "TOT_CCLD_QTY",
+        "tot_ccld_qty",
+        "CCLD_QTY_TOT",
+        "ccld_qty_tot",
+    ]
+    qty_keys_line = ["CCLD_QTY", "ccld_qty"]
+    px_keys = [
+        "CCLD_UNPR",
+        "ccld_unpr",
+        "CCLD_PRC",
+        "ccld_prc",
+        "AVG_PRC",
+        "avg_prc",
+        "AVG_UNPR",
+        "avg_unpr",
+        "ORD_UNPR",
+        "ord_unpr",
+    ]
     try:
         if df is None or getattr(df, "empty", True):
             return {"qty": int(fallback_qty or 0), "px": float(fallback_px or 0.0), "fields": {}}
-        row = {}
-        try:
-            row = df.iloc[0].to_dict()
-        except Exception:
-            row = {}
+        rows: list = []
+        for i in range(len(df)):
+            try:
+                rows.append(df.iloc[i].to_dict())
+            except Exception:
+                pass
+        if not rows:
+            return {"qty": int(fallback_qty or 0), "px": float(fallback_px or 0.0), "fields": {}}
+        row0 = rows[0]
 
-        qty_raw = _pick_first(row, [
-            "CCLD_QTY", "ccld_qty",
-            "TOT_CCLD_QTY", "tot_ccld_qty",
-            "CCLD_QTY_TOT", "ccld_qty_tot",
-            "ORD_QTY", "ord_qty",
-        ])
-        px_raw = _pick_first(row, [
-            "CCLD_UNPR", "ccld_unpr",
-            "CCLD_PRC", "ccld_prc",
-            "AVG_PRC", "avg_prc",
-            "AVG_UNPR", "avg_unpr",
-            "ORD_UNPR", "ord_unpr",
-        ])
-        qty = _to_int(qty_raw, int(fallback_qty or 0))
-        px = _to_float(px_raw, float(fallback_px or 0.0))
-        if qty <= 0:
-            qty = int(fallback_qty or 0)
-        if px <= 0:
-            px = float(fallback_px or 0.0)
-        return {"qty": int(qty), "px": float(px), "fields": row, "columns": list(df.columns)}
+        tot_qty = _to_int(_pick_first(row0, qty_keys_total), 0)
+        if tot_qty > 0:
+            qty = tot_qty
+            px = _to_float(_pick_first(row0, px_keys), float(fallback_px or 0.0))
+            if px <= 0:
+                px = float(fallback_px or 0.0)
+            return {"qty": int(qty), "px": float(px), "fields": row0, "columns": list(df.columns)}
+
+        sum_q = 0
+        w_px = 0.0
+        for r in rows:
+            cq = _to_int(_pick_first(r, qty_keys_line), 0)
+            pq = _to_float(_pick_first(r, px_keys), 0.0)
+            if cq > 0 and pq > 0:
+                sum_q += cq
+                w_px += cq * pq
+        if sum_q > 0:
+            qty = sum_q
+            px = w_px / sum_q
+        else:
+            qty_raw = _pick_first(
+                row0,
+                qty_keys_line + ["ORD_QTY", "ord_qty"],
+            )
+            qty = _to_int(qty_raw, int(fallback_qty or 0))
+            px = _to_float(_pick_first(row0, px_keys), float(fallback_px or 0.0))
+            if qty <= 0:
+                qty = int(fallback_qty or 0)
+            if px <= 0:
+                px = float(fallback_px or 0.0)
+        return {"qty": int(qty), "px": float(px), "fields": row0, "columns": list(df.columns)}
     except Exception:
         return {"qty": int(fallback_qty or 0), "px": float(fallback_px or 0.0), "fields": {}}
 
@@ -1161,6 +1460,11 @@ async def _pending_order_reconciler_loop():
                     logger.warning("advance_ratio 로그 오류(무시): %s", e)
 
             try:
+                await _sync_unified_regime_periodic()
+            except Exception as e:
+                logger.warning("통합 레짐 주기 평가 오류(무시): %s", e)
+
+            try:
                 events = await asyncio.to_thread(
                     _reconcile_pending_orders_sync,
                     max_per_run,
@@ -1337,7 +1641,7 @@ def _throttled_skip_log(stock_code: str, reason: str, *, ttl_sec: int = 30):
         return
 
 
-def _apply_risk_config_dict_to_state(d: dict) -> None:
+def _apply_risk_config_dict_to_state(d: dict, update_unified_risk_base: bool = True) -> None:
     """DB에서 불러온 risk_config 딕셔너리를 state.risk_manager에 반영 (폼·DB·실행값 일치)."""
     if not d or not getattr(state, "risk_manager", None):
         return
@@ -1442,6 +1746,11 @@ def _apply_risk_config_dict_to_state(d: dict) -> None:
             rm.expand_position_when_few_stocks = bool(d.get("expand_position_when_few_stocks", True))
         if "daily_max_buy_amount_krw" in d:
             rm.daily_max_buy_amount_krw = max(0, int(d.get("daily_max_buy_amount_krw") or 0))
+        if update_unified_risk_base:
+            try:
+                state._unified_regime_base_risk = dict(d)
+            except Exception:
+                pass
     except Exception as e:
         logger.warning(f"저장된 리스크 설정 적용 중 오류(무시): {e}")
 
@@ -1485,8 +1794,9 @@ def _apply_operational_config_dict_to_state(d: dict) -> None:
         logger.warning(f"저장된 운영 옵션 적용 중 오류(무시): {e}")
 
 
-def _apply_strategy_config_to_state(config: "StrategyConfig") -> None:
-    """StrategyConfig를 state 및 state.strategy에 반영. POST /api/config/strategy와 DB 로드 시 공통 사용."""
+def _apply_strategy_config_to_state(config: "StrategyConfig", update_unified_snapshot: bool = True) -> None:
+    """StrategyConfig를 state 및 state.strategy에 반영. POST /api/config/strategy와 DB 로드 시 공통 사용.
+    update_unified_snapshot=False: 통합 레짐 런타임 오버레이 적용 시 베이스 스냅샷은 유지."""
     if getattr(state, "strategy", None):
         short_period = int(config.short_ma_period)
         long_period = int(config.long_ma_period)
@@ -1590,6 +1900,25 @@ def _apply_strategy_config_to_state(config: "StrategyConfig") -> None:
     state.last_minutes_no_buy = max(0, min(60, int(getattr(config, "last_minutes_no_buy", 0) or 0)))
     state.advance_ratio_down_market_skip = bool(getattr(config, "advance_ratio_down_market_skip", True))
     state.skip_buy_below_high_pct = max(0.0, min(0.20, float(getattr(config, "skip_buy_below_high_pct", 0.0) or 0.0)))
+    state.regime_dual_switch_enabled = bool(getattr(config, "regime_dual_switch_enabled", getattr(state, "regime_dual_switch_enabled", True)))
+    state.regime_block_ma_buy_when_index_bear = bool(
+        getattr(config, "regime_block_ma_buy_when_index_bear", getattr(state, "regime_block_ma_buy_when_index_bear", True))
+    )
+    state.regime_block_ma_buy_when_stock_range = bool(
+        getattr(config, "regime_block_ma_buy_when_stock_range", getattr(state, "regime_block_ma_buy_when_stock_range", True))
+    )
+    state.regime_stock_range_lookback_minutes = max(2, min(120, int(getattr(config, "regime_stock_range_lookback_minutes", 15) or 15)))
+    state.regime_stock_range_max_ratio = max(0.0005, min(0.05, float(getattr(config, "regime_stock_range_max_ratio", 0.0065) or 0.0065)))
+    state.regime_mr_buy_enabled = bool(getattr(config, "regime_mr_buy_enabled", getattr(state, "regime_mr_buy_enabled", False)))
+    state.regime_mr_max_zone_pct = max(0.01, min(0.98, float(getattr(config, "regime_mr_max_zone_pct", 0.32) or 0.32)))
+    state.regime_mr_require_index_bull = bool(getattr(config, "regime_mr_require_index_bull", getattr(state, "regime_mr_require_index_bull", True)))
+    if update_unified_snapshot:
+        try:
+            cfg_dump = config.model_dump()
+            state._strategy_config_snapshot = cfg_dump
+            state._unified_regime_base_strategy = {k: v for k, v in cfg_dump.items() if k != "unified_regime"}
+        except Exception:
+            pass
 
 
 def _apply_strategy_config_dict_to_state(d: dict) -> None:
@@ -2298,19 +2627,23 @@ def _handle_signal(
             _run_async_broadcast({"type": "signal_pending", "data": created})
         return
 
-    # 매도 시: 진입 후 최소 보유 시간 이내면 스킵 (손절/익절/데드크로스 모두 적용. 시간청산·일일한도·긴급청산은 예외)
+    # 매도 시: 진입 후 최소 보유 시간 이내면 스킵 — 전략(데드크로스 등)만 지연. 리스크 청산(sell_trigger_code risk_*)은 최소보유를 우회.
     if signal == "sell" and state.risk_manager and stock_code in state.risk_manager.positions and state.strategy:
         min_hold = int(getattr(state.strategy, "min_hold_seconds", 0) or 0)
         if min_hold > 0:
-            r = (reason or "")
-            bypass = "시간기반" in r or "시간 청산" in r or "일일 이익 한도" in r or "일일 손실 한도" in r or "긴급 청산" in r or "서킷브레이커" in r or "사이드카" in r or "수동 청산" in r
-            if not bypass:
-                pos = state.risk_manager.positions.get(stock_code)
-                buy_time = pos.get("buy_time") if pos else None
-                if isinstance(buy_time, datetime):
-                    elapsed = (datetime.now() - buy_time).total_seconds()
-                    if elapsed < min_hold:
-                        return
+            stc_kw = (sell_trigger_code or "").strip()
+            if stc_kw.startswith("risk_"):
+                pass
+            else:
+                r = (reason or "")
+                bypass = "시간기반" in r or "시간 청산" in r or "일일 이익 한도" in r or "일일 손실 한도" in r or "긴급 청산" in r or "서킷브레이커" in r or "사이드카" in r or "수동 청산" in r
+                if not bypass:
+                    pos = state.risk_manager.positions.get(stock_code)
+                    buy_time = pos.get("buy_time") if pos else None
+                    if isinstance(buy_time, datetime):
+                        elapsed = (datetime.now() - buy_time).total_seconds()
+                        if elapsed < min_hold:
+                            return
 
     _stc_kw = None
     if str(signal).lower() == "sell":
@@ -3011,13 +3344,63 @@ def _start_trading_engine_thread():
                                 short_ma = state.strategy.calculate_ma(stock_code, state.strategy.short_ma_period)
                                 long_ma = state.strategy.calculate_ma(stock_code, state.strategy.long_ma_period)
                                 signal_type = None
+                                buy_signal_reason = "이동평균 크로스 조건 충족"
                                 if (
                                     stock_code in state.strategy.price_history
                                     and len(state.strategy.price_history[stock_code]) >= state.strategy.min_history_length
                                     and short_ma is not None
                                     and long_ma is not None
                                 ):
-                                    if short_ma > long_ma and current_price > short_ma and stock_code not in state.risk_manager.positions and stock_code in (state.selected_stocks or []):
+                                    bars = (getattr(state, "_minute_bars", {}) or {}).get(stock_code) or []
+                                    ma_buy_candidate = bool(short_ma > long_ma and current_price > short_ma)
+                                    mr_buy_candidate = False
+                                    if bool(getattr(state, "regime_dual_switch_enabled", False)) and bool(
+                                        getattr(state, "regime_mr_buy_enabled", False)
+                                    ):
+                                        try:
+                                            mr_buy_candidate = _mr_buy_signal_ok(state, stock_code, current_price, bars)
+                                        except Exception:
+                                            mr_buy_candidate = False
+                                    if bool(getattr(state, "regime_dual_switch_enabled", False)) and ma_buy_candidate:
+                                        try:
+                                            idx_code = str(getattr(state, "index_ma_code", "1001") or "1001")
+                                            idx_period = max(5, min(60, int(getattr(state, "index_ma_period", 20) or 20)))
+                                            lb = max(2, min(120, int(getattr(state, "regime_stock_range_lookback_minutes", 15) or 15)))
+                                            max_rr = float(getattr(state, "regime_stock_range_max_ratio", 0.0065) or 0.0065)
+                                            box = _stock_minute_range_box(bars, float(current_price), lb)
+                                            is_tight = box is not None and box[2] < max_rr
+                                            if bool(getattr(state, "regime_block_ma_buy_when_index_bear", True)):
+                                                if not _get_index_ma_ok(idx_code, idx_period):
+                                                    _record_buy_skip(stock_code, "regime_index_bear")
+                                                    _throttled_skip_log(
+                                                        stock_code,
+                                                        "듀얼 레짐: 지수<N일MA → MA 추세 매수 제외",
+                                                        ttl_sec=30,
+                                                    )
+                                                    ma_buy_candidate = False
+                                            if ma_buy_candidate and bool(getattr(state, "regime_block_ma_buy_when_stock_range", True)) and is_tight:
+                                                _record_buy_skip(stock_code, "regime_stock_range")
+                                                _throttled_skip_log(
+                                                    stock_code,
+                                                    "듀얼 레짐: 종목 분봉 박스(좁음) → MA 추세 매수 제외",
+                                                    ttl_sec=30,
+                                                )
+                                                ma_buy_candidate = False
+                                        except Exception:
+                                            pass
+                                    if ma_buy_candidate and mr_buy_candidate:
+                                        mr_buy_candidate = False
+                                    entry_buy = (
+                                        (ma_buy_candidate or mr_buy_candidate)
+                                        and stock_code not in state.risk_manager.positions
+                                        and stock_code in (state.selected_stocks or [])
+                                    )
+                                    if entry_buy:
+                                        buy_signal_reason = (
+                                            "듀얼 레짐: 분봉 박스 역추세(MR) 매수"
+                                            if mr_buy_candidate and not ma_buy_candidate
+                                            else "이동평균 크로스 조건 충족"
+                                        )
                                         # 선정 종목에 있을 때만 매수. 포지션에만 있고 선정에 없는 종목(전일 잔여 등)은 매도만 허용·매수 스킵
                                         # (0-0) 재진입 쿨다운: 직전 매도 직후 같은 종목 재매수 방지(횡보장 와입 방지) — 가장 먼저 검사
                                         try:
@@ -3798,7 +4181,7 @@ def _start_trading_engine_thread():
                                             stock_code,
                                             signal_type,
                                             current_price,
-                                            "이동평균 크로스 조건 충족",
+                                            buy_signal_reason if signal_type == "buy" else "이동평균 크로스 조건 충족",
                                             sell_trigger_code=_ma_trig,
                                         )
                             except Exception:
@@ -3928,6 +4311,7 @@ async def send_status_update():
                 "stock_selection_last_error": getattr(getattr(state, "stock_selector", None), "last_error_message", "") or "",
                 "short_ma_period": state.strategy.short_ma_period if state.strategy else None,
                 "long_ma_period": state.strategy.long_ma_period if state.strategy else None,
+                **_unified_regime_status_payload(),
             }
         })
         
@@ -4336,6 +4720,7 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
             "liquidate_on_auto_stop": getattr(state, "liquidate_on_auto_stop", True),
             "auto_schedule_username": getattr(state, "auto_schedule_username", "") or "",
             "stock_selection_criteria": criteria,
+            **_unified_regime_status_payload(),
             "positions": {},
         }, headers=_STATUS_NO_CACHE)
     
@@ -4403,6 +4788,7 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
         "liquidate_on_auto_stop": getattr(state, "liquidate_on_auto_stop", True),
         "auto_schedule_username": getattr(state, "auto_schedule_username", "") or "",
         "stock_selection_criteria": criteria,
+        **_unified_regime_status_payload(),
         "positions": _build_positions_message(),
     }, headers=_STATUS_NO_CACHE)
 
@@ -4532,6 +4918,12 @@ async def _do_start_system(username: str) -> tuple:
                 _apply_risk_config_dict_to_state(saved.get("risk_config"))
                 _apply_operational_config_dict_to_state(saved.get("operational_config"))
                 _apply_strategy_config_dict_to_state(saved.get("strategy_config"))
+                try:
+                    s0 = saved.get("strategy_config")
+                    if isinstance(s0, dict) and (s0.get("unified_regime") or {}).get("enabled"):
+                        _sync_unified_regime_label_from_market_and_apply()
+                except Exception:
+                    pass
                 _apply_stock_selection_config_dict_to_state(saved.get("stock_selection_config"))
                 try:
                     # 시작 시 실제 반영된 핵심값을 시스템 로그에 남김 (커스텀(DB 저장값) 적용 확인용)
@@ -4909,7 +5301,11 @@ async def _auto_schedule_loop():
 @app.on_event("startup")
 async def _start_auto_schedule():
     """앱 기동 시 자동 스케줄 루프 시작."""
-    asyncio.create_task(_auto_schedule_loop())
+    t = asyncio.create_task(_auto_schedule_loop())
+    try:
+        state._auto_schedule_task = t
+    except Exception:
+        pass
     logger.info("자동 스케줄 루프 시작 (매일 auto_start_hhmm/auto_stop_hhmm 적용)")
 
 
@@ -4925,7 +5321,14 @@ async def _dashboard_lifecycle_startup_log():
 
 @app.on_event("shutdown")
 async def _dashboard_http_shutdown_event():
-    """Uvicorn 정상 종료 시 system_*.log에 흔적 남김."""
+    """Uvicorn 종료: 백그라운드 태스크 취소 후 정상 shutdown 로그."""
+    for attr in ("pending_order_reconciler_task", "_auto_schedule_task"):
+        try:
+            t = getattr(state, attr, None)
+            if t is not None and hasattr(t, "done") and not t.done() and hasattr(t, "cancel"):
+                t.cancel()
+        except Exception:
+            pass
     try:
         _record_dashboard_http_shutdown_graceful()
     except Exception:
@@ -6245,6 +6648,16 @@ async def update_risk_config(config: RiskConfig, current_user: str = Depends(get
         except Exception:
             pass
 
+        try:
+            state._unified_regime_base_risk = config.model_dump()
+        except Exception:
+            pass
+        try:
+            if (getattr(state, "_strategy_config_snapshot", None) or {}).get("unified_regime", {}).get("enabled"):
+                _sync_unified_regime_label_from_market_and_apply()
+        except Exception:
+            pass
+
         await state.broadcast({"type": "log", "message": "리스크 설정이 업데이트되었습니다.", "level": "info"})
         try:
             audit_log(current_user, "config_save", {"section": "risk"})
@@ -6273,6 +6686,13 @@ async def update_strategy_config(config: StrategyConfig, current_user: str = Dep
             return JSONResponse({"success": False, "message": "단기 이동평균은 장기 이동평균보다 작아야 합니다."})
 
         _apply_strategy_config_to_state(config)
+        try:
+            if getattr(config.unified_regime, "enabled", False):
+                _sync_unified_regime_label_from_market_and_apply()
+            else:
+                state.unified_regime_active_label = "neutral"
+        except Exception:
+            pass
 
         store = _get_user_settings_store()
         persisted = False
@@ -6458,6 +6878,12 @@ async def get_user_settings(current_user: str = Depends(get_current_user)):
     _apply_risk_config_dict_to_state(settings.get("risk_config"))
     _apply_operational_config_dict_to_state(settings.get("operational_config"))
     _apply_strategy_config_dict_to_state(settings.get("strategy_config"))
+    try:
+        sc0 = settings.get("strategy_config")
+        if isinstance(sc0, dict) and (sc0.get("unified_regime") or {}).get("enabled"):
+            _sync_unified_regime_label_from_market_and_apply()
+    except Exception:
+        pass
     if settings.get("stock_selection_config"):
         try:
             _apply_stock_selection_config_dict_to_state(settings.get("stock_selection_config"))

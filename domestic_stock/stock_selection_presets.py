@@ -114,6 +114,62 @@ PRESET_SCALP_MORNING = {
 }
 
 # ============================================================================
+# 오후 단타용 기준 (12~15:20 운용)
+# ============================================================================
+
+PRESET_SCALP_AFTERNOON = {
+    "name": "오후 단타(12~15:20) 추천",
+    "description": "장중 이후 유동성·당일 고점 대비 하락 필터 강화(오전 단타보다 완화된 장초 제약)",
+    "min_price_change_ratio": 0.01,
+    "max_price_change_ratio": 0.12,
+    "min_price": 1000,
+    "max_price": 50000,
+    "min_volume": 100000,
+    "min_trade_amount": 2000000000,
+    "max_stocks": 12,
+    "exclude_risk_stocks": True,
+    "market_open_hhmm": "09:00",
+    "warmup_minutes": 0,
+    "early_strict": False,
+    "early_strict_minutes": 30,
+    "early_min_volume": 150000,
+    "early_min_trade_amount": 3000000000,
+    "exclude_drawdown": True,
+    "max_drawdown_from_high_ratio": 0.10,
+    "drawdown_filter_after_hhmm": "12:00",
+    "kospi_only": False,
+}
+
+# ============================================================================
+# 오전 상승장 보수 (소수 종목 1~3, 코스피·유동성·워밍업 후 선정)
+# ============================================================================
+
+PRESET_MORNING_UPTREND_CONSERVATIVE = {
+    "name": "오전 상승장 보수(1~3종)",
+    "description": "코스피·거래대금 우선·장초 10분 워밍업 후 선정. 최대 3종 집중. 단타 휩쏘 완화용.",
+    "min_price_change_ratio": 0.02,
+    "max_price_change_ratio": 0.08,
+    "min_price": 5000,
+    "max_price": 100000,
+    "min_volume": 300000,
+    "min_trade_amount": 8000000000,
+    "max_stocks": 3,
+    "exclude_risk_stocks": True,
+    "sort_by": "trade_amount",
+    "prev_day_rank_pool_size": 80,
+    "market_open_hhmm": "09:00",
+    "warmup_minutes": 10,
+    "early_strict": True,
+    "early_strict_minutes": 30,
+    "early_min_volume": 250000,
+    "early_min_trade_amount": 10000000000,
+    "exclude_drawdown": True,
+    "max_drawdown_from_high_ratio": 0.08,
+    "drawdown_filter_after_hhmm": "10:30",
+    "kospi_only": True,
+}
+
+# ============================================================================
 # 프리셋 딕셔너리
 # ============================================================================
 
@@ -123,6 +179,8 @@ PRESETS = {
     "aggressive": PRESET_AGGRESSIVE,
     "beginner": PRESET_BEGINNER,
     "scalp_morning": PRESET_SCALP_MORNING,
+    "scalp_afternoon": PRESET_SCALP_AFTERNOON,
+    "morning_uptrend_conservative": PRESET_MORNING_UPTREND_CONSERVATIVE,
 }
 
 def get_preset(preset_name: str) -> Dict:

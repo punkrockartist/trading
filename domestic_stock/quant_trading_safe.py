@@ -740,6 +740,8 @@ class RiskManager:
     def check_exit_signal(self, stock_code: str, current_price: float) -> Optional[Dict]:
         """
         포지션 청산/부분익절/보호 로직을 통합해서 판단.
+        손절/전량익절: 비율과 ATR이 모두 켜져 있으면 더 타이트한 쪽(손절=가격 높은 선,
+        익절=목표가 낮은 선)을 적용. trigger_code는 실제로 적용된 규칙(비율 또는 ATR).
         Returns:
             {"action":"sell","quantity":int,"reason":str,"trigger_code":str} or None
             trigger_code는 quant_dashboard_api 의 매도 로그·trade_info와 1:1 매핑용.
@@ -762,7 +764,11 @@ class RiskManager:
             effective_buy = buy_price
         change_ratio = (float(current_price) - effective_buy) / effective_buy if effective_buy > 0 else 0.0
 
-        # ATR(틱 변동성) 배수 손절/익절
+        # 비율 손절/익절 + ATR 손절/익절: 각각 유효할 때 더 타이트한 쪽(손절=높은 가격, 익절=낮은 목표가)을 적용
+        min_stop_pct = 0.002
+        min_take_pct = 0.002
+        atr_stop_price: Optional[float] = None
+        atr_take_price: Optional[float] = None
         use_atr = bool(getattr(self, "use_atr_for_stop_take", False))
         if use_atr and hasattr(self, "get_intraday_vol_ratio"):
             lookback = max(2, min(300, int(getattr(self, "atr_lookback_ticks", 20) or 20)))
@@ -771,31 +777,30 @@ class RiskManager:
                 atr_proxy = float(vol_ratio) * float(effective_buy)
                 stop_mult = max(0.5, min(5.0, float(getattr(self, "atr_stop_mult", 1.5) or 1.5)))
                 take_mult = max(0.5, min(10.0, float(getattr(self, "atr_take_mult", 2.0) or 2.0)))
-                stop_price = effective_buy - stop_mult * atr_proxy
-                take_price = effective_buy + take_mult * atr_proxy
-                # 진입 직후 변동성이 작으면 손절선이 매수가에 붙어 즉시 터지는 것 방지: 손절선이 매수가의 0.2% 미만 아래면 인정
-                min_stop_pct = 0.002
-                if stop_price < effective_buy * (1.0 - min_stop_pct) and float(current_price) <= stop_price:
-                    return {
-                        "action": "sell",
-                        "quantity": qty,
-                        "reason": "손절(ATR)",
-                        "trigger_code": "risk_atr_stop_loss",
-                    }
-                min_take_pct = 0.002
-                if take_price > effective_buy * (1.0 + min_take_pct) and float(current_price) >= take_price:
-                    return {
-                        "action": "sell",
-                        "quantity": qty,
-                        "reason": "익절(ATR)",
-                        "trigger_code": "risk_atr_take_profit",
-                    }
-            else:
-                use_atr = False
-        if not use_atr:
-            # 손절 (비율)
-            if self.stop_loss_ratio and change_ratio <= -float(self.stop_loss_ratio):
-                return {"action": "sell", "quantity": qty, "reason": "손절", "trigger_code": "risk_stop_loss_ratio"}
+                cand_stop = effective_buy - stop_mult * atr_proxy
+                cand_take = effective_buy + take_mult * atr_proxy
+                # 진입 직후 변동성이 작으면 손절선이 매수가에 붙어 즉시 터지는 것 방지
+                if cand_stop < effective_buy * (1.0 - min_stop_pct):
+                    atr_stop_price = cand_stop
+                if cand_take > effective_buy * (1.0 + min_take_pct):
+                    atr_take_price = cand_take
+
+        ratio_stop_price: Optional[float] = None
+        if self.stop_loss_ratio and float(self.stop_loss_ratio) > 0:
+            ratio_stop_price = effective_buy * (1.0 - float(self.stop_loss_ratio))
+
+        stop_candidates: list[tuple[float, str, str]] = []
+        if ratio_stop_price is not None:
+            stop_candidates.append((ratio_stop_price, "risk_stop_loss_ratio", "손절"))
+        if atr_stop_price is not None:
+            stop_candidates.append((atr_stop_price, "risk_atr_stop_loss", "손절(ATR)"))
+        if stop_candidates:
+            # 아래로 내려갈 때 먼저 걸리는 선 = 손절가가 더 높은 쪽(허용 손실이 더 작은 쪽)
+            sp, tcode, rsn = max(stop_candidates, key=lambda x: x[0])
+            if float(current_price) <= sp:
+                if len(stop_candidates) > 1:
+                    rsn = "손절(비율·ATR 중 타이트)"
+                return {"action": "sell", "quantity": qty, "reason": rsn, "trigger_code": tcode}
 
         # 부분 익절
         try:
@@ -816,9 +821,21 @@ class RiskManager:
         except Exception:
             pass
 
-        # 익절(전량) — ATR 모드가 아닐 때만 비율 적용
-        if not use_atr and self.take_profit_ratio and change_ratio >= float(self.take_profit_ratio):
-            return {"action": "sell", "quantity": qty, "reason": "익절", "trigger_code": "risk_take_profit_ratio"}
+        # 익절(전량) — 비율·ATR 중 더 낮은 목표가(먼저 도달)를 적용
+        ratio_take_price: Optional[float] = None
+        if self.take_profit_ratio and float(self.take_profit_ratio) > 0:
+            ratio_take_price = effective_buy * (1.0 + float(self.take_profit_ratio))
+        take_candidates: list[tuple[float, str, str]] = []
+        if ratio_take_price is not None:
+            take_candidates.append((ratio_take_price, "risk_take_profit_ratio", "익절"))
+        if atr_take_price is not None:
+            take_candidates.append((atr_take_price, "risk_atr_take_profit", "익절(ATR)"))
+        if take_candidates:
+            tp, tcode, rsn = min(take_candidates, key=lambda x: x[0])
+            if float(current_price) >= tp:
+                if len(take_candidates) > 1:
+                    rsn = "익절(비율·ATR 중 타이트)"
+                return {"action": "sell", "quantity": qty, "reason": rsn, "trigger_code": tcode}
 
         # 트레일링 스탑
         try:

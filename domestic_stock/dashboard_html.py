@@ -1033,6 +1033,7 @@ def get_dashboard_html(username: str) -> str:
                     <h2>추천 프리셋</h2>
                     <div class="hint">
                         리스크·전략·종목선정을 한 번에 적용합니다. 용도에 맞는 프리셋을 선택한 뒤 적용하세요.
+                        <strong>오전 상승장 보수(1~3종)</strong>: 코스피·소수 종목·지수/상승비율/통합 레짐으로 장세 필터를 강하게 건 뒤 오전 매수창만 사용합니다(전역 설정, 종목별 번들 없음).
                     </div>
                     <div class="form-group">
                         <label>프리셋 선택:</label>
@@ -1046,9 +1047,11 @@ def get_dashboard_html(username: str) -> str:
                                 <option value="4">커스텀4</option>
                                 <option value="5">커스텀5</option>
                                 <option value="scalp_morning">오전 단타(9~12)</option>
+                                <option value="scalp_afternoon">오후 단타(12~15:20)</option>
                                 <option value="scalp_fullday">전일 단타(오전~오후)</option>
                                 <option value="scalp_conservative">보수적 단타</option>
                                 <option value="scalp_aggressive">공격적 단타</option>
+                                <option value="morning_uptrend">오전 상승장 보수(1~3종)</option>
                             </select>
                             <button type="button" class="btn" onclick="applyRecommendedPreset()" style="padding:6px 14px; font-size:0.9rem; width:auto; flex-shrink:0;">프리셋 적용</button>
                             <button type="button" class="btn btn-primary" id="btn_save_to_slot" onclick="saveToSelectedSlot()" style="padding:6px 14px; font-size:0.9rem; display:none;" title="선택한 커스텀 슬롯(1~5)에 현재 설정 저장">선택 슬롯에 저장</button>
@@ -1361,8 +1364,8 @@ def get_dashboard_html(username: str) -> str:
                     <h3 class="settings-block-title">매수 시간·최소 보유</h3>
                     <div class="form-group">
                         <label>진입 후 최소 보유 시간(초): <code class="setting-var">min_hold_seconds</code></label>
-                        <input type="number" id="min_hold_seconds" value="0" min="0" max="600" title="매수 직후 데드크로스로 즉시 매도되는 것 방지. 0=미적용, 30~60 권장">
-                        <span class="hint">0=미적용. 30~60초 권장(같은 가격에 매수→매도 반복 방지). 데드크로스만 틱으로 지연하려면 고급 → <strong>전략 청산·확인</strong>의 <code>dead_cross_confirm_ticks</code>를 사용하세요.</span>
+                        <input type="number" id="min_hold_seconds" value="0" min="0" max="600" title="매수 직후 데드크로스 매도만 지연. 손절·트레일링 등 risk_* 청산은 적용되지 않음. 0=미적용, 30~120 권장">
+                        <span class="hint">0=미적용. 30~120초 권장(같은 틱에서 매수→데드크로스 매도 완화). 손절/익절/ATR/트레일링은 최소보유와 무관합니다. 데드크로스만 틱으로 더 지연하려면 고급 → <strong>전략 청산·확인</strong>의 <code>dead_cross_confirm_ticks</code>를 사용하세요.</span>
                     </div>
                     <div class="form-group">
                         <label>신규 매수 허용 시작 (HH:MM, KST): <code class="setting-var">buy_window_start_hhmm</code></label>
@@ -1641,6 +1644,137 @@ def get_dashboard_html(username: str) -> str:
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="regime_dual_switch_enabled" checked>
+                                듀얼 레짐(지수 MA + 종목 분봉 박스) <code class="setting-var">regime_dual_switch_enabled</code>
+                            </label>
+                            <div class="hint">지수(N일 MA)와 종목 1분봉 박스를 함께 보면 추세 매수와 횡보(박스) 구간을 나누기 좋습니다. 켜면 아래 규칙이 MA 골든 매수에 추가로 적용됩니다.</div>
+                            <div class="hint">추천값 요약: lookback <strong>12~15</strong>(오전 단타), <strong>20</strong>(전일·오후), 박스폭 비율 <strong>0.006~0.007</strong>(0.6~0.7%). MR(박스 하단 매수)은 오전·보수 <strong>끔</strong>, 전일·오후·공격 <strong>켬</strong> 권장. 기존 <code>index_ma_filter_enabled</code>와 병행 시 지수 조건이 이중으로 걸립니다.</div>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="regime_block_ma_buy_when_index_bear" checked>
+                                지수 &lt; MA 이면 MA 추세 매수 제외 <code class="setting-var">regime_block_ma_buy_when_index_bear</code>
+                            </label>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="regime_block_ma_buy_when_stock_range" checked>
+                                종목 분봉 박스가 좁으면 MA 추세 매수 제외 <code class="setting-var">regime_block_ma_buy_when_stock_range</code>
+                            </label>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>박스 판단: 최근 N분봉 <code class="setting-var">regime_stock_range_lookback_minutes</code></label>
+                            <input type="number" id="regime_stock_range_lookback_minutes" value="15" min="2" max="120">
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>좁은 박스: (고가−저가)/현재가 &lt; 이 값 <code class="setting-var">regime_stock_range_max_ratio</code></label>
+                            <input type="number" id="regime_stock_range_max_ratio" value="0.0065" min="0.0005" max="0.05" step="0.0005">
+                            <div class="hint">예: 0.0065 ≈ 당일 분봉 고저폭이 현재가의 0.65% 미만이면 좁은 박스(횡보)로 간주. 틱 <code>min_range_ratio</code>와 역할이 다릅니다.</div>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="regime_mr_buy_enabled">
+                                박스 하단 역추세(MR) 매수 허용 <code class="setting-var">regime_mr_buy_enabled</code>
+                            </label>
+                            <div class="hint">골든크로스 없이, 좁은 박스에서 가격이 하단부일 때만 별도 매수 신호(동일 매수 필터·확인 틱 적용).</div>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>MR: 박스 내 하단 구간 (0~1) <code class="setting-var">regime_mr_max_zone_pct</code></label>
+                            <input type="number" id="regime_mr_max_zone_pct" value="0.32" min="0.01" max="0.98" step="0.01">
+                            <div class="hint">(가격−저가)/(고가−저가)가 이 값 이하일 때만 MR 매수.</div>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="regime_mr_require_index_bull" checked>
+                                MR 매수도 지수 ≥ MA 요구 <code class="setting-var">regime_mr_require_index_bull</code>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="unified_regime_enabled">
+                                통합 시장 레짐 (trend / range / neutral) <code class="setting-var">unified_regime.enabled</code>
+                            </label>
+                            <div class="hint"><strong>전역 1세트만</strong> 적용됩니다. 시장 단위로 라벨을 정하고 저장된 전략/리스크 베이스 위에 레짐별 프로필을 덮어씁니다. <strong>종목별로 다른 전략 번들을 두는 구조는 없습니다.</strong></div>
+                            <div class="hint">지수 MA·상승 비율·지수 변동률·거래대금 집중으로 라벨을 정한 뒤, 프로필(슬로프·range·ATR·확인틱·손절/트레일 등)이 합쳐집니다. 레짐별 프로필 세부는 DB/저장 JSON에서도 수정 가능합니다.</div>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>평가 주기(초) <code class="setting-var">unified_regime.eval_interval_sec</code></label>
+                            <input type="number" id="unified_regime_eval_sec" value="60" min="15" max="600">
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>전환 히스테리시스(연속 관측) <code class="setting-var">unified_regime.hysteresis_streak</code></label>
+                            <input type="number" id="unified_regime_hysteresis" value="2" min="1" max="10">
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <span>실행 중 상태: 스위치 <strong id="unified_regime_live_on">—</strong> · 라벨 <strong id="unified_regime_live_label">—</strong></span>
+                            <span class="hint" style="margin-left:8px;">(폴링/WS status)</span>
+                        </div>
+                        <details class="form-group" style="margin-left:12px;">
+                            <summary style="cursor:pointer;">라벨 산정 임계값 (고급)</summary>
+                            <div class="hint">아래는 <code>_compute_unified_regime_label</code>에 쓰는 시장 지표만 조정합니다. 지수 MA 기간은 위쪽 <code>index_ma_period</code>와 동일하게 쓰입니다.</div>
+                            <div class="form-group" style="margin-left:8px;">
+                                <label>라벨용 지수 코드 <code class="setting-var">unified_regime.index_ma_code</code></label>
+                                <select id="unified_regime_index_ma_code">
+                                    <option value="1001">코스닥(1001)</option>
+                                    <option value="0001">코스피(0001)</option>
+                                </select>
+                            </div>
+                            <div class="form-group" style="margin-left:8px;">
+                                <label style="display:flex; align-items:center; gap:8px;">
+                                    <input type="checkbox" id="unified_regime_trend_require_index_bull" checked>
+                                    추세 점수에 지수&gt;MA 필요 <code class="setting-var">trend_require_index_bull</code>
+                                </label>
+                            </div>
+                            <div class="form-group" style="margin-left:8px;">
+                                <label>상승비율 조회 시장 <code class="setting-var">advance_ratio_market</code></label>
+                                <select id="unified_regime_adv_mkt">
+                                    <option value="1001">코스닥(1001)</option>
+                                    <option value="0001">코스피(0001)</option>
+                                </select>
+                            </div>
+                            <div class="form-group" style="margin-left:8px;">
+                                <label>추세: 상승 비율 ≥ (0~1) <code class="setting-var">trend_min_advance_ratio</code></label>
+                                <input type="number" id="unified_regime_trend_min_ratio" value="0.48" min="0" max="1" step="0.01" title="등락 순위 기반 상승/(상승+하락) 비율">
+                            </div>
+                            <div class="form-group" style="margin-left:8px;">
+                                <label>박스: 상승 비율 ≤ (0~1) <code class="setting-var">range_max_advance_ratio</code></label>
+                                <input type="number" id="unified_regime_range_max_ratio" value="0.46" min="0" max="1" step="0.01">
+                            </div>
+                            <div class="form-group" style="margin-left:8px;">
+                                <label>변동률(지수) 조회 시장 <code class="setting-var">circuit_breaker_market_for_vol</code></label>
+                                <select id="unified_regime_cb_mkt_vol">
+                                    <option value="0001">코스피(0001)</option>
+                                    <option value="1001">코스닥(1001)</option>
+                                </select>
+                            </div>
+                            <div class="form-group" style="margin-left:8px;">
+                                <label>추세 쪽 점수: |지수 당일변동%| ≥ <code class="setting-var">volatility_index_change_trend_min</code></label>
+                                <input type="number" id="unified_regime_vol_trend_min" value="0.12" min="0" max="20" step="0.01" title="퍼센트 포인트">
+                            </div>
+                            <div class="form-group" style="margin-left:8px;">
+                                <label>박스 쪽 점수: |지수 당일변동%| ≤ <code class="setting-var">volatility_index_change_range_max</code></label>
+                                <input type="number" id="unified_regime_vol_range_max" value="0.35" min="0" max="20" step="0.01">
+                            </div>
+                            <div class="form-group" style="margin-left:8px;">
+                                <label>거래대금 집중 조회 시장 <code class="setting-var">trade_value_concentration_market</code></label>
+                                <select id="unified_regime_tvc_mkt">
+                                    <option value="1001">코스닥(1001)</option>
+                                    <option value="0001">코스피(0001)</option>
+                                </select>
+                            </div>
+                            <div class="form-group" style="margin-left:8px;">
+                                <label style="display:flex; align-items:center; gap:8px;">
+                                    <input type="checkbox" id="unified_regime_conc_implies_range" checked>
+                                    집중(좁은 시장)이면 박스 점수 가산 <code class="setting-var">concentration_implies_range</code>
+                                </label>
+                            </div>
+                            <div class="form-group" style="margin-left:8px;">
+                                <label>t/r 점수 차이 ≥ 이면 라벨 확정 <code class="setting-var">decision_margin</code></label>
+                                <input type="number" id="unified_regime_decision_margin" value="0.8" min="0" max="5" step="0.1">
+                            </div>
+                        </details>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="advance_ratio_filter_enabled">
                                 상승 종목 비율 시장 레짐 필터 <code class="setting-var">advance_ratio_filter_enabled</code>
                             </label>
@@ -1791,6 +1925,8 @@ def get_dashboard_html(username: str) -> str:
                     <select id="preset_select" onchange="loadPreset()">
                         <option value="">직접 설정</option>
                             <option value="scalp_morning">오전 단타(9~12)</option>
+                            <option value="scalp_afternoon">오후 단타(12~15:20)</option>
+                            <option value="morning_uptrend_conservative">오전 상승장 보수(1~3종)</option>
                         <option value="common">보편적</option>
                         <option value="conservative">보수적</option>
                         <option value="aggressive">공격적</option>
@@ -1987,15 +2123,19 @@ def get_dashboard_html(username: str) -> str:
                             </div>
                             <div class="help-item">
                                 <strong>오전 단타(9~12)</strong>
-                                매수 창 09:05~11:30(KST), 11:55 시간 청산. 손절·익절·일일 한도·변동성 필터(ATR/SAP)·시장 레짐(지수 MA, 상승 비율) 등이 단타에 맞게 설정됩니다.
+                                매수 09:05~11:30, 11:55 시간 청산. 손절·익절·ATR/SAP·지수 MA·상승 비율 등 단타용으로 맞춤. 듀얼 레짐: lookback <strong>12</strong>, 박스 <strong>0.006</strong>, MR <strong>끔</strong>이 기본 적용됩니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>오후 단타(12~15:20)</strong>
+                                매수 12:05~15:20, 장 초 스킵 0분, 15:25 청산. 듀얼 레짐: lookback <strong>20</strong>, 박스 <strong>0.007</strong>, MR <strong>켬</strong>(하단 0.30), 분봉 추세는 장초 한정 해제.
                             </div>
                             <div class="help-item">
                                 <strong>전일 단타(오전~오후)</strong>
-                                매수 창 09:05~15:20, 15:25 시간 청산. 오전 단타와 동일한 전략·리스크 구조에, 장 마감 직전까지 매수·청산을 허용하는 버전입니다.
+                                매수 창 09:05~15:20, 15:25 시간 청산. 오전 단타와 유사한 리스크·전략에 장중~오후까지 확장. 듀얼 레짐: lookback <strong>20</strong>, 박스 <strong>0.007</strong>, MR <strong>켬</strong>(하단 0.30).
                             </div>
                             <div class="help-item">
                                 <strong>보수적 단타 / 공격적 단타</strong>
-                                매수 창은 오전 단타와 동일(11:30/11:55). 보수적은 손절·익절을 더 타이트하게, 일일 거래 횟수·동시 보유 종목 수를 줄입니다. 공격적은 손절·익절을 넓히고 거래 횟수·동시 보유 종목을 늘립니다.
+                                매수 창은 오전 단타와 동일(11:30/11:55). 보수: 손절·익절 타이트·거래 적음, 듀얼 박스 <strong>0.0055</strong>·lookback <strong>25</strong>·MR 끔. 공격: 손절·익절 넓음·동시 보유↑, 박스 <strong>0.0075</strong>·lookback <strong>12</strong>·MR 켬(하단 0.38).
                             </div>
                         </div>
                     </details>
@@ -2152,6 +2292,10 @@ def get_dashboard_html(username: str) -> str:
                                 지수 MA: 선택한 지수(코스피/코스닥)가 N일 이평선 아래면 매수 스킵. 상승 비율: 시장에서 상승 종목 비율이 N% 미만이면 스킵. <code>advance_ratio_down_market_skip</code>을 켜면 상승 비율이 50% 미만(하락장)일 때 전량 매수 스킵으로 더 강하게 막습니다.
                             </div>
                             <div class="help-item">
+                                <strong>듀얼 레짐 (<code>regime_dual_switch_enabled</code> 등)</strong>
+                                <code>index_ma_filter_enabled</code>와 별개로, “지수가 MA 아래인가”와 “종목이 최근 N분 1분봉에서 고저폭이 좁은 박스인가”를 조합해 MA 골든 추세 매수를 끄거나, 옵션에 따라 박스 하단에서만 역추세(MR) 매수를 허용합니다. 지수·종목을 함께 보는 편이 횡보장에서의 불필요한 추세 진입을 줄이는 데 유리합니다.
+                            </div>
+                            <div class="help-item">
                                 <strong>서킷브레이커·사이드카·VI (<code>circuit_breaker_*</code> / <code>sidecar_*</code> / <code>vi_*</code>)</strong>
                                 서킷: 지수 전일 대비 하락률이 임계값(예: -7%) 이하이면 신규 매수 스킵(또는 설정에 따라 전량/일부 청산). 사이드카: 지수 급등락(코스피 ±5%, 코스닥 ±6%) 시 N분간 매수 스킵. VI: 해당 종목에 변동성완화장치가 걸리면 그 종목만 N분간 매수 스킵. 단타에서는 세 옵션 모두 켜 두는 것을 권장합니다.
                             </div>
@@ -2165,7 +2309,11 @@ def get_dashboard_html(username: str) -> str:
                             </div>
                             <div class="help-item">
                                 <strong>거래대금 집중·연속 손실 쿨다운</strong>
-                                거래대금 집중: 상위 N종목 거래대금 비율이 X%를 넘으면 “좁은 시장”으로 보고 매수 스킵. 연속 손실 쿨다운: 직전 N회 모두 손실이면 재진입 쿨다운 시간을 배수만큼 늘려, 그동안 같은 종목 재매수를 막습니다.
+                                거래대금 집중: 상위 N종목 거래대금 비율이 X%를 넘으면 “좁은 시장”으로 보고 매수 스킵. 연속 손실 쿨다운: 매도 체결의 실현손익(pnl) 기준으로 직전 N회가 연속 손실이면, <em>재진입 쿨다운(초)×배수</em>만큼 <strong>모든 종목의 신규 매수</strong>를 막습니다(특정 손실 종목만이 아님). 시스템 로그에 <code>BUY 스킵 | 006400 | 연속 손실 쿨다운</code>처럼 나오면, 006400이 손실을 낸 원인 종목이라는 뜻이 아니라 <strong>그 틱에서 매수를 검토하던 후보 종목</strong>이 스킵된 것입니다.
+                            </div>
+                            <div class="help-item">
+                                <strong>틱당 청산 평가 순서 (리스크 → 전략 MA)</strong>
+                                각 종목 틱마다 먼저 <code>RiskManager.check_exit_signal</code>으로 손절·익절·ATR 손익·부분익절·트레일링을 판단하고, 여기서 매도가 나오면 그 즉시 매도 신호만 실행합니다. 통과하면 그 다음에 단기/장기 MA로 골든/데드크로스(전략 매수·매도)를 봅니다. 그래서 손절/트레일링 등은 데드크로스보다 항상 우선합니다. 최소 보유시간(<code>min_hold_seconds</code>)은 <strong>전략 MA 매도(데드크로스)</strong>에만 적용되며, 리스크 청산(<code>sell_trigger_code</code>가 <code>risk_*</code>)·시간·한도·긴급·수동 청산은 대기 없이 실행됩니다.
                             </div>
                             <div class="help-item">
                                 <strong>재진입 쿨다운(초) (<code>reentry_cooldown_seconds</code>)</strong>
@@ -3445,6 +3593,14 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 const el = document.getElementById('long_ma_period');
                 if (el && activeId !== 'long_ma_period') el.value = data.long_ma_period;
             }}
+            if (data.unified_regime_label != null) {{
+                const uel = document.getElementById('unified_regime_live_label');
+                if (uel) uel.textContent = String(data.unified_regime_label);
+            }}
+            if (data.unified_regime_enabled !== undefined && data.unified_regime_enabled !== null) {{
+                const uon = document.getElementById('unified_regime_live_on');
+                if (uon) uon.textContent = data.unified_regime_enabled ? '켜짐' : '꺼짐';
+            }}
             if (data.buy_window_start_hhmm) {{
                 const el = document.getElementById('buy_window_start_hhmm');
                 if (el) el.value = data.buy_window_start_hhmm;
@@ -3615,6 +3771,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     const idxCode = document.getElementById('index_ma_code')?.value || '1001';
                     const idxPeriod = document.getElementById('index_ma_period')?.value || '20';
                     const idxLabel = (idxCode === '1001' ? '코스닥' : '코스피') + idxPeriod + 'd';
+                    const dualOn = !!document.getElementById('regime_dual_switch_enabled')?.checked;
                     const advOn = !!document.getElementById('advance_ratio_filter_enabled')?.checked;
                     const advMin = document.getElementById('advance_ratio_min_pct')?.value || '40';
                     const tvcOn = !!document.getElementById('trade_value_concentration_filter_enabled')?.checked;
@@ -3628,6 +3785,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                         'confirm2=' + (ec ? 'on' : 'off') + ' · ' +
                         'cd=' + cd + 's · ' +
                         (idxMaOn ? '지수MA=' + idxLabel + ' · ' : '') +
+                        (dualOn ? '듀얼레짐=on · ' : '') +
                         (advOn ? '상승비율≥' + advMin + '% · ' : '') +
                         (tvcOn ? '거래대금집중<' + tvcMax + '%(상위' + tvcTop + ') · ' : '') +
                         'confirm=' + conf + ' · ' +
@@ -4377,6 +4535,14 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     if (strat.index_ma_filter_enabled != null) document.getElementById('index_ma_filter_enabled').checked = !!strat.index_ma_filter_enabled;
                     if (strat.index_ma_code != null) document.getElementById('index_ma_code').value = strat.index_ma_code;
                     if (strat.index_ma_period != null) document.getElementById('index_ma_period').value = strat.index_ma_period;
+                    if (strat.regime_dual_switch_enabled != null) document.getElementById('regime_dual_switch_enabled').checked = !!strat.regime_dual_switch_enabled;
+                    if (strat.regime_block_ma_buy_when_index_bear != null) document.getElementById('regime_block_ma_buy_when_index_bear').checked = !!strat.regime_block_ma_buy_when_index_bear;
+                    if (strat.regime_block_ma_buy_when_stock_range != null) document.getElementById('regime_block_ma_buy_when_stock_range').checked = !!strat.regime_block_ma_buy_when_stock_range;
+                    if (strat.regime_stock_range_lookback_minutes != null) document.getElementById('regime_stock_range_lookback_minutes').value = strat.regime_stock_range_lookback_minutes;
+                    if (strat.regime_stock_range_max_ratio != null) document.getElementById('regime_stock_range_max_ratio').value = strat.regime_stock_range_max_ratio;
+                    if (strat.regime_mr_buy_enabled != null) document.getElementById('regime_mr_buy_enabled').checked = !!strat.regime_mr_buy_enabled;
+                    if (strat.regime_mr_max_zone_pct != null) document.getElementById('regime_mr_max_zone_pct').value = strat.regime_mr_max_zone_pct;
+                    if (strat.regime_mr_require_index_bull != null) document.getElementById('regime_mr_require_index_bull').checked = !!strat.regime_mr_require_index_bull;
                     if (strat.advance_ratio_filter_enabled != null) document.getElementById('advance_ratio_filter_enabled').checked = !!strat.advance_ratio_filter_enabled;
                     if (strat.advance_ratio_market != null) document.getElementById('advance_ratio_market').value = strat.advance_ratio_market;
                     if (strat.advance_ratio_min_pct != null) document.getElementById('advance_ratio_min_pct').value = strat.advance_ratio_min_pct;
@@ -4404,6 +4570,29 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     if (strat.use_sap_revert_entry != null) document.getElementById('use_sap_revert_entry').checked = !!strat.use_sap_revert_entry;
                     if (strat.sap_revert_entry_from_pct != null) document.getElementById('sap_revert_entry_from_pct').value = strat.sap_revert_entry_from_pct;
                     if (strat.sap_revert_entry_to_pct != null) document.getElementById('sap_revert_entry_to_pct').value = strat.sap_revert_entry_to_pct;
+                    if (strat.unified_regime) {{
+                        window.__unified_regime_json = strat.unified_regime;
+                        const u = strat.unified_regime;
+                        const uen = document.getElementById('unified_regime_enabled');
+                        if (uen) uen.checked = !!u.enabled;
+                        const ues = document.getElementById('unified_regime_eval_sec');
+                        if (ues && u.eval_interval_sec != null) ues.value = u.eval_interval_sec;
+                        const uhy = document.getElementById('unified_regime_hysteresis');
+                        if (uhy && u.hysteresis_streak != null) uhy.value = u.hysteresis_streak;
+                        const setv = (id, val) => {{ const el = document.getElementById(id); if (el) el.value = val; }};
+                        const setc = (id, val) => {{ const el = document.getElementById(id); if (el) el.checked = !!val; }};
+                        if (u.index_ma_code != null) setv('unified_regime_index_ma_code', u.index_ma_code);
+                        if (u.trend_require_index_bull !== undefined) setc('unified_regime_trend_require_index_bull', u.trend_require_index_bull);
+                        if (u.advance_ratio_market != null) setv('unified_regime_adv_mkt', u.advance_ratio_market);
+                        if (u.trend_min_advance_ratio != null) setv('unified_regime_trend_min_ratio', u.trend_min_advance_ratio);
+                        if (u.range_max_advance_ratio != null) setv('unified_regime_range_max_ratio', u.range_max_advance_ratio);
+                        if (u.circuit_breaker_market_for_vol != null) setv('unified_regime_cb_mkt_vol', u.circuit_breaker_market_for_vol);
+                        if (u.volatility_index_change_trend_min != null) setv('unified_regime_vol_trend_min', u.volatility_index_change_trend_min);
+                        if (u.volatility_index_change_range_max != null) setv('unified_regime_vol_range_max', u.volatility_index_change_range_max);
+                        if (u.trade_value_concentration_market != null) setv('unified_regime_tvc_mkt', u.trade_value_concentration_market);
+                        if (u.concentration_implies_range !== undefined) setc('unified_regime_conc_implies_range', u.concentration_implies_range);
+                        if (u.decision_margin != null) setv('unified_regime_decision_margin', u.decision_margin);
+                    }}
                 }}
                 if (stocksel) {{
                     const preset = document.getElementById('preset_select');
@@ -4623,6 +4812,14 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     index_ma_filter_enabled: !!document.getElementById('index_ma_filter_enabled').checked,
                     index_ma_code: (document.getElementById('index_ma_code')?.value || '1001'),
                     index_ma_period: parseInt(document.getElementById('index_ma_period').value) || 20,
+                    regime_dual_switch_enabled: !!document.getElementById('regime_dual_switch_enabled')?.checked,
+                    regime_block_ma_buy_when_index_bear: !!document.getElementById('regime_block_ma_buy_when_index_bear')?.checked,
+                    regime_block_ma_buy_when_stock_range: !!document.getElementById('regime_block_ma_buy_when_stock_range')?.checked,
+                    regime_stock_range_lookback_minutes: parseInt(document.getElementById('regime_stock_range_lookback_minutes')?.value) || 15,
+                    regime_stock_range_max_ratio: parseFloat(document.getElementById('regime_stock_range_max_ratio')?.value) || 0.0065,
+                    regime_mr_buy_enabled: !!document.getElementById('regime_mr_buy_enabled')?.checked,
+                    regime_mr_max_zone_pct: parseFloat(document.getElementById('regime_mr_max_zone_pct')?.value) || 0.32,
+                    regime_mr_require_index_bull: !!document.getElementById('regime_mr_require_index_bull')?.checked,
                     advance_ratio_filter_enabled: !!document.getElementById('advance_ratio_filter_enabled').checked,
                     advance_ratio_market: (document.getElementById('advance_ratio_market')?.value || '1001'),
                     advance_ratio_min_pct: parseFloat(document.getElementById('advance_ratio_min_pct').value) || 35,
@@ -4652,6 +4849,42 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     // 0도 유효한 설정값이므로 Number.isFinite로만 보정.
                     sap_revert_entry_from_pct: (() => {{ const v = parseFloat(document.getElementById('sap_revert_entry_from_pct')?.value); return Number.isFinite(v) ? v : -1.5; }})(),
                     sap_revert_entry_to_pct: (() => {{ const v = parseFloat(document.getElementById('sap_revert_entry_to_pct')?.value); return Number.isFinite(v) ? v : -0.5; }})(),
+                    unified_regime: (function() {{
+                        const base = (window.__unified_regime_json && typeof window.__unified_regime_json === 'object')
+                            ? JSON.parse(JSON.stringify(window.__unified_regime_json))
+                            : {{}};
+                        base.enabled = !!document.getElementById('unified_regime_enabled')?.checked;
+                        const e1 = parseInt(document.getElementById('unified_regime_eval_sec')?.value, 10);
+                        if (Number.isFinite(e1)) base.eval_interval_sec = Math.max(15, Math.min(600, e1));
+                        const h1 = parseInt(document.getElementById('unified_regime_hysteresis')?.value, 10);
+                        if (Number.isFinite(h1)) base.hysteresis_streak = Math.max(1, Math.min(10, h1));
+                        const g = (id) => document.getElementById(id);
+                        const gv = (id) => (g(id) && g(id).value !== undefined && g(id).value !== '') ? g(id).value : null;
+                        const gc = (id) => g(id) ? !!g(id).checked : null;
+                        const idx = gv('unified_regime_index_ma_code');
+                        if (idx) base.index_ma_code = String(idx);
+                        const trb = gc('unified_regime_trend_require_index_bull');
+                        if (trb !== null) base.trend_require_index_bull = trb;
+                        const am = gv('unified_regime_adv_mkt');
+                        if (am) base.advance_ratio_market = String(am);
+                        const tmr = parseFloat(gv('unified_regime_trend_min_ratio'));
+                        if (Number.isFinite(tmr)) base.trend_min_advance_ratio = Math.max(0, Math.min(1, tmr));
+                        const rmr = parseFloat(gv('unified_regime_range_max_ratio'));
+                        if (Number.isFinite(rmr)) base.range_max_advance_ratio = Math.max(0, Math.min(1, rmr));
+                        const cbm = gv('unified_regime_cb_mkt_vol');
+                        if (cbm) base.circuit_breaker_market_for_vol = String(cbm);
+                        const vtm = parseFloat(gv('unified_regime_vol_trend_min'));
+                        if (Number.isFinite(vtm)) base.volatility_index_change_trend_min = Math.max(0, Math.min(20, vtm));
+                        const vrm = parseFloat(gv('unified_regime_vol_range_max'));
+                        if (Number.isFinite(vrm)) base.volatility_index_change_range_max = Math.max(0, Math.min(20, vrm));
+                        const tvm = gv('unified_regime_tvc_mkt');
+                        if (tvm) base.trade_value_concentration_market = String(tvm);
+                        const cir = gc('unified_regime_conc_implies_range');
+                        if (cir !== null) base.concentration_implies_range = cir;
+                        const dm = parseFloat(gv('unified_regime_decision_margin'));
+                        if (Number.isFinite(dm)) base.decision_margin = Math.max(0, Math.min(5, dm));
+                        return base;
+                    }})(),
                 }};
                 const response = await fetch('/api/config/strategy', {{
                     method: 'POST',
@@ -4735,6 +4968,16 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 document.getElementById('minute_trend_min_green_bars').value = 2;
                 document.getElementById('minute_trend_mode').value = 'hh_hl';
 
+                // 듀얼 레짐(추천 기본): 밸런스 — lookback 15, 박스 0.0065, MR off
+                document.getElementById('regime_dual_switch_enabled').checked = true;
+                document.getElementById('regime_block_ma_buy_when_index_bear').checked = true;
+                document.getElementById('regime_block_ma_buy_when_stock_range').checked = true;
+                document.getElementById('regime_mr_require_index_bull').checked = true;
+                document.getElementById('regime_stock_range_lookback_minutes').value = 15;
+                document.getElementById('regime_stock_range_max_ratio').value = 0.0065;
+                document.getElementById('regime_mr_buy_enabled').checked = false;
+                document.getElementById('regime_mr_max_zone_pct').value = 0.32;
+
                 if (n === 'scalp_light') {{
                     // 가벼움: 진입 기회↑
                     document.getElementById('short_ma_period').value = 3;
@@ -4754,6 +4997,9 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     document.getElementById('early_max_spread_pct').value = 0.35;
                     document.getElementById('early_range_lookback_ticks').value = 40;
                     document.getElementById('early_min_range_pct').value = 0.25;
+                    document.getElementById('regime_stock_range_lookback_minutes').value = 10;
+                    document.getElementById('regime_stock_range_max_ratio').value = 0.008;
+                    document.getElementById('regime_mr_buy_enabled').checked = false;
                 }} else if (n === 'scalp_morning_strict') {{
                     // 엄격: 노이즈↓
                     document.getElementById('short_ma_period').value = 3;
@@ -4777,6 +5023,9 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     // 보강조건 2개 이상
                     document.getElementById('entry_confirm_min_count').value = 2;
                     document.getElementById('confirm_volume_surge_enabled').checked = true;
+                    document.getElementById('regime_stock_range_lookback_minutes').value = 22;
+                    document.getElementById('regime_stock_range_max_ratio').value = 0.0055;
+                    document.getElementById('regime_mr_buy_enabled').checked = false;
                 }} else {{
                     // 밸런스
                     document.getElementById('short_ma_period').value = 3;
@@ -4860,8 +5109,10 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
 
         async function applyScalpPresetWithOptions(variant) {{
             const overrides = {{
+                buy_window_start_hhmm: '09:05',
                 buy_window_end_hhmm: '11:30',
                 liquidate_after_hhmm: '11:55',
+                skip_buy_first_minutes: 5,
                 stop_loss: 0.8,
                 take_profit: 1.8,
                 daily_loss_limit: 50000,
@@ -4876,6 +5127,17 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 overrides.liquidate_after_hhmm = '15:25';
                 overrides.last_minutes_no_buy = 15;
                 overrides.name = '전일 단타';
+            }} else if (variant === 'scalp_afternoon') {{
+                overrides.buy_window_start_hhmm = '12:05';
+                overrides.buy_window_end_hhmm = '15:20';
+                overrides.liquidate_after_hhmm = '15:25';
+                overrides.skip_buy_first_minutes = 0;
+                overrides.last_minutes_no_buy = 12;
+                overrides.stop_loss = 0.85;
+                overrides.take_profit = 1.9;
+                overrides.max_trades_per_day = 10;
+                overrides.max_positions_count = 2;
+                overrides.name = '오후 단타';
             }} else if (variant === 'scalp_conservative') {{
                 overrides.stop_loss = 0.6;
                 overrides.take_profit = 1.2;
@@ -4892,6 +5154,19 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 overrides.max_trades_per_day = 12;
                 overrides.max_positions_count = 3;
                 overrides.name = '공격적 단타';
+            }} else if (variant === 'morning_uptrend') {{
+                overrides.buy_window_start_hhmm = '09:10';
+                overrides.buy_window_end_hhmm = '11:30';
+                overrides.liquidate_after_hhmm = '11:55';
+                overrides.skip_buy_first_minutes = 0;
+                overrides.stop_loss = 0.55;
+                overrides.take_profit = 1.45;
+                overrides.daily_loss_limit = 40000;
+                overrides.daily_profit_limit = 40000;
+                overrides.max_trades_per_day = 6;
+                overrides.max_positions_count = 3;
+                overrides.last_minutes_no_buy = 12;
+                overrides.name = '오전 상승장 보수(1~3종)';
             }}
             try {{
                 addLog(overrides.name + ' 프리셋 적용 중...', 'info');
@@ -4944,7 +5219,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 document.getElementById('long_ma_period').value = 10;
                 const minHoldEl = document.getElementById('min_hold_seconds');
                 if (minHoldEl) minHoldEl.value = 30;
-                document.getElementById('buy_window_start_hhmm').value = '09:05';
+                document.getElementById('buy_window_start_hhmm').value = overrides.buy_window_start_hhmm || '09:05';
                 document.getElementById('buy_window_end_hhmm').value = overrides.buy_window_end_hhmm;
                 document.getElementById('min_short_ma_slope_pct').value = 0.010;
                 document.getElementById('momentum_lookback_ticks').value = 8;
@@ -4997,6 +5272,65 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 document.getElementById('advance_ratio_market').value = '1001';
                 document.getElementById('advance_ratio_min_pct').value = 35;
                 document.getElementById('advance_ratio_down_market_skip').checked = true;
+                if (variant === 'morning_uptrend') {{
+                    document.getElementById('index_ma_code').value = '0001';
+                    document.getElementById('advance_ratio_market').value = '0001';
+                    document.getElementById('advance_ratio_min_pct').value = 42;
+                    document.getElementById('trade_value_concentration_filter_enabled').checked = true;
+                    document.getElementById('trade_value_concentration_market').value = '0001';
+                    document.getElementById('trade_value_concentration_top_n').value = 8;
+                    document.getElementById('trade_value_concentration_denom_n').value = 25;
+                    document.getElementById('trade_value_concentration_max_pct').value = 40;
+                    document.getElementById('unified_regime_enabled').checked = true;
+                    document.getElementById('unified_regime_eval_sec').value = 90;
+                    document.getElementById('unified_regime_hysteresis').value = 2;
+                    const _uix = document.getElementById('unified_regime_index_ma_code'); if (_uix) _uix.value = '0001';
+                    const _uadv = document.getElementById('unified_regime_adv_mkt'); if (_uadv) _uadv.value = '0001';
+                    const _utr = document.getElementById('unified_regime_trend_min_ratio'); if (_utr) _utr.value = 0.5;
+                    const _urr = document.getElementById('unified_regime_range_max_ratio'); if (_urr) _urr.value = 0.43;
+                    const _ucb = document.getElementById('unified_regime_cb_mkt_vol'); if (_ucb) _ucb.value = '0001';
+                    const _utvc = document.getElementById('unified_regime_tvc_mkt'); if (_utvc) _utvc.value = '0001';
+                    const _udm = document.getElementById('unified_regime_decision_margin'); if (_udm) _udm.value = 1.0;
+                    const _utrb = document.getElementById('unified_regime_trend_require_index_bull'); if (_utrb) _utrb.checked = true;
+                }}
+                // 듀얼 레짐: 프리셋별 추천(지수+분봉 박스). index_ma_filter와 병행 시 지수 조건 이중 적용됨.
+                document.getElementById('regime_dual_switch_enabled').checked = true;
+                document.getElementById('regime_block_ma_buy_when_index_bear').checked = true;
+                document.getElementById('regime_block_ma_buy_when_stock_range').checked = true;
+                document.getElementById('regime_mr_require_index_bull').checked = true;
+                if (variant === 'scalp_fullday') {{
+                    document.getElementById('regime_stock_range_lookback_minutes').value = 20;
+                    document.getElementById('regime_stock_range_max_ratio').value = 0.007;
+                    document.getElementById('regime_mr_buy_enabled').checked = true;
+                    document.getElementById('regime_mr_max_zone_pct').value = 0.30;
+                }} else if (variant === 'scalp_afternoon') {{
+                    document.getElementById('regime_stock_range_lookback_minutes').value = 20;
+                    document.getElementById('regime_stock_range_max_ratio').value = 0.007;
+                    document.getElementById('regime_mr_buy_enabled').checked = true;
+                    document.getElementById('regime_mr_max_zone_pct').value = 0.30;
+                    document.getElementById('enable_morning_regime_split').checked = false;
+                    document.getElementById('minute_trend_early_only').checked = false;
+                }} else if (variant === 'scalp_conservative') {{
+                    document.getElementById('regime_stock_range_lookback_minutes').value = 25;
+                    document.getElementById('regime_stock_range_max_ratio').value = 0.0055;
+                    document.getElementById('regime_mr_buy_enabled').checked = false;
+                    document.getElementById('regime_mr_max_zone_pct').value = 0.30;
+                }} else if (variant === 'scalp_aggressive') {{
+                    document.getElementById('regime_stock_range_lookback_minutes').value = 12;
+                    document.getElementById('regime_stock_range_max_ratio').value = 0.0075;
+                    document.getElementById('regime_mr_buy_enabled').checked = true;
+                    document.getElementById('regime_mr_max_zone_pct').value = 0.38;
+                }} else if (variant === 'morning_uptrend') {{
+                    document.getElementById('regime_stock_range_lookback_minutes').value = 15;
+                    document.getElementById('regime_stock_range_max_ratio').value = 0.006;
+                    document.getElementById('regime_mr_buy_enabled').checked = false;
+                    document.getElementById('regime_mr_max_zone_pct').value = 0.32;
+                }} else {{
+                    document.getElementById('regime_stock_range_lookback_minutes').value = 12;
+                    document.getElementById('regime_stock_range_max_ratio').value = 0.006;
+                    document.getElementById('regime_mr_buy_enabled').checked = false;
+                    document.getElementById('regime_mr_max_zone_pct').value = 0.32;
+                }}
                 // 서킷/사이드카/VI: 급락·변동 시 매수 스킵 (단타 보호)
                 document.getElementById('circuit_breaker_filter_enabled').checked = true;
                 document.getElementById('circuit_breaker_market').value = '0001';
@@ -5004,7 +5338,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 document.getElementById('sidecar_filter_enabled').checked = true;
                 document.getElementById('vi_filter_enabled').checked = true;
                 // 시간대: 장 초반 N분 스킵, 마감 N분 전 신규 매수 스킵
-                document.getElementById('skip_buy_first_minutes').value = 5;
+                document.getElementById('skip_buy_first_minutes').value = (overrides.skip_buy_first_minutes != null) ? overrides.skip_buy_first_minutes : 5;
                 document.getElementById('last_minutes_no_buy').value = overrides.last_minutes_no_buy;
                 // 스프레드/횡보장 필터 기본값 튜닝(너무 타이트하면 매수 자체가 안 걸릴 수 있음)
                 document.getElementById('max_spread_pct').value = 0.20;
@@ -5016,7 +5350,11 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
 
                 // 종목 선정 프리셋
                 const sel = document.getElementById('preset_select');
-                if (sel) sel.value = 'scalp_morning';
+                if (sel) {{
+                    if (variant === 'scalp_afternoon') sel.value = 'scalp_afternoon';
+                    else if (variant === 'morning_uptrend') sel.value = 'morning_uptrend_conservative';
+                    else sel.value = 'scalp_morning';
+                }}
                 await loadPreset();
                 const ok = await updateStockSelection(true);
                 if (!ok) {{
@@ -5131,6 +5469,8 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     if (preset.exclude_drawdown != null) document.getElementById('exclude_drawdown').checked = !!preset.exclude_drawdown;
                     if (preset.max_drawdown_from_high_ratio != null) document.getElementById('max_drawdown_pct').value = (preset.max_drawdown_from_high_ratio * 100).toFixed(1);
                     if (preset.drawdown_filter_after_hhmm != null) document.getElementById('drawdown_filter_after_hhmm').value = preset.drawdown_filter_after_hhmm;
+                    if (preset.sort_by != null) {{ const sb = document.getElementById('stock_sort_by'); if (sb) sb.value = preset.sort_by; }}
+                    if (preset.prev_day_rank_pool_size != null) {{ const pr = document.getElementById('prev_day_rank_pool_size'); if (pr) pr.value = preset.prev_day_rank_pool_size; }}
                     addLog(`프리셋 로드: ${{preset.name}}`, 'info');
                 }}
             }} catch (error) {{
