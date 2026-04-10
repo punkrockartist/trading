@@ -263,7 +263,7 @@ def _mr_buy_signal_ok(state, stock_code: str, current_price: float, bars: list) 
         idx_period = max(5, min(60, int(getattr(state, "index_ma_period", 20) or 20)))
         if not _get_index_ma_ok(idx_code, idx_period):
             return False
-    return True
+        return True
 
 
 def _get_exchange_circuit_breaker_risk(
@@ -986,10 +986,10 @@ def _extract_exec_from_ccld_df(df, fallback_qty: int, fallback_px: float) -> dic
             )
             qty = _to_int(qty_raw, int(fallback_qty or 0))
             px = _to_float(_pick_first(row0, px_keys), float(fallback_px or 0.0))
-            if qty <= 0:
-                qty = int(fallback_qty or 0)
-            if px <= 0:
-                px = float(fallback_px or 0.0)
+        if qty <= 0:
+            qty = int(fallback_qty or 0)
+        if px <= 0:
+            px = float(fallback_px or 0.0)
         return {"qty": int(qty), "px": float(px), "fields": row0, "columns": list(df.columns)}
     except Exception:
         return {"qty": int(fallback_qty or 0), "px": float(fallback_px or 0.0), "fields": {}}
@@ -1165,7 +1165,7 @@ def _reconcile_pending_orders_sync(max_per_run: int = 5, min_check_interval_sec:
             try:
                 if side == "buy":
                     # 추가 매수(동일 종목 누적)도 반영해야 MTS 잔고와 일치함
-                    rm.update_position(stock_code, exec_px, exec_qty, "buy")
+                        rm.update_position(stock_code, exec_px, exec_qty, "buy")
                 else:
                     if stock_code in getattr(rm, "positions", {}):
                         pnl = rm.update_position(stock_code, exec_px, exec_qty, "sell")
@@ -2840,10 +2840,12 @@ def _start_trading_engine_thread():
     if engine_thread is not None and engine_thread.is_alive():
         _request_active_kis_ws_close()
         state.engine_running = False
-        for _ in range(16):
+        # 재연결 sleep(ws_reconnect_sleep) 중에는 _active_kws가 없을 수 있음 → 주기적으로 다시 close 요청
+        for _ in range(60):
             time.sleep(0.5)
             if not (getattr(state, "engine_thread", None) and state.engine_thread.is_alive()):
                 break
+            _request_active_kis_ws_close()
         if getattr(state, "engine_thread", None) and state.engine_thread.is_alive():
             logger.warning("엔진 스레드가 아직 종료되지 않음. WebSocket 연결이 끊길 때까지 잠시 기다린 뒤 다시 시작하세요.")
             return
@@ -3734,8 +3736,8 @@ def _start_trading_engine_thread():
                                                                     stock_code,
                                                                     # low/high를 1자리 반올림하지 않고, -0.05 같은 경계값을 정확히 확인할 수 있게 소수 2자리 표시
                                                                     f"SAP 풀백 범위 밖으로 신규 매수 스킵(dev={dev:.2f}% not in [{low:.2f}%,{high:.2f}%])",
-                                                                )
-                                                                continue
+                                                        )
+                                                        continue
                                                     except Exception:
                                                         pass
                                         except Exception:
@@ -4294,6 +4296,9 @@ async def send_status_update():
                 "is_running": state.is_running,
                 "is_paper_trading": state.is_paper_trading,
                 "manual_approval": getattr(state, "manual_approval", True),
+                "allow_real_auto_from_env": _parse_allow_real_auto_trading_from_env(),
+                "allow_real_auto_effective": _effective_allow_real_auto_trading(),
+                "allow_real_auto_override": getattr(state, "allow_real_auto_override", None),
                 "env_name": "모의투자" if state.is_paper_trading else "실전투자",
                 "account_balance": _get_display_account_balance(),
                 "daily_pnl": state.risk_manager.daily_pnl,
@@ -4457,10 +4462,6 @@ def _preflight_check(username: str) -> Dict[str, Any]:
         issues.append("Strategy가 초기화되지 않았습니다.")
     if not getattr(state, "stock_selector", None):
         warnings.append("StockSelector가 없습니다. 종목 재선정 기능이 제한될 수 있습니다.")
-
-    # 실전/자동 안전장치(추가 안전: 여기서는 점검용 메시지)
-    if (not bool(getattr(state, "is_paper_trading", True))) and (not bool(getattr(state, "manual_approval", True))):
-        warnings.append("실전 + 자동(즉시체결) 조합입니다. 안전장치 설정에 따라 시작이 차단될 수 있습니다.")
 
     # 리스크 핵심값 sanity
     rm = getattr(state, "risk_manager", None)
@@ -4681,6 +4682,9 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
             "is_running": False,
             "is_paper_trading": getattr(state, "is_paper_trading", True),
             "manual_approval": getattr(state, "manual_approval", True),
+            "allow_real_auto_from_env": _parse_allow_real_auto_trading_from_env(),
+            "allow_real_auto_effective": _effective_allow_real_auto_trading(),
+            "allow_real_auto_override": getattr(state, "allow_real_auto_override", None),
             "env_name": "-",
             "account_balance": 0,
             "daily_pnl": daily_pnl,
@@ -4748,6 +4752,9 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
         "is_running": state.is_running,
         "is_paper_trading": state.is_paper_trading,
         "manual_approval": getattr(state, "manual_approval", True),
+        "allow_real_auto_from_env": _parse_allow_real_auto_trading_from_env(),
+        "allow_real_auto_effective": _effective_allow_real_auto_trading(),
+        "allow_real_auto_override": getattr(state, "allow_real_auto_override", None),
         "env_name": "모의투자" if state.is_paper_trading else "실전투자",
         "account_balance": _get_display_account_balance(),
         "kis_account_balance": kis_balance,
@@ -4812,6 +4819,24 @@ def _is_within_window(now_t: dtime, start_hhmm: str, end_hhmm: str) -> bool:
     # 동일일 내 구간만 지원 (start <= end). 그렇지 않으면 always-true로 처리.
     if start_t <= end_t:
         return start_t <= now_t <= end_t
+    return True
+
+
+def _parse_allow_real_auto_trading_from_env() -> bool:
+    """레거시: OS 환경변수 ALLOW_REAL_AUTO_TRADING (표시용, 시작 허용과 무관)."""
+    try:
+        return str(os.getenv("ALLOW_REAL_AUTO_TRADING", "false") or "false").strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+    except Exception:
+        return False
+
+
+def _effective_allow_real_auto_trading() -> bool:
+    """실전+자동 시작 허용. allow_real_auto_override==False 일 때만 차단(런타임 킬스위치)."""
+    try:
+        if getattr(state, "allow_real_auto_override", None) is False:
+            return False
+    except Exception:
+        pass
     return True
 
 
@@ -5031,14 +5056,12 @@ async def _do_start_system(username: str) -> tuple:
             pass
         _restore_daily_buy_notional_from_hist(username)
 
-        # 안전장치: 실전(real) + 자동(즉시 체결) 조합은 기본적으로 차단 (환경변수로만 해제)
-        # - 실수로 실전 자동매매를 켜서 손실이 나는 사고 방지 목적
-        try:
-            allow_real_auto = str(os.getenv("ALLOW_REAL_AUTO_TRADING", "false") or "false").strip().lower() in {"1", "true", "t", "yes", "y", "on"}
-        except Exception:
-            allow_real_auto = False
-        if (not getattr(state, "is_paper_trading", True)) and (not bool(getattr(state, "manual_approval", True))) and (not allow_real_auto):
-            msg = "안전장치: 실전투자 + 자동(즉시 체결) 모드는 기본적으로 차단됩니다. 수동(승인대기)으로 바꾸거나, 반드시 필요하면 서버 환경변수 ALLOW_REAL_AUTO_TRADING=true로 해제한 뒤 다시 시작하세요."
+        # 선택적 런타임 차단만 적용: POST /api/system/allow-real-auto-trading {"mode":"block"} 시 시작 불가
+        if not _effective_allow_real_auto_trading():
+            msg = (
+                "실전+자동(즉시 체결이) 서버에서 강제 차단 중입니다. "
+                'POST /api/system/allow-real-auto-trading body {"mode":"env"} 로 해제하세요.'
+            )
             try:
                 await state.broadcast({"type": "log", "level": "error", "message": msg})
             except Exception:
@@ -5144,6 +5167,45 @@ async def set_trade_mode(
         return JSONResponse({"success": True, "message": f"매매 모드가 {label}(으)로 변경되었습니다.", "manual_approval": manual_approval})
     except Exception as e:
         logger.error(f"매매 모드 전환 오류: {e}")
+        return JSONResponse({"success": False, "message": str(e)})
+
+
+@app.post("/api/system/allow-real-auto-trading")
+async def set_allow_real_auto_trading_override(
+    body: dict = Body(...),
+    current_user: str = Depends(get_current_user),
+):
+    """
+    실전+자동(즉시 체결) 시작에 대한 런타임 킬스위치(기본은 허용).
+    - mode=block : 시스템 시작 시 실전+자동 조합 차단
+    - mode=env  : 강제 차단 해제(기본 동작으로 복귀)
+    """
+    try:
+        mode = str(body.get("mode", "env") or "env").strip().lower()
+        if mode in ("block", "false", "0", "off", "deny", "no"):
+            state.allow_real_auto_override = False
+            msg = "실전+자동 시작이 런타임에서 차단되었습니다. 해제하려면 mode=env 를 호출하세요."
+        elif mode in ("env", "reset", "follow", "default", "clear"):
+            state.allow_real_auto_override = None
+            msg = "실전+자동 시작 차단이 해제되었습니다(기본: 허용)."
+        else:
+            return JSONResponse(
+                {"success": False, "message": 'mode 는 "env" 또는 "block" 이어야 합니다.'},
+                status_code=400,
+            )
+        await send_status_update()
+        return JSONResponse(
+            {
+                "success": True,
+                "message": msg,
+                "mode": mode if mode not in ("false", "0", "off", "deny", "no") else "block",
+                "allow_real_auto_from_env": _parse_allow_real_auto_trading_from_env(),
+                "allow_real_auto_effective": _effective_allow_real_auto_trading(),
+                "allow_real_auto_override": getattr(state, "allow_real_auto_override", None),
+            }
+        )
+    except Exception as e:
+        logger.error("allow-real-auto-trading 오류: %s", e)
         return JSONResponse({"success": False, "message": str(e)})
 
 
@@ -5329,6 +5391,12 @@ async def _dashboard_http_shutdown_event():
                 t.cancel()
         except Exception:
             pass
+    # Ctrl+C 등으로 HTTP 서버가 내려갈 때 엔진 루프·WS를 먼저 끊어 graceful shutdown 지연 완화(daemon 엔진+asyncio.run 블로킹 대비)
+    try:
+        state.engine_running = False
+        _request_active_kis_ws_close()
+    except Exception:
+        pass
     try:
         _record_dashboard_http_shutdown_graceful()
     except Exception:
