@@ -122,7 +122,7 @@ _index_change_cache_ttl = 120  # 2분
 _index_change_cache_lock = threading.Lock()
 
 # VI(종목별 변동성완화장치) 캐시: key = stock_code, value = (triggered: bool, ts)
-_vi_status_cache: Dict[str, tuple] = {}
+_vi_status_cache: Dict[str, dict] = {}
 _vi_status_cache_ttl = 60  # 1분
 _vi_status_cache_lock = threading.Lock()
 
@@ -421,30 +421,47 @@ def _rest_vi_dataframe_active(df) -> Optional[bool]:
     return None
 
 
-def _get_stock_vi_triggered(stock_code: str) -> bool:
+def _get_stock_vi_status(stock_code: str) -> dict:
     """
-    종목별 VI(변동성완화장치) 적용 여부.
-    1) 장운영 WS(H0STMKO0) vi_cls_code가 최근 갱신되어 있으면 우선.
-    2) 없거나 오래되면 inquire_vi_status — 행 유무만으로는 판단하지 않고 VI 구분 컬럼으로 판단;
-       컬럼을 못 찾으면 레거시(행 있음=True)로만 폴백.
-    캐시 1분.
+    종목별 VI 활성 상태와 판정 소스를 함께 반환.
+    source:
+      - cache_ws / cache_rest / cache_rest_unknown
+      - ws
+      - rest
+      - rest_unknown
+      - invalid / error
     """
     if not stock_code or len(str(stock_code).strip()) < 6:
-        return False
+        return {"triggered": False, "source": "invalid", "raw": None, "note": "invalid_code"}
     code = str(stock_code).strip().zfill(6)
+    now_ts = time.time()
     with _vi_status_cache_lock:
         ent = _vi_status_cache.get(code)
-        if ent is not None and (time.time() - ent[1]) < _vi_status_cache_ttl:
-            return ent[0]
+    if isinstance(ent, dict) and (now_ts - float(ent.get("ts", 0.0) or 0.0)) < _vi_status_cache_ttl:
+        cached = dict(ent)
+        cached["source"] = f"cache_{cached.get('source', 'unknown')}"
+        return cached
 
-    triggered = False
+    status = {"triggered": False, "source": "rest_unknown", "raw": None, "note": ""}
     try:
-        now_ts = time.time()
         ws_map = getattr(state, "_vi_ws_active", None) or {}
         ws_ent = ws_map.get(code)
-        if ws_ent is not None and (now_ts - ws_ent[1]) < _VI_WS_STALE_SECONDS:
-            triggered = bool(ws_ent[0])
-        else:
+        if ws_ent is not None:
+            ws_active = bool(ws_ent[0])
+            ws_ts = float(ws_ent[1] or 0.0)
+            ws_raw = ws_ent[2] if len(ws_ent) >= 3 else None
+            ws_age = now_ts - ws_ts if ws_ts > 0 else None
+            if ws_age is not None and ws_age < _VI_WS_STALE_SECONDS:
+                status = {
+                    "triggered": ws_active,
+                    "source": "ws",
+                    "raw": ws_raw,
+                    "note": f"age={ws_age:.1f}s",
+                }
+            else:
+                status["note"] = f"ws_stale age={ws_age:.1f}s" if ws_age is not None else "ws_missing_ts"
+
+        if status.get("source") != "ws":
             tz = timezone(timedelta(hours=9))
             today_str = datetime.now(tz).strftime("%Y%m%d")
             df = inquire_vi_status(
@@ -459,14 +476,155 @@ def _get_stock_vi_triggered(stock_code: str) -> bool:
             )
             parsed = _rest_vi_dataframe_active(df)
             if parsed is not None:
-                triggered = parsed
+                raw_values = []
+                try:
+                    for col in getattr(df, "columns", []):
+                        cl = str(col).lower().replace(" ", "")
+                        if "vi" in cl and any(k in cl for k in ("cls", "stts", "stat", "type", "code", "div", "aplc", "yn")):
+                            raw_values.extend([v for v in df[col].astype(str).str.strip().tolist() if v and v.lower() not in ("nan", "none")])
+                except Exception:
+                    raw_values = []
+                status = {
+                    "triggered": bool(parsed),
+                    "source": "rest",
+                    "raw": ",".join(raw_values[:5]) if raw_values else None,
+                    "note": f"rows={0 if df is None else len(df)}",
+                }
             else:
-                triggered = df is not None and not getattr(df, "empty", True) and len(df) > 0
+                status = {
+                    "triggered": False,
+                    "source": "rest_unknown",
+                    "raw": None,
+                    "note": "no_explicit_vi_columns",
+                }
     except Exception as e:
         logger.debug("VI status check failed for %s: %s", code, e)
+        status = {"triggered": False, "source": "error", "raw": None, "note": str(e)}
+
+    out = {
+        "triggered": bool(status.get("triggered", False)),
+        "source": str(status.get("source", "error") or "error"),
+        "raw": status.get("raw"),
+        "note": str(status.get("note", "") or ""),
+        "ts": now_ts,
+    }
     with _vi_status_cache_lock:
-        _vi_status_cache[code] = (triggered, time.time())
-    return triggered
+        _vi_status_cache[code] = out
+    return out
+
+
+def _get_stock_vi_triggered(stock_code: str) -> bool:
+    return bool(_get_stock_vi_status(stock_code).get("triggered", False))
+
+
+def _get_vi_reentry_watch() -> Dict[str, dict]:
+    watch = getattr(state, "_vi_reentry_watch", None)
+    if not isinstance(watch, dict):
+        watch = {}
+        state._vi_reentry_watch = watch
+    return watch
+
+
+def _mark_vi_reentry_active(stock_code: str, price: float = 0.0) -> None:
+    code = str(stock_code or "").strip().zfill(6)
+    if not code:
+        return
+    watch = _get_vi_reentry_watch()
+    prev = watch.get(code) or {}
+    prev_high = float(prev.get("vi_high", 0.0) or 0.0) if bool(prev.get("active", False)) else 0.0
+    px = float(price or 0.0)
+    watch[code] = {
+        "active": True,
+        "triggered_at": time.time(),
+        "released_at": 0.0,
+        "vi_high": max(prev_high, px),
+        "ref_high": 0.0,
+        "pass_logged": False,
+        "buy_done": False,
+    }
+
+
+def _update_vi_reentry_active_price(stock_code: str, price: float) -> None:
+    code = str(stock_code or "").strip().zfill(6)
+    if not code:
+        return
+    watch = _get_vi_reentry_watch()
+    ctx = watch.get(code)
+    if not ctx or not bool(ctx.get("active", False)):
+        return
+    px = float(price or 0.0)
+    if px <= 0:
+        return
+    ctx["vi_high"] = max(float(ctx.get("vi_high", 0.0) or 0.0), px)
+    watch[code] = ctx
+
+
+def _mark_vi_reentry_released(stock_code: str, price: float = 0.0) -> None:
+    code = str(stock_code or "").strip().zfill(6)
+    if not code:
+        return
+    watch = _get_vi_reentry_watch()
+    ctx = watch.get(code)
+    if not ctx or not bool(ctx.get("active", False)):
+        return
+    px = float(price or 0.0)
+    ref_high = max(float(ctx.get("vi_high", 0.0) or 0.0), px)
+    watch[code] = {
+        **ctx,
+        "active": False,
+        "released_at": time.time(),
+        "ref_high": ref_high,
+        "pass_logged": False,
+        "buy_done": False,
+    }
+
+
+def _get_vi_reentry_skip_reason(stock_code: str, current_price: float) -> Optional[str]:
+    if not bool(getattr(state, "vi_reentry_eval_enabled", True)):
+        return None
+    code = str(stock_code or "").strip().zfill(6)
+    if not code or current_price <= 0:
+        return None
+    ctx = _get_vi_reentry_watch().get(code)
+    if not ctx or bool(ctx.get("active", False)) or bool(ctx.get("buy_done", False)):
+        return None
+    released_at = float(ctx.get("released_at", 0.0) or 0.0)
+    ref_high = float(ctx.get("ref_high", 0.0) or 0.0)
+    if released_at <= 0 or ref_high <= 0:
+        return None
+    stabilize_sec = max(0, min(180, int(getattr(state, "vi_reentry_stabilization_seconds", 20) or 20)))
+    ready_at = released_at + stabilize_sec
+    now_ts = time.time()
+    if now_ts < ready_at:
+        return f"VI 해제 안정화 대기({int(max(1, ready_at - now_ts))}s)"
+    breakout_buffer = max(0.0, min(0.03, float(getattr(state, "vi_reentry_breakout_buffer_ratio", 0.001) or 0.001)))
+    breakout_px = ref_high * (1.0 + breakout_buffer)
+    if float(current_price) < breakout_px:
+        return f"VI 재돌파 대기({breakout_px:,.0f}원 미만)"
+    if not bool(ctx.get("pass_logged", False)):
+        ctx["pass_logged"] = True
+        _get_vi_reentry_watch()[code] = ctx
+        _run_async_broadcast({
+            "type": "log",
+            "level": "info",
+            "message": (
+                f"VI 재평가 통과 | {code} | 해제 후 {stabilize_sec}s 안정화 + "
+                f"직전 VI 고점 {ref_high:,.0f}원 재돌파 확인"
+            ),
+        })
+    return None
+
+
+def _mark_vi_reentry_bought(stock_code: str) -> None:
+    code = str(stock_code or "").strip().zfill(6)
+    if not code:
+        return
+    watch = _get_vi_reentry_watch()
+    ctx = watch.get(code)
+    if not ctx:
+        return
+    ctx["buy_done"] = True
+    watch[code] = ctx
 
 
 # 상승 종목 비율 캐시 (등락률 순위 API 기반)
@@ -1871,6 +2029,9 @@ def _apply_strategy_config_to_state(config: "StrategyConfig", update_unified_sna
         state.sidecar_action = "skip_buy_only"
     state.vi_filter_enabled = bool(getattr(config, "vi_filter_enabled", getattr(state, "vi_filter_enabled", True)))
     state.vi_cooling_minutes = max(1, min(30, int(getattr(config, "vi_cooling_minutes", getattr(state, "vi_cooling_minutes", 5)) or 5)))
+    state.vi_reentry_eval_enabled = bool(getattr(config, "vi_reentry_eval_enabled", getattr(state, "vi_reentry_eval_enabled", True)))
+    state.vi_reentry_stabilization_seconds = max(0, min(180, int(getattr(config, "vi_reentry_stabilization_seconds", getattr(state, "vi_reentry_stabilization_seconds", 20)) or 20)))
+    state.vi_reentry_breakout_buffer_ratio = max(0.0, min(0.03, float(getattr(config, "vi_reentry_breakout_buffer_ratio", getattr(state, "vi_reentry_breakout_buffer_ratio", 0.001)) or 0.001)))
     state.trade_value_concentration_filter_enabled = bool(getattr(config, "trade_value_concentration_filter_enabled", getattr(state, "trade_value_concentration_filter_enabled", False)))
     state.trade_value_concentration_market = str(getattr(config, "trade_value_concentration_market", getattr(state, "trade_value_concentration_market", "1001")) or "1001")
     state.trade_value_concentration_top_n = max(2, min(20, int(getattr(config, "trade_value_concentration_top_n", getattr(state, "trade_value_concentration_top_n", 10)) or 10)))
@@ -2724,6 +2885,7 @@ def _handle_signal(
             vi_skip = getattr(state, "_vi_skip_until", None) or {}
             if not isinstance(vi_skip, dict):
                 vi_skip = {}
+            _mark_vi_reentry_active(stock_code, price)
             state._vi_skip_until = {**vi_skip, stock_code: time.time() + vi_cooling * 60}
             _run_async_broadcast({"type": "log", "level": "warning", "message": f"주문 거절(VI): {stock_code} → {vi_cooling}분간 해당 종목 매수 스킵"})
         if details.get("error_type") == "auth_expired":
@@ -2735,6 +2897,8 @@ def _handle_signal(
         return
 
     filled = bool(details.get("filled", False))
+    if signal == "buy":
+        _mark_vi_reentry_bought(stock_code)
     level = "info" if filled else "warning"
     _raw_ok = _format_order_log(details)
     _msg_ok = _append_sell_trigger_to_order_log(_raw_ok, signal, sell_trigger_code, reason)
@@ -2952,10 +3116,17 @@ def _start_trading_engine_thread():
                                         vi_raw = row.get("VI_CLS_CODE")
                                     vi_active = _vi_cls_code_implies_active(vi_raw)
                                     prev = state._vi_ws_active.get(code)
-                                    state._vi_ws_active[code] = (vi_active, time.time())
+                                    state._vi_ws_active[code] = (vi_active, time.time(), None if vi_raw is None else str(vi_raw).strip())
+                                    try:
+                                        last_px = float((getattr(state.risk_manager, "last_prices", {}) or {}).get(code) or 0.0)
+                                    except Exception:
+                                        last_px = 0.0
+                                    if vi_active:
+                                        _mark_vi_reentry_active(code, last_px)
                                     with _vi_status_cache_lock:
                                         _vi_status_cache.pop(code, None)
                                     if prev is not None and prev[0] and not vi_active:
+                                        _mark_vi_reentry_released(code, last_px)
                                         vi_skip = getattr(state, "_vi_skip_until", None) or {}
                                         if isinstance(vi_skip, dict) and vi_skip.get(code, 0) > time.time():
                                             state._vi_skip_until = {k: v for k, v in vi_skip.items() if k != code}
@@ -2964,8 +3135,14 @@ def _start_trading_engine_thread():
                                             _run_async_broadcast({
                                                 "type": "log",
                                                 "level": "info",
-                                                "message": f"VI 해제(장운영 WS): {code} → 해당 종목 VI 냉각 해제, 매수 필터 재평가",
+                                                "message": f"VI 해제(장운영 WS): {code} raw={vi_raw} → 해당 종목 VI 냉각 해제, 매수 필터 재평가",
                                             })
+                                    elif (prev is None or not prev[0]) and vi_active:
+                                        _run_async_broadcast({
+                                            "type": "log",
+                                            "level": "warning",
+                                            "message": f"VI 상태 감지(장운영 WS): {code} raw={vi_raw}",
+                                        })
                             except Exception as ex:
                                 logger.debug("H0STMKO0 VI 처리 실패: %s", ex)
                             return
@@ -3300,6 +3477,7 @@ def _start_trading_engine_thread():
 
                                 state.risk_manager.update_price(stock_code, current_price)
                                 state.strategy.update_price(stock_code, current_price)
+                                _update_vi_reentry_active_price(stock_code, current_price)
                                 _print_signal_decision(stock_code, current_price)
 
                                 # 1~2분봉 추세 유지/고점 근접 회피를 위해 간단 분봉(1분) 생성
@@ -3514,14 +3692,44 @@ def _start_trading_engine_thread():
                                                     _record_buy_skip(stock_code, "vi_cooling")
                                                     _throttled_skip_log(stock_code, "VI 냉각 구간(해당 종목) 신규 매수 스킵")
                                                     continue
-                                                if _get_stock_vi_triggered(stock_code):
+                                                vi_status = _get_stock_vi_status(stock_code)
+                                                vi_active_now = bool(vi_status.get("triggered", False))
+                                                vi_source = str(vi_status.get("source", "unknown") or "unknown")
+                                                vi_raw = vi_status.get("raw")
+                                                vi_note = str(vi_status.get("note", "") or "")
+                                                if vi_active_now and vi_source == "ws":
+                                                    _mark_vi_reentry_active(stock_code, current_price)
                                                     state._vi_skip_until = {**vi_skip_until, stock_code: time.time() + vi_cooling * 60}
                                                     _run_async_broadcast({
                                                         "type": "log",
                                                         "level": "warning",
-                                                        "message": f"VI 발동(종목): {stock_code} → {vi_cooling}분간 해당 종목 매수 스킵",
+                                                        "message": f"VI 발동(종목): {stock_code} source=WS raw={vi_raw} → {vi_cooling}분간 해당 종목 매수 스킵",
                                                     })
                                                     _record_buy_skip(stock_code, "vi")
+                                                    continue
+                                                if vi_active_now:
+                                                    _record_buy_skip(stock_code, "vi_rest_active")
+                                                    _throttled_skip_log(
+                                                        stock_code,
+                                                        f"VI 활성 추정({vi_source}) raw={vi_raw or '-'} {vi_note}".strip(),
+                                                        ttl_sec=30,
+                                                    )
+                                                    continue
+                                                vi_watch = (_get_vi_reentry_watch() or {}).get(stock_code) or {}
+                                                if bool(vi_watch.get("active", False)) and vi_source in ("rest_unknown", "cache_rest_unknown", "error", "cache_error"):
+                                                    _record_buy_skip(stock_code, "vi_status_unknown")
+                                                    _throttled_skip_log(
+                                                        stock_code,
+                                                        f"VI 상태 미확정({vi_source}) → WS 해제 대기",
+                                                        ttl_sec=30,
+                                                    )
+                                                    continue
+                                                if vi_source in ("ws", "cache_ws", "rest", "cache_rest"):
+                                                    _mark_vi_reentry_released(stock_code, current_price)
+                                                vi_reentry_reason = _get_vi_reentry_skip_reason(stock_code, current_price)
+                                                if vi_reentry_reason:
+                                                    _record_buy_skip(stock_code, "vi_reentry_wait")
+                                                    _throttled_skip_log(stock_code, vi_reentry_reason)
                                                     continue
                                         except Exception:
                                             pass
@@ -4704,6 +4912,11 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
             "momentum_lookback_ticks": getattr(state, "momentum_lookback_ticks", 0),
             "min_momentum_ratio": getattr(state, "min_momentum_ratio", 0.0),
             "reentry_cooldown_seconds": getattr(state, "reentry_cooldown_seconds", 0),
+            "vi_filter_enabled": getattr(state, "vi_filter_enabled", True),
+            "vi_cooling_minutes": getattr(state, "vi_cooling_minutes", 5),
+            "vi_reentry_eval_enabled": getattr(state, "vi_reentry_eval_enabled", True),
+            "vi_reentry_stabilization_seconds": getattr(state, "vi_reentry_stabilization_seconds", 20),
+            "vi_reentry_breakout_buffer_ratio": getattr(state, "vi_reentry_breakout_buffer_ratio", 0.001),
             "buy_confirm_ticks": getattr(state, "buy_confirm_ticks", 1),
             "dead_cross_confirm_ticks": getattr(state, "dead_cross_confirm_ticks", 0),
             "enable_time_liquidation": getattr(state, "enable_time_liquidation", False),
@@ -4775,6 +4988,11 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
         "momentum_lookback_ticks": getattr(state, "momentum_lookback_ticks", 0),
         "min_momentum_ratio": getattr(state, "min_momentum_ratio", 0.0),
         "reentry_cooldown_seconds": getattr(state, "reentry_cooldown_seconds", 0),
+        "vi_filter_enabled": getattr(state, "vi_filter_enabled", True),
+        "vi_cooling_minutes": getattr(state, "vi_cooling_minutes", 5),
+        "vi_reentry_eval_enabled": getattr(state, "vi_reentry_eval_enabled", True),
+        "vi_reentry_stabilization_seconds": getattr(state, "vi_reentry_stabilization_seconds", 20),
+        "vi_reentry_breakout_buffer_ratio": getattr(state, "vi_reentry_breakout_buffer_ratio", 0.001),
         "buy_confirm_ticks": getattr(state, "buy_confirm_ticks", 1),
         "dead_cross_confirm_ticks": getattr(state, "dead_cross_confirm_ticks", 0),
         "enable_time_liquidation": getattr(state, "enable_time_liquidation", False),
@@ -6463,6 +6681,7 @@ async def approve_signal(signal_id: str, current_user: str = Depends(get_current
             vi_skip = getattr(state, "_vi_skip_until", None) or {}
             if not isinstance(vi_skip, dict):
                 vi_skip = {}
+            _mark_vi_reentry_active(sc, float(signal_data.get("price") or 0.0))
             state._vi_skip_until = {**vi_skip, sc: time.time() + vi_cooling * 60}
             await state.broadcast({"type": "log", "level": "warning", "message": f"주문 거절(VI): {sc} → {vi_cooling}분간 해당 종목 매수 스킵"})
         if details.get("error_type") == "auth_expired":
@@ -6471,6 +6690,8 @@ async def approve_signal(signal_id: str, current_user: str = Depends(get_current
                 send_alert("error", "토큰 만료 가능성. 재로그인 후 이용하세요.", title="인증 만료")
             except Exception:
                 pass
+    elif str(signal_data.get("signal") or "").lower() == "buy":
+        _mark_vi_reentry_bought(str(signal_data.get("stock_code") or ""))
     try:
         audit_log(current_user, "signal_approve", {"signal_id": signal_id, "stock_code": signal_data.get("stock_code"), "result": result, "filled": filled})
     except Exception:
@@ -6788,6 +7009,9 @@ async def update_strategy_config(config: StrategyConfig, current_user: str = Dep
                 f"volNorm=N{int(getattr(state,'vol_norm_lookback_ticks',20) or 20)} slopeMult={float(getattr(state,'slope_vs_vol_mult',0.0) or 0.0):.2f} rangeMult={float(getattr(state,'range_vs_vol_mult',0.0) or 0.0):.2f}, "
                 f"regimeSplit={'on' if getattr(state,'enable_morning_regime_split',False) else 'off'}@{getattr(state,'morning_regime_early_end_hhmm','09:10')}, "
                 f"cooldown={state.reentry_cooldown_seconds}s, "
+                f"viReeval={'on' if getattr(state,'vi_reentry_eval_enabled',True) else 'off'}"
+                f"({int(getattr(state,'vi_reentry_stabilization_seconds',20) or 20)}s,"
+                f"+{float(getattr(state,'vi_reentry_breakout_buffer_ratio',0.001) or 0.001)*100:.2f}%), "
                 f"confirm={int(state.buy_confirm_ticks)}tick, "
                 f"dcConfirm={int(getattr(state, 'dead_cross_confirm_ticks', 0) or 0)}tick, "
                 f"time_liq={'on' if state.enable_time_liquidation else 'off'}@{state.liquidate_after_hhmm}, "
@@ -7245,6 +7469,7 @@ async def execute_manual_order(order: ManualOrder, current_user: str = Depends(g
                 vi_skip = getattr(state, "_vi_skip_until", None) or {}
                 if not isinstance(vi_skip, dict):
                     vi_skip = {}
+                _mark_vi_reentry_active(sc, float(getattr(order, "price", 0.0) or 0.0))
                 state._vi_skip_until = {**vi_skip, sc: time.time() + vi_cooling * 60}
                 await state.broadcast({"type": "log", "level": "warning", "message": f"주문 거절(VI): {sc} → {vi_cooling}분간 해당 종목 매수 스킵"})
             if details.get("error_type") == "auth_expired":
@@ -7253,6 +7478,8 @@ async def execute_manual_order(order: ManualOrder, current_user: str = Depends(g
                     send_alert("error", "토큰 만료 가능성. 재로그인 후 이용하세요.", title="인증 만료")
                 except Exception:
                     pass
+        elif str(order.order_type or "").lower() == "buy":
+            _mark_vi_reentry_bought(str(order.stock_code or ""))
         try:
             audit_log(current_user, "manual_order", {"stock_code": order.stock_code, "order_type": order.order_type, "quantity": order.quantity, "result": result, "filled": filled})
         except Exception:

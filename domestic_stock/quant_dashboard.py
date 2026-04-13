@@ -593,6 +593,10 @@ class StrategyConfig(BaseModel):
     # VI(종목별 변동성완화장치) 발동 시 해당 종목 N분 매수 스킵
     vi_filter_enabled: bool = True
     vi_cooling_minutes: int = 5  # 해당 종목 냉각 분
+    # VI 해제 후 강세주 재평가: 즉시 추격 대신 짧은 안정화 후 직전 VI 고점 재돌파 시에만 재평가
+    vi_reentry_eval_enabled: bool = True
+    vi_reentry_stabilization_seconds: int = 20
+    vi_reentry_breakout_buffer_ratio: float = 0.001  # 0.1% 상향 재돌파
     # 거래대금 집중 시장 레짐: 상위 N종목 거래대금 비율이 X% 초과면 매수 스킵(좁은 시장)
     trade_value_concentration_filter_enabled: bool = False
     trade_value_concentration_market: str = "1001"  # 1001:코스닥, 0001:코스피

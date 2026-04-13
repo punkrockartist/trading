@@ -1624,6 +1624,21 @@ def get_dashboard_html(username: str) -> str:
                             <label>해당 종목 냉각(분):</label>
                             <input type="number" id="vi_cooling_minutes" value="5" min="1" max="30">
                         </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="vi_reentry_eval_enabled" checked>
+                                VI 해제 후 강세주 재평가
+                            </label>
+                            <div class="hint">VI가 풀린 직후 바로 추격하지 않고, 짧은 안정화 후 직전 VI 고점 재돌파 시에만 재평가합니다.</div>
+                        </div>
+                        <div class="form-group" style="margin-left:24px;">
+                            <label>안정화(초): <code class="setting-var">vi_reentry_stabilization_seconds</code></label>
+                            <input type="number" id="vi_reentry_stabilization_seconds" value="20" min="0" max="180">
+                        </div>
+                        <div class="form-group" style="margin-left:24px;">
+                            <label>재돌파 버퍼(%): <code class="setting-var">vi_reentry_breakout_buffer_ratio</code></label>
+                            <input type="number" id="vi_reentry_breakout_buffer_pct" value="0.10" min="0" max="3" step="0.01">
+                        </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="index_ma_filter_enabled">
@@ -4532,6 +4547,9 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     if (strat.sidecar_action != null) {{ const el = document.getElementById('sidecar_action'); if (el) el.value = strat.sidecar_action; }}
                     if (strat.vi_filter_enabled != null) document.getElementById('vi_filter_enabled').checked = !!strat.vi_filter_enabled;
                     if (strat.vi_cooling_minutes != null) document.getElementById('vi_cooling_minutes').value = strat.vi_cooling_minutes;
+                    if (strat.vi_reentry_eval_enabled != null) document.getElementById('vi_reentry_eval_enabled').checked = !!strat.vi_reentry_eval_enabled;
+                    if (strat.vi_reentry_stabilization_seconds != null) document.getElementById('vi_reentry_stabilization_seconds').value = strat.vi_reentry_stabilization_seconds;
+                    if (strat.vi_reentry_breakout_buffer_ratio != null) document.getElementById('vi_reentry_breakout_buffer_pct').value = (Number(strat.vi_reentry_breakout_buffer_ratio) * 100).toFixed(2);
                     if (strat.index_ma_filter_enabled != null) document.getElementById('index_ma_filter_enabled').checked = !!strat.index_ma_filter_enabled;
                     if (strat.index_ma_code != null) document.getElementById('index_ma_code').value = strat.index_ma_code;
                     if (strat.index_ma_period != null) document.getElementById('index_ma_period').value = strat.index_ma_period;
@@ -4809,6 +4827,9 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     sidecar_action: (document.getElementById('sidecar_action')?.value || 'skip_buy_only'),
                     vi_filter_enabled: !!document.getElementById('vi_filter_enabled').checked,
                     vi_cooling_minutes: parseInt(document.getElementById('vi_cooling_minutes').value) || 5,
+                    vi_reentry_eval_enabled: !!document.getElementById('vi_reentry_eval_enabled').checked,
+                    vi_reentry_stabilization_seconds: parseInt(document.getElementById('vi_reentry_stabilization_seconds').value) || 20,
+                    vi_reentry_breakout_buffer_ratio: (parseFloat(document.getElementById('vi_reentry_breakout_buffer_pct').value) || 0.10) / 100,
                     index_ma_filter_enabled: !!document.getElementById('index_ma_filter_enabled').checked,
                     index_ma_code: (document.getElementById('index_ma_code')?.value || '1001'),
                     index_ma_period: parseInt(document.getElementById('index_ma_period').value) || 20,
@@ -5337,6 +5358,9 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 document.getElementById('circuit_breaker_threshold_pct').value = -7;
                 document.getElementById('sidecar_filter_enabled').checked = true;
                 document.getElementById('vi_filter_enabled').checked = true;
+                document.getElementById('vi_reentry_eval_enabled').checked = true;
+                document.getElementById('vi_reentry_stabilization_seconds').value = 20;
+                document.getElementById('vi_reentry_breakout_buffer_pct').value = 0.10;
                 // 시간대: 장 초반 N분 스킵, 마감 N분 전 신규 매수 스킵
                 document.getElementById('skip_buy_first_minutes').value = (overrides.skip_buy_first_minutes != null) ? overrides.skip_buy_first_minutes : 5;
                 document.getElementById('last_minutes_no_buy').value = overrides.last_minutes_no_buy;
