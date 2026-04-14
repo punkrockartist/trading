@@ -767,6 +767,7 @@ def get_dashboard_html(username: str) -> str:
             <button class="tab active" data-tab="status" onclick="showTab('status')">상태</button>
             <button class="tab" data-tab="positions" onclick="showTab('positions')">포지션</button>
                 <button class="tab" data-tab="performance" onclick="showTab('performance')">성과</button>
+            <button class="tab" data-tab="macro" onclick="showTab('macro')">매크로</button>
             <button class="tab" data-tab="settings" onclick="showTab('settings')">설정</button>
                 <button class="tab" data-tab="signals" onclick="showTab('signals')">승인대기</button>
             <button class="tab" data-tab="trades" onclick="showTab('trades')">거래내역</button>
@@ -1018,6 +1019,247 @@ def get_dashboard_html(username: str) -> str:
                                 </tr>
                             </thead>
                             <tbody id="performance_daily_tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 매크로 탭 -->
+        <div id="tab-macro" class="tab-content">
+            <div class="card">
+                <div class="card-header-row">
+                    <h2>매크로 현재값 입력</h2>
+                    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                        <button type="button" class="btn btn-inline" onclick="autoFetchMacroAnalysis()">스크롤실행</button>
+                        <button type="button" class="btn btn-inline" onclick="loadMacroAnalysis(true)">불러오기</button>
+                        <button type="button" class="btn btn-inline" onclick="saveMacroAnalysis()">저장·분석</button>
+                    </div>
+                </div>
+                <p class="hint">현재값만 수기로 입력하면 `미장`과 `USD/KRW`의 `금일·주간·월간` 방향 바이어스를 규칙형으로 추정합니다. `스크롤실행`을 누르면 FRED와 공개 시세 소스 기반으로 값을 자동 채워 넣습니다.</p>
+                <div style="display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; margin:12px 0;">
+                    <div class="form-group" style="margin:0; min-width:180px;">
+                        <label>기준일</label>
+                        <input type="date" id="macro_as_of_date">
+                    </div>
+                </div>
+                <div id="macro_fetch_info" class="hint" style="margin:0 0 10px 0;">자동 수집 이력 없음</div>
+                <div style="overflow-x:auto;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>항목</th>
+                                <th>현재값</th>
+                                <th>설명</th>
+                                <th>기준선</th>
+                                <th>자동수집</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr id="macro-row-vix">
+                                <td>VIX</td>
+                                <td><input type="number" id="macro_vix" step="0.1" placeholder="예: 13.8" style="min-width:120px;"></td>
+                                <td>낮을수록 단기 리스크온, 높을수록 리스크오프 해석</td>
+                                <td>&lt;14 안정, 18+ 경계, 22+ 부담, 28+ 긴장</td>
+                                <td id="macro-source-vix" class="hint">-</td>
+                            </tr>
+                            <tr id="macro-row-spx_fut_pct">
+                                <td>S&amp;P500 선물 (%)</td>
+                                <td><input type="number" id="macro_spx_fut_pct" step="0.01" placeholder="예: 0.45" style="min-width:120px;"></td>
+                                <td>금일 미장 방향성의 가장 직접적인 입력</td>
+                                <td>+0.2% 이상 우호, -0.2% 이하 부담</td>
+                                <td id="macro-source-spx_fut_pct" class="hint">-</td>
+                            </tr>
+                            <tr id="macro-row-ndx_fut_pct">
+                                <td>Nasdaq100 선물 (%)</td>
+                                <td><input type="number" id="macro_ndx_fut_pct" step="0.01" placeholder="예: 0.70" style="min-width:120px;"></td>
+                                <td>성장주/기술주 민감도 보강</td>
+                                <td>+0.3% 이상 우호, -0.3% 이하 부담</td>
+                                <td id="macro-source-ndx_fut_pct" class="hint">-</td>
+                            </tr>
+                            <tr id="macro-row-dxy">
+                                <td>DXY</td>
+                                <td><input type="number" id="macro_dxy" step="0.01" placeholder="예: 104.80" style="min-width:120px;"></td>
+                                <td>달러 강세면 대체로 환율 상방, 위험자산 부담</td>
+                                <td>&lt;102.5 완화, 104+ 강세, 105.5+ 부담</td>
+                                <td id="macro-source-dxy" class="hint">-</td>
+                            </tr>
+                            <tr id="macro-row-usdkrw">
+                                <td>USD/KRW</td>
+                                <td><input type="number" id="macro_usdkrw" step="0.1" placeholder="예: 1378.5" style="min-width:120px;"></td>
+                                <td>현재 환율 레벨 자체가 주간·월간 바이어스에 반영</td>
+                                <td>&lt;1320 완화, 1380+ 부담, 1450+ 고압력</td>
+                                <td id="macro-source-usdkrw" class="hint">-</td>
+                            </tr>
+                            <tr id="macro-row-us2y">
+                                <td>미국 2년물 (%)</td>
+                                <td><input type="number" id="macro_us2y" step="0.01" placeholder="예: 4.32" style="min-width:120px;"></td>
+                                <td>정책금리 부담과 달러 방향성 민감</td>
+                                <td>&lt;3.8 안정, 4.4+ 부담, 4.8+ 고금리</td>
+                                <td id="macro-source-us2y" class="hint">-</td>
+                            </tr>
+                            <tr id="macro-row-us10y">
+                                <td>미국 10년물 (%)</td>
+                                <td><input type="number" id="macro_us10y" step="0.01" placeholder="예: 4.41" style="min-width:120px;"></td>
+                                <td>밸류에이션 부담, 성장주 할인율 반영</td>
+                                <td>&lt;4.0 안정, 4.5+ 부담, 4.8+ 고압력</td>
+                                <td id="macro-source-us10y" class="hint">-</td>
+                            </tr>
+                            <tr id="macro-row-hy_oas">
+                                <td>HY OAS (bp)</td>
+                                <td><input type="number" id="macro_hy_oas" step="1" placeholder="예: 365" style="min-width:120px;"></td>
+                                <td>신용스프레드. 높을수록 주간·월간 리스크오프</td>
+                                <td>&lt;340 안정, 400+ 경계, 450+ 확대</td>
+                                <td id="macro-source-hy_oas" class="hint">-</td>
+                            </tr>
+                            <tr id="macro-row-sofr">
+                                <td>SOFR (%)</td>
+                                <td><input type="number" id="macro_sofr" step="0.01" placeholder="예: 5.31" style="min-width:120px;"></td>
+                                <td>담보부 익일물 기준금리. IORB, T-bill과 함께 스프레드 계산</td>
+                                <td>내부 계산: `SOFR - IORB`, `3M T-bill - SOFR`</td>
+                                <td id="macro-source-sofr" class="hint">-</td>
+                            </tr>
+                            <tr id="macro-row-iorb">
+                                <td>IORB (%)</td>
+                                <td><input type="number" id="macro_iorb" step="0.01" placeholder="예: 5.40" style="min-width:120px;"></td>
+                                <td>연준 지급준비금 이자. SOFR 대비 단기 유동성 스트레스 판단</td>
+                                <td>내부 계산 후 `SOFR - IORB` 기준선 적용</td>
+                                <td id="macro-source-iorb" class="hint">-</td>
+                            </tr>
+                            <tr id="macro-row-tbill_3m">
+                                <td>3M T-bill (%)</td>
+                                <td><input type="number" id="macro_tbill_3m" step="0.01" placeholder="예: 5.18" style="min-width:120px;"></td>
+                                <td>3개월 국채수익률. SOFR 대비 현금 선호·유동성 스트레스 판단</td>
+                                <td>내부 계산 후 `3M T-bill - SOFR` 기준선 적용</td>
+                                <td id="macro-source-tbill_3m" class="hint">-</td>
+                            </tr>
+                            <tr id="macro-row-wti">
+                                <td>WTI ($)</td>
+                                <td><input type="number" id="macro_wti" step="0.1" placeholder="예: 82.4" style="min-width:120px;"></td>
+                                <td>유가 급등 시 인플레·위험자산 부담</td>
+                                <td>&lt;70 안정, 90+ 부담, 100+ 고유가</td>
+                                <td id="macro-source-wti" class="hint">-</td>
+                            </tr>
+                            <tr id="macro-row-gold">
+                                <td>Gold ($)</td>
+                                <td><input type="number" id="macro_gold" step="0.1" placeholder="예: 2360.0" style="min-width:120px;"></td>
+                                <td>방어 선호 또는 대체 안전자산 수요 참고</td>
+                                <td>2400+ 방어 선호 신호 참고</td>
+                                <td id="macro-source-gold" class="hint">-</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div id="macro_status" class="hint" style="margin-top:10px;">저장된 값이 있으면 불러와서 표시됩니다.</div>
+            </div>
+            <div class="card">
+                <h2>매크로 분석 결과</h2>
+                <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:12px; margin-bottom:12px;">
+                    <div style="border:1px solid var(--border); background:var(--surface-2); padding:12px; border-radius:var(--radius);">
+                        <div class="hint" style="margin-bottom:4px;">입력 완성도</div>
+                        <div id="macro_filled_count" style="font-size:24px; font-weight:700;">-</div>
+                    </div>
+                    <div style="border:1px solid var(--border); background:var(--surface-2); padding:12px; border-radius:var(--radius);">
+                        <div class="hint" style="margin-bottom:4px;">유동성 상태</div>
+                        <div id="macro_liquidity_label" style="font-size:24px; font-weight:700;">-</div>
+                    </div>
+                    <div style="border:1px solid var(--border); background:var(--surface-2); padding:12px; border-radius:var(--radius);">
+                        <div class="hint" style="margin-bottom:4px;">기준일</div>
+                        <div id="macro_analysis_date" style="font-size:20px; font-weight:700;">-</div>
+                    </div>
+                </div>
+                <div id="macro_one_liner" style="padding:12px 14px; border:1px solid var(--border); background:var(--surface-2); border-radius:var(--radius); font-size:15px; font-weight:700; margin-bottom:8px;">한줄 평가가 여기에 표시됩니다.</div>
+                <div id="macro_liquidity_summary" class="hint" style="margin-bottom:12px;">유동성 요약이 여기에 표시됩니다.</div>
+                <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap:14px;">
+                    <div style="min-width:0;">
+                        <h3 style="font-size:15px; margin-bottom:8px;">S&amp;P 중심 미장</h3>
+                        <div style="overflow-x:auto;">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>구간</th>
+                                        <th>판정</th>
+                                        <th>점수</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="macro_spx_body">
+                                    <tr><td colspan="3" style="color:var(--muted);">분석 전입니다.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div style="min-width:0;">
+                        <h3 style="font-size:15px; margin-bottom:8px;">나스닥 중심 미장</h3>
+                        <div style="overflow-x:auto;">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>구간</th>
+                                        <th>판정</th>
+                                        <th>점수</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="macro_nasdaq_body">
+                                    <tr><td colspan="3" style="color:var(--muted);">분석 전입니다.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div style="min-width:0;">
+                        <h3 style="font-size:15px; margin-bottom:8px;">USD/KRW 방향 바이어스</h3>
+                        <div style="overflow-x:auto;">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>구간</th>
+                                        <th>판정</th>
+                                        <th>점수</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="macro_usdkrw_body">
+                                    <tr><td colspan="3" style="color:var(--muted);">분석 전입니다.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                <div style="margin-top:14px;">
+                    <h3 style="font-size:15px; margin-bottom:8px;">한국장 영향</h3>
+                    <div class="hint" style="margin-bottom:8px;">미장 바이어스, 원달러 방향, 유동성 상태를 합성한 참고 카드입니다.</div>
+                    <div style="overflow-x:auto;">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>구간</th>
+                                    <th>판정</th>
+                                    <th>점수</th>
+                                </tr>
+                            </thead>
+                            <tbody id="macro_korea_body">
+                                <tr><td colspan="3" style="color:var(--muted);">분석 전입니다.</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <div style="margin-top:14px;">
+                    <h3 style="font-size:15px; margin-bottom:8px;">핵심 드라이버</h3>
+                    <ul id="macro_core_drivers" style="padding-left:18px; line-height:1.7; font-size:14px; color:var(--text);">
+                        <li style="color:var(--muted);">분석 전입니다.</li>
+                    </ul>
+                </div>
+                <div style="margin-top:14px;">
+                    <h3 style="font-size:15px; margin-bottom:8px;">입력 스냅샷</h3>
+                    <div style="overflow-x:auto;">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>항목</th>
+                                    <th>값</th>
+                                </tr>
+                            </thead>
+                            <tbody id="macro_snapshot_body">
+                                <tr><td colspan="2" style="color:var(--muted);">분석 전입니다.</td></tr>
+                            </tbody>
                         </table>
                     </div>
                 </div>
@@ -1282,6 +1524,7 @@ def get_dashboard_html(username: str) -> str:
                         <div class="form-group">
                             <label>부분 익절 트리거(%): <code class="setting-var">partial_take_profit_ratio</code></label>
                             <input type="number" id="partial_tp_pct" value="0" step="0.1" min="0" max="50">
+                            <div class="hint">실제 매수 체결가 대비 수익률 기준입니다. 같은 틱에서 전량 익절선까지 함께 도달하면 전량 익절이 우선합니다.</div>
                         </div>
                         <div class="form-group">
                             <label>부분 익절 비율(%): <code class="setting-var">partial_take_profit_fraction</code></label>
@@ -1290,6 +1533,7 @@ def get_dashboard_html(username: str) -> str:
                         <div class="form-group">
                             <label>트레일링 스탑 (%): <code class="setting-var">trailing_stop_ratio</code></label>
                             <input type="number" id="trailing_stop_pct" value="0.5" step="0.1" min="0" max="50">
+                            <div class="hint">실제 매수 체결가 기준으로 수익이 난 뒤, 기록한 고점 대비 이 비율만큼 밀리면 청산합니다.</div>
                         </div>
                         <div class="form-group">
                             <label>트레일링 활성화 최소 수익(%): <code class="setting-var">trailing_activation_ratio</code></label>
@@ -1618,33 +1862,36 @@ def get_dashboard_html(username: str) -> str:
                                 <input type="checkbox" id="vi_filter_enabled" checked>
                                 VI(종목별 변동성완화장치) 필터 <code class="setting-var">vi_filter_enabled</code>
                             </label>
-                            <div class="hint">VI 발동 종목은 N분간 해당 종목만 매수 스킵.</div>
+                            <div class="hint">1차 방어입니다. VI 발동이 감지되면 해당 종목은 즉시 냉각 구간으로 보내 신규 매수를 잠시 막습니다.</div>
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label>해당 종목 냉각(분):</label>
+                            <label>해당 종목 냉각(분): <code class="setting-var">vi_cooling_minutes</code></label>
                             <input type="number" id="vi_cooling_minutes" value="5" min="1" max="30">
+                            <div class="hint">VI 발동 직후의 과열 구간을 통째로 쉬는 시간입니다. 값이 클수록 보수적입니다.</div>
                         </div>
                         <div class="form-group" style="margin-left:12px;">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="vi_reentry_eval_enabled" checked>
-                                VI 해제 후 강세주 재평가
+                                VI 해제 후 강세주 재평가 <code class="setting-var">vi_reentry_eval_enabled</code>
                             </label>
-                            <div class="hint">VI가 풀린 직후 바로 추격하지 않고, 짧은 안정화 후 직전 VI 고점 재돌파 시에만 재평가합니다.</div>
+                            <div class="hint">2차 진입 필터입니다. 냉각이 끝났더라도 바로 추격하지 않고, 짧은 안정화 후 재돌파가 확인될 때만 다시 진입 후보로 봅니다.</div>
                         </div>
                         <div class="form-group" style="margin-left:24px;">
                             <label>안정화(초): <code class="setting-var">vi_reentry_stabilization_seconds</code></label>
                             <input type="number" id="vi_reentry_stabilization_seconds" value="20" min="0" max="180">
+                            <div class="hint">VI 해제 직후 흔들리는 시간을 얼마나 기다릴지 정합니다.</div>
                         </div>
                         <div class="form-group" style="margin-left:24px;">
                             <label>재돌파 버퍼(%): <code class="setting-var">vi_reentry_breakout_buffer_ratio</code></label>
                             <input type="number" id="vi_reentry_breakout_buffer_pct" value="0.10" min="0" max="3" step="0.01">
+                            <div class="hint">직전 VI 고점을 이 비율만큼 다시 넘겨야 재진입을 허용합니다. 값이 클수록 추격을 더 보수적으로 막습니다.</div>
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="index_ma_filter_enabled">
                                 지수 MA 시장 레짐 필터 <code class="setting-var">index_ma_filter_enabled</code>
                             </label>
-                            <div class="hint">지수(코스닥/코스피)가 N일 MA 미만이면 매수 전부 스킵. 하락장 진입 억제.</div>
+                            <div class="hint">시장 약세 판단의 핵심 1축입니다. 지수(코스닥/코스피)가 N일 MA 미만이면 신규 매수를 막습니다.</div>
                         </div>
                         <div class="form-group" style="margin-left:12px;">
                             <label>지수: <code class="setting-var">index_ma_code</code></label>
@@ -1660,22 +1907,13 @@ def get_dashboard_html(username: str) -> str:
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
                                 <input type="checkbox" id="regime_dual_switch_enabled" checked>
-                                듀얼 레짐(지수 MA + 종목 분봉 박스) <code class="setting-var">regime_dual_switch_enabled</code>
+                                듀얼 레짐(MA vs MR 진입 선택) <code class="setting-var">regime_dual_switch_enabled</code>
                             </label>
-                            <div class="hint">지수(N일 MA)와 종목 1분봉 박스를 함께 보면 추세 매수와 횡보(박스) 구간을 나누기 좋습니다. 켜면 아래 규칙이 MA 골든 매수에 추가로 적용됩니다.</div>
-                            <div class="hint">추천값 요약: lookback <strong>12~15</strong>(오전 단타), <strong>20</strong>(전일·오후), 박스폭 비율 <strong>0.006~0.007</strong>(0.6~0.7%). MR(박스 하단 매수)은 오전·보수 <strong>끔</strong>, 전일·오후·공격 <strong>켬</strong> 권장. 기존 <code>index_ma_filter_enabled</code>와 병행 시 지수 조건이 이중으로 걸립니다.</div>
+                            <div class="hint">이제 듀얼 레짐은 시장 약세 차단용이 아니라, 종목 분봉 박스를 보고 MA 추세 진입과 MR 역추세 진입을 나누는 용도로만 사용합니다.</div>
+                            <div class="hint">시장 하락/약세는 <code>index_ma_filter_enabled</code>, <code>advance_ratio_filter_enabled</code>, 메인 횡보 필터가 담당합니다.</div>
                         </div>
                         <div class="form-group" style="margin-left:12px;">
-                            <label style="display:flex; align-items:center; gap:8px;">
-                                <input type="checkbox" id="regime_block_ma_buy_when_index_bear" checked>
-                                지수 &lt; MA 이면 MA 추세 매수 제외 <code class="setting-var">regime_block_ma_buy_when_index_bear</code>
-                            </label>
-                        </div>
-                        <div class="form-group" style="margin-left:12px;">
-                            <label style="display:flex; align-items:center; gap:8px;">
-                                <input type="checkbox" id="regime_block_ma_buy_when_stock_range" checked>
-                                종목 분봉 박스가 좁으면 MA 추세 매수 제외 <code class="setting-var">regime_block_ma_buy_when_stock_range</code>
-                            </label>
+                            <div class="hint">이전의 <code>regime_block_ma_buy_when_index_bear</code>, <code>regime_block_ma_buy_when_stock_range</code> 옵션은 중복 차단을 줄이기 위해 숨김 처리되며 저장값이 있어도 런타임에서는 무시됩니다.</div>
                         </div>
                         <div class="form-group" style="margin-left:12px;">
                             <label>박스 판단: 최근 N분봉 <code class="setting-var">regime_stock_range_lookback_minutes</code></label>
@@ -1859,7 +2097,7 @@ def get_dashboard_html(username: str) -> str:
                                 <input type="checkbox" id="use_sap_revert_entry">
                                 SAP 풀백 진입 보조 사용 <code class="setting-var">use_sap_revert_entry</code>
                             </label>
-                            <div class="hint">당일 세션 평균가(SAP) 대비 특정 하단 구간(%)에서만 신규 매수 허용. MA 크로스+필터가 모두 통과해도 SAP 범위를 벗어나면 매수 스킵.</div>
+                            <div class="hint">위의 SAP 이격 필터가 "과열 차단"이라면, 이 옵션은 "평균가 근처 풀백 구간에서만 진입"을 허용하는 보조 조건입니다. 둘은 역할이 다릅니다.</div>
                         </div>
                         <div class="form-group">
                             <label>SAP 풀백 진입 구간(%): <code class="setting-var">sap_revert_entry_from_pct</code> ~ <code class="setting-var">sap_revert_entry_to_pct</code></label>
@@ -2138,15 +2376,15 @@ def get_dashboard_html(username: str) -> str:
                             </div>
                             <div class="help-item">
                                 <strong>오전 단타(9~12)</strong>
-                                매수 09:05~11:30, 11:55 시간 청산. 손절·익절·ATR/SAP·지수 MA·상승 비율 등 단타용으로 맞춤. 듀얼 레짐: lookback <strong>12</strong>, 박스 <strong>0.006</strong>, MR <strong>끔</strong>이 기본 적용됩니다.
+                                매수 09:05~11:30, 11:55 시간 청산. 손절·익절·ATR/SAP·지수 MA·상승 비율 등 단타용으로 맞춤. 듀얼 레짐은 MA 추세 vs MR 선택 용도로만 쓰며, 기본값은 lookback <strong>12</strong>, 박스 <strong>0.006</strong>, MR <strong>끔</strong>입니다.
                             </div>
                             <div class="help-item">
                                 <strong>오후 단타(12~15:20)</strong>
-                                매수 12:05~15:20, 장 초 스킵 0분, 15:25 청산. 듀얼 레짐: lookback <strong>20</strong>, 박스 <strong>0.007</strong>, MR <strong>켬</strong>(하단 0.30), 분봉 추세는 장초 한정 해제.
+                                매수 12:05~15:20, 장 초 스킵 0분, 15:25 청산. 듀얼 레짐 기본값은 lookback <strong>20</strong>, 박스 <strong>0.007</strong>, MR <strong>켬</strong>(하단 0.30)이며, 분봉 추세는 장초 한정 해제됩니다.
                             </div>
                             <div class="help-item">
                                 <strong>전일 단타(오전~오후)</strong>
-                                매수 창 09:05~15:20, 15:25 시간 청산. 오전 단타와 유사한 리스크·전략에 장중~오후까지 확장. 듀얼 레짐: lookback <strong>20</strong>, 박스 <strong>0.007</strong>, MR <strong>켬</strong>(하단 0.30).
+                                매수 창 09:05~15:20, 15:25 시간 청산. 오전 단타와 유사한 리스크·전략에 장중~오후까지 확장. 듀얼 레짐 기본값은 lookback <strong>20</strong>, 박스 <strong>0.007</strong>, MR <strong>켬</strong>(하단 0.30)입니다.
                             </div>
                             <div class="help-item">
                                 <strong>보수적 단타 / 공격적 단타</strong>
@@ -2192,11 +2430,11 @@ def get_dashboard_html(username: str) -> str:
                             </div>
                             <div class="help-item">
                                 <strong>손절매 비율(%) (<code>stop_loss_ratio</code>)</strong>
-                                매수가 대비 손실률이 이 값에 도달하면 매도 신호를 냅니다. 값이 작을수록 빨리 손절(보수적)합니다. 단타에서는 0.5~1.2%를 많이 씁니다.
+                                실제 매수 체결가 대비 손실률이 이 값에 도달하면 매도 신호를 냅니다. 값이 작을수록 빨리 손절(보수적)합니다. 단타에서는 0.5~1.2%를 많이 씁니다.
                             </div>
                             <div class="help-item">
                                 <strong>익절매 비율(%) (<code>take_profit_ratio</code>)</strong>
-                                매수가 대비 수익률이 이 값에 도달하면 매도 신호를 냅니다. 손절 대비 2배 정도(예: 손절 0.8%·익절 1.8%)로 두면 손익비를 맞추기 쉽습니다.
+                                실제 매수 체결가 대비 수익률이 이 값에 도달하면 전량 매도 신호를 냅니다. 손절 대비 1.5~2배 정도로 두면 손익비를 맞추기 쉽습니다.
                             </div>
                             <div class="help-item">
                                 <strong>ATR(틱 변동성) 배수 손절/익절 (<code>use_atr_for_stop_take</code>)</strong>
@@ -2240,11 +2478,11 @@ def get_dashboard_html(username: str) -> str:
                             </div>
                             <div class="help-item">
                                 <strong>부분 익절 트리거/비율</strong>
-                                지정한 수익률에 도달하면 보유 수량의 일부만 매도합니다. 비율은 0~100%로 설정합니다. 1주만 보유 중이면 부분 익절도 전량 매도처럼 처리됩니다.
+                                지정한 수익률에 도달하면 보유 수량의 일부만 매도합니다. 다만 같은 틱에서 전량 익절선까지 함께 도달하면 전량 익절이 먼저 실행됩니다. 비율은 0~100%로 설정합니다. 1주만 보유 중이면 부분 익절도 전량 매도처럼 처리됩니다.
                             </div>
                             <div class="help-item">
                                 <strong>트레일링 스탑/활성화</strong>
-                                “활성화 수익률” 이상 오른 뒤, 고점 대비 “트레일링 스탑 %”만큼 내려오면 매도합니다. 추세가 길게 나갈 때 수익을 더 끌어당기면서도 급반전 시 보호할 수 있습니다.
+                                실제 매수 체결가 기준으로 “활성화 수익률” 이상 오른 뒤, 기록한 고점 대비 “트레일링 스탑 %”만큼 내려오면 매도합니다. 추세가 길게 나갈 때 수익을 더 끌어당기면서도 급반전 시 보호할 수 있습니다.
                             </div>
                         </div>
                     </details>
@@ -2308,7 +2546,7 @@ def get_dashboard_html(username: str) -> str:
                             </div>
                             <div class="help-item">
                                 <strong>듀얼 레짐 (<code>regime_dual_switch_enabled</code> 등)</strong>
-                                <code>index_ma_filter_enabled</code>와 별개로, “지수가 MA 아래인가”와 “종목이 최근 N분 1분봉에서 고저폭이 좁은 박스인가”를 조합해 MA 골든 추세 매수를 끄거나, 옵션에 따라 박스 하단에서만 역추세(MR) 매수를 허용합니다. 지수·종목을 함께 보는 편이 횡보장에서의 불필요한 추세 진입을 줄이는 데 유리합니다.
+                                현재는 시장 약세 차단용이 아니라, 종목 분봉 박스를 보고 MA 골든 추세 진입과 박스 하단 MR 진입을 나누는 선택 스위치입니다. 시장 약세는 <code>index_ma_filter_enabled</code>와 <code>advance_ratio_*</code>가 담당하고, 박스/횡보 차단은 메인 <code>range</code> 필터가 담당합니다.
                             </div>
                             <div class="help-item">
                                 <strong>서킷브레이커·사이드카·VI (<code>circuit_breaker_*</code> / <code>sidecar_*</code> / <code>vi_*</code>)</strong>
@@ -2795,6 +3033,21 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
         let performanceDailyRows = [];
         let performanceDailyCurrentPage = 1;
         let performanceDailyPageSize = 30;
+        const MACRO_FIELDS = [
+            ['vix', 'VIX'],
+            ['spx_fut_pct', 'S&P500 선물'],
+            ['ndx_fut_pct', 'Nasdaq100 선물'],
+            ['dxy', 'DXY'],
+            ['usdkrw', 'USD/KRW'],
+            ['us2y', '미국 2년물'],
+            ['us10y', '미국 10년물'],
+            ['hy_oas', 'HY OAS'],
+            ['sofr', 'SOFR'],
+            ['iorb', 'IORB'],
+            ['tbill_3m', '3M T-bill'],
+            ['wti', 'WTI'],
+            ['gold', 'Gold'],
+        ];
 
         function showTab(tabName) {{
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -2820,6 +3073,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 }}
             }}
             if (tabName === 'docs') showDocsSection('overview');
+            if (tabName === 'macro') loadMacroAnalysis(false);
             if (tabName === 'positions') {{
                 // 포지션 탭 최초 진입 시 1회: MTS/계좌 잔고 기준으로 강제 동기화
                 if (!window.__positionsTabInitialized) {{
@@ -2849,6 +3103,244 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     const today = new Date().toISOString().slice(0, 10);
                     dateEl.value = today;
                 }}
+            }}
+        }}
+
+        function ensureMacroDateDefault() {{
+            const el = document.getElementById('macro_as_of_date');
+            if (el && !el.value) el.value = new Date().toISOString().slice(0, 10);
+        }}
+
+        function applyMacroConfig(config) {{
+            ensureMacroDateDefault();
+            const cfg = config || {{}};
+            const dateEl = document.getElementById('macro_as_of_date');
+            if (dateEl && cfg.as_of_date) dateEl.value = cfg.as_of_date;
+            MACRO_FIELDS.forEach(([key]) => {{
+                const el = document.getElementById(`macro_${{key}}`);
+                if (el) el.value = (cfg[key] ?? '') === null ? '' : (cfg[key] ?? '');
+            }});
+        }}
+
+        function buildMacroPayload() {{
+            ensureMacroDateDefault();
+            const payload = {{
+                as_of_date: (document.getElementById('macro_as_of_date')?.value || '').trim(),
+                headline_note: '',
+            }};
+            MACRO_FIELDS.forEach(([key]) => {{
+                const raw = (document.getElementById(`macro_${{key}}`)?.value || '').trim();
+                payload[key] = raw === '' ? null : Number(raw);
+            }});
+            return payload;
+        }}
+
+        function renderMacroFetchMeta(fetchMeta) {{
+            const meta = fetchMeta || null;
+            const infoEl = document.getElementById('macro_fetch_info');
+            MACRO_FIELDS.forEach(([key]) => {{
+                const rowEl = document.getElementById(`macro-row-${{key}}`);
+                const srcEl = document.getElementById(`macro-source-${{key}}`);
+                if (rowEl) rowEl.style.background = '';
+                if (srcEl) srcEl.textContent = '-';
+            }});
+            if (!meta) {{
+                if (infoEl) infoEl.textContent = '자동 수집 이력 없음';
+                return;
+            }}
+            const fetchedAt = meta.fetched_at || '';
+            const failures = Array.isArray(meta.failures) ? meta.failures : [];
+            const sources = meta.sources || {{}};
+            if (infoEl) {{
+                infoEl.textContent = fetchedAt
+                    ? `마지막 자동수집: ${{fetchedAt}}${{failures.length ? ` · 실패 ${{failures.length}}건` : ''}}`
+                    : '자동 수집 메타데이터가 있습니다.';
+            }}
+            MACRO_FIELDS.forEach(([key]) => {{
+                const rowEl = document.getElementById(`macro-row-${{key}}`);
+                const srcEl = document.getElementById(`macro-source-${{key}}`);
+                const src = sources[key] || null;
+                if (srcEl && src) {{
+                    const sourceLabel = String(src.source || '-');
+                    const shortLabel = sourceLabel.toLowerCase().includes('fred')
+                        ? 'FRED'
+                        : (sourceLabel.toLowerCase().includes('stooq') ? 'stooq' : sourceLabel);
+                    const titleParts = [sourceLabel];
+                    if (src.description) titleParts.push(src.description);
+                    if (src.observed_at) titleParts.push(`@ ${{src.observed_at}}`);
+                    const title = titleParts.join(' - ');
+                    if (src.url) {{
+                        srcEl.innerHTML = `<a href="${{src.url}}" target="_blank" rel="noopener noreferrer" title="${{title}}">${{shortLabel}}</a>`;
+                    }} else {{
+                        srcEl.textContent = shortLabel;
+                        srcEl.title = title;
+                    }}
+                }}
+                if (rowEl && failures.includes(key)) {{
+                    rowEl.style.background = 'rgba(209, 50, 18, 0.08)';
+                }}
+            }});
+        }}
+
+        function renderMacroAnalysis(analysis) {{
+            const a = analysis || {{}};
+            const filledEl = document.getElementById('macro_filled_count');
+            const liquidityEl = document.getElementById('macro_liquidity_label');
+            const dateEl = document.getElementById('macro_analysis_date');
+            const oneEl = document.getElementById('macro_one_liner');
+            const liquiditySummaryEl = document.getElementById('macro_liquidity_summary');
+            const driversEl = document.getElementById('macro_core_drivers');
+            const spxBodyEl = document.getElementById('macro_spx_body');
+            const ndxBodyEl = document.getElementById('macro_nasdaq_body');
+            const fxBodyEl = document.getElementById('macro_usdkrw_body');
+            const koreaBodyEl = document.getElementById('macro_korea_body');
+            const snapBodyEl = document.getElementById('macro_snapshot_body');
+            if (filledEl) filledEl.textContent = `${{a.filled_count ?? 0}} / ${{a.total_inputs ?? 0}}`;
+            if (liquidityEl) liquidityEl.textContent = a.liquidity_label || '-';
+            if (dateEl) dateEl.textContent = a.as_of_date || '-';
+            if (oneEl) oneEl.textContent = a.one_liner || '한줄 평가가 여기에 표시됩니다.';
+            if (liquiditySummaryEl) liquiditySummaryEl.textContent = a.liquidity_summary || '유동성 요약이 여기에 표시됩니다.';
+            if (driversEl) {{
+                const rows = Array.isArray(a.core_drivers) ? a.core_drivers : [];
+                driversEl.innerHTML = rows.length
+                    ? rows.map((msg) => `<li>${{msg}}</li>`).join('')
+                    : '<li style="color:var(--muted);">핵심 드라이버가 없습니다.</li>';
+            }}
+            if (spxBodyEl) {{
+                const rows = [
+                    ['금일', a.spx_outlook?.daily],
+                    ['주간', a.spx_outlook?.weekly],
+                    ['월간', a.spx_outlook?.monthly],
+                ];
+                spxBodyEl.innerHTML = rows.map(([label, row]) => row
+                    ? `<tr><td>${{label}}</td><td>${{row.label || '-'}}</td><td>${{row.score ?? '-'}}</td></tr>`
+                    : ''
+                ).join('') || '<tr><td colspan="3" style="color:var(--muted);">분석 전입니다.</td></tr>';
+            }}
+            if (ndxBodyEl) {{
+                const rows = [
+                    ['금일', a.nasdaq_outlook?.daily],
+                    ['주간', a.nasdaq_outlook?.weekly],
+                    ['월간', a.nasdaq_outlook?.monthly],
+                ];
+                ndxBodyEl.innerHTML = rows.map(([label, row]) => row
+                    ? `<tr><td>${{label}}</td><td>${{row.label || '-'}}</td><td>${{row.score ?? '-'}}</td></tr>`
+                    : ''
+                ).join('') || '<tr><td colspan="3" style="color:var(--muted);">분석 전입니다.</td></tr>';
+            }}
+            if (fxBodyEl) {{
+                const rows = [
+                    ['금일', a.usdkrw?.daily],
+                    ['주간', a.usdkrw?.weekly],
+                    ['월간', a.usdkrw?.monthly],
+                ];
+                fxBodyEl.innerHTML = rows.map(([label, row]) => row
+                    ? `<tr><td>${{label}}</td><td>${{row.label || '-'}}</td><td>${{row.score ?? '-'}}</td></tr>`
+                    : ''
+                ).join('') || '<tr><td colspan="3" style="color:var(--muted);">분석 전입니다.</td></tr>';
+            }}
+            if (koreaBodyEl) {{
+                const rows = [
+                    ['금일', a.korea_market?.daily],
+                    ['주간', a.korea_market?.weekly],
+                    ['월간', a.korea_market?.monthly],
+                ];
+                koreaBodyEl.innerHTML = rows.map(([label, row]) => row
+                    ? `<tr><td>${{label}}</td><td>${{row.label || '-'}}</td><td>${{row.score ?? '-'}}</td></tr>`
+                    : ''
+                ).join('') || '<tr><td colspan="3" style="color:var(--muted);">분석 전입니다.</td></tr>';
+            }}
+            if (snapBodyEl) {{
+                const rows = Array.isArray(a.snapshots) ? a.snapshots : [];
+                snapBodyEl.innerHTML = rows.length
+                    ? rows.map((row) => `<tr><td>${{row.label}}</td><td>${{row.display_value || '-'}}</td></tr>`).join('')
+                    : '<tr><td colspan="2" style="color:var(--muted);">분석 전입니다.</td></tr>';
+            }}
+        }}
+
+        async function loadMacroAnalysis(silent = true) {{
+            ensureMacroDateDefault();
+            const statusEl = document.getElementById('macro_status');
+            if (statusEl) statusEl.textContent = '매크로 데이터 로딩 중...';
+            try {{
+                const response = await fetch('/api/macro', withAuth({{}}));
+                const data = await response.json().catch(() => ({{}}));
+                if (!response.ok || !data.success) {{
+                    if (statusEl) statusEl.textContent = data.message || ('매크로 로드 실패: ' + response.status);
+                    if (!silent) addLog('매크로 로드 실패: ' + (data.message || response.status), 'error');
+                    return;
+                }}
+                applyMacroConfig(data.config || {{}});
+                renderMacroAnalysis(data.analysis || {{}});
+                renderMacroFetchMeta(data.fetch_meta || null);
+                if (statusEl) statusEl.textContent = '저장된 매크로 입력값과 분석 결과를 불러왔습니다.';
+            }} catch (e) {{
+                if (statusEl) statusEl.textContent = '매크로 로드 오류: ' + (e.message || e);
+                if (!silent) addLog('매크로 로드 오류: ' + (e.message || e), 'error');
+            }}
+        }}
+
+        async function saveMacroAnalysis() {{
+            const statusEl = document.getElementById('macro_status');
+            const payload = buildMacroPayload();
+            if (statusEl) statusEl.textContent = '저장·분석 중...';
+            try {{
+                const response = await fetch('/api/macro', {{
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {{
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + (localStorage.getItem('token') || '')
+                    }},
+                    body: JSON.stringify(payload)
+                }});
+                const data = await response.json().catch(() => ({{}}));
+                if (!response.ok || !data.success) {{
+                    if (statusEl) statusEl.textContent = data.message || ('매크로 저장 실패: ' + response.status);
+                    addLog('매크로 저장 실패: ' + (data.message || response.status), 'error');
+                    return;
+                }}
+                applyMacroConfig(data.config || payload);
+                renderMacroAnalysis(data.analysis || {{}});
+                renderMacroFetchMeta(data.fetch_meta || null);
+                if (statusEl) statusEl.textContent = data.persisted ? '매크로 입력값이 저장되고 분석이 갱신되었습니다.' : '매크로 입력값이 메모리에 반영되고 분석이 갱신되었습니다.';
+                addLog(data.persisted ? '매크로 입력 저장·분석 완료' : '매크로 입력 분석 완료(DB 저장소 비활성)', 'info');
+            }} catch (e) {{
+                if (statusEl) statusEl.textContent = '매크로 저장 오류: ' + (e.message || e);
+                addLog('매크로 저장 오류: ' + (e.message || e), 'error');
+            }}
+        }}
+
+        async function autoFetchMacroAnalysis() {{
+            const statusEl = document.getElementById('macro_status');
+            if (statusEl) statusEl.textContent = '매크로 자동 수집 실행 중...';
+            try {{
+                const response = await fetch('/api/macro/auto-fetch', {{
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {{
+                        'Authorization': 'Bearer ' + (localStorage.getItem('token') || '')
+                    }},
+                }});
+                const data = await response.json().catch(() => ({{}}));
+                if (!response.ok || !data.success) {{
+                    if (statusEl) statusEl.textContent = data.message || ('매크로 자동 수집 실패: ' + response.status);
+                    addLog('매크로 자동 수집 실패: ' + (data.message || response.status), 'error');
+                    return;
+                }}
+                applyMacroConfig(data.config || {{}});
+                renderMacroAnalysis(data.analysis || {{}});
+                renderMacroFetchMeta(data.fetch_meta || data.fetched || null);
+                const warnings = Array.isArray(data.fetched?.warnings) ? data.fetched.warnings.filter(Boolean) : [];
+                if (statusEl) {{
+                    statusEl.textContent = warnings.length
+                        ? `자동 수집 완료(일부 실패: ${{warnings.join(', ')}})`
+                        : '자동 수집 완료: FRED/공개 시세 소스 값이 반영되었습니다.';
+                }}
+                addLog('매크로 자동 수집 완료', 'info');
+            }} catch (e) {{
+                if (statusEl) statusEl.textContent = '매크로 자동 수집 오류: ' + (e.message || e);
+                addLog('매크로 자동 수집 오류: ' + (e.message || e), 'error');
             }}
         }}
 
@@ -3670,6 +4162,31 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 below_high: '고점 대비 하락(하락추세)',
                 minute_trend: '분봉 추세 유지 실패',
                 cooldown: '재진입 쿨다운',
+                circuit_breaker: '서킷브레이커 구간',
+                sidecar: '사이드카 감지',
+                sidecar_cooling: '사이드카 냉각',
+                vi: 'VI 발동',
+                vi_cooling: 'VI 냉각',
+                vi_rest_active: 'VI 활성 추정(REST)',
+                vi_status_unknown: 'VI 상태 미확정',
+                vi_reentry_wait: 'VI 해제 후 재평가 대기',
+                index_ma: '지수 MA 약세',
+                regime_index_bear: '구형 듀얼레짐 지수 약세',
+                regime_stock_range: '구형 듀얼레짐 박스 차단',
+                advance_ratio: '상승비율 부족',
+                advance_ratio_down: '하락장 상승비율 차단',
+                trade_value_concentration: '거래대금 집중 과열',
+                relative_strength: '상대강도 부족',
+                atr_cap: 'ATR 과열',
+                vol_cap: '당일 변동률 과열',
+                sap_deviation: 'SAP 이격 과열',
+                sap_revert_window: 'SAP 평균회귀 구간 밖',
+                min_volume_ratio: '진입 거래량 하한 미달',
+                min_trade_amount_ratio: '진입 거래대금 하한 미달',
+                loss_cooldown: '연속 손실 쿨다운',
+                balance: '주문 가능 잔고 부족',
+                skip_first_minutes: '장초반 매수 제한',
+                last_minutes_no_buy: '마감 전 매수 제한',
                 confirm: '진입 확인 대기',
                 confirm2: '진입 보강 조건 미충족',
                 time_window: '신규매수 시간외',
@@ -4425,6 +4942,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 const strat = s.strategy_config || null;
                 const stocksel = s.stock_selection_config || null;
                 const oper = s.operational_config || null;
+                const macro = s.macro_config || null;
 
                 if (risk) {{
                     if (risk.max_single_trade_amount != null && risk.max_single_trade_amount !== undefined) document.getElementById('max_trade_amount').value = String(risk.max_single_trade_amount);
@@ -4488,6 +5006,11 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     if (risk.atr_stop_mult != null) document.getElementById('atr_stop_mult').value = risk.atr_stop_mult;
                     if (risk.atr_take_mult != null) document.getElementById('atr_take_mult').value = risk.atr_take_mult;
                     if (risk.atr_lookback_ticks != null) document.getElementById('atr_lookback_ticks').value = risk.atr_lookback_ticks;
+                }}
+                if (macro) {{
+                    applyMacroConfig(macro);
+                }} else {{
+                    ensureMacroDateDefault();
                 }}
                 if (strat) {{
                     var shortMa = strat.short_ma_period;
@@ -4554,8 +5077,6 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     if (strat.index_ma_code != null) document.getElementById('index_ma_code').value = strat.index_ma_code;
                     if (strat.index_ma_period != null) document.getElementById('index_ma_period').value = strat.index_ma_period;
                     if (strat.regime_dual_switch_enabled != null) document.getElementById('regime_dual_switch_enabled').checked = !!strat.regime_dual_switch_enabled;
-                    if (strat.regime_block_ma_buy_when_index_bear != null) document.getElementById('regime_block_ma_buy_when_index_bear').checked = !!strat.regime_block_ma_buy_when_index_bear;
-                    if (strat.regime_block_ma_buy_when_stock_range != null) document.getElementById('regime_block_ma_buy_when_stock_range').checked = !!strat.regime_block_ma_buy_when_stock_range;
                     if (strat.regime_stock_range_lookback_minutes != null) document.getElementById('regime_stock_range_lookback_minutes').value = strat.regime_stock_range_lookback_minutes;
                     if (strat.regime_stock_range_max_ratio != null) document.getElementById('regime_stock_range_max_ratio').value = strat.regime_stock_range_max_ratio;
                     if (strat.regime_mr_buy_enabled != null) document.getElementById('regime_mr_buy_enabled').checked = !!strat.regime_mr_buy_enabled;
@@ -4834,8 +5355,8 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     index_ma_code: (document.getElementById('index_ma_code')?.value || '1001'),
                     index_ma_period: parseInt(document.getElementById('index_ma_period').value) || 20,
                     regime_dual_switch_enabled: !!document.getElementById('regime_dual_switch_enabled')?.checked,
-                    regime_block_ma_buy_when_index_bear: !!document.getElementById('regime_block_ma_buy_when_index_bear')?.checked,
-                    regime_block_ma_buy_when_stock_range: !!document.getElementById('regime_block_ma_buy_when_stock_range')?.checked,
+                    regime_block_ma_buy_when_index_bear: false,
+                    regime_block_ma_buy_when_stock_range: false,
                     regime_stock_range_lookback_minutes: parseInt(document.getElementById('regime_stock_range_lookback_minutes')?.value) || 15,
                     regime_stock_range_max_ratio: parseFloat(document.getElementById('regime_stock_range_max_ratio')?.value) || 0.0065,
                     regime_mr_buy_enabled: !!document.getElementById('regime_mr_buy_enabled')?.checked,
@@ -4989,10 +5510,8 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 document.getElementById('minute_trend_min_green_bars').value = 2;
                 document.getElementById('minute_trend_mode').value = 'hh_hl';
 
-                // 듀얼 레짐(추천 기본): 밸런스 — lookback 15, 박스 0.0065, MR off
+                // 듀얼 레짐(추천 기본): 분봉 박스 기반 MA/MR 분기
                 document.getElementById('regime_dual_switch_enabled').checked = true;
-                document.getElementById('regime_block_ma_buy_when_index_bear').checked = true;
-                document.getElementById('regime_block_ma_buy_when_stock_range').checked = true;
                 document.getElementById('regime_mr_require_index_bull').checked = true;
                 document.getElementById('regime_stock_range_lookback_minutes').value = 15;
                 document.getElementById('regime_stock_range_max_ratio').value = 0.0065;
@@ -5314,10 +5833,8 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     const _udm = document.getElementById('unified_regime_decision_margin'); if (_udm) _udm.value = 1.0;
                     const _utrb = document.getElementById('unified_regime_trend_require_index_bull'); if (_utrb) _utrb.checked = true;
                 }}
-                // 듀얼 레짐: 프리셋별 추천(지수+분봉 박스). index_ma_filter와 병행 시 지수 조건 이중 적용됨.
+                // 듀얼 레짐: 프리셋별 추천(분봉 박스 기반 MA/MR 선택).
                 document.getElementById('regime_dual_switch_enabled').checked = true;
-                document.getElementById('regime_block_ma_buy_when_index_bear').checked = true;
-                document.getElementById('regime_block_ma_buy_when_stock_range').checked = true;
                 document.getElementById('regime_mr_require_index_bull').checked = true;
                 if (variant === 'scalp_fullday') {{
                     document.getElementById('regime_stock_range_lookback_minutes').value = 20;

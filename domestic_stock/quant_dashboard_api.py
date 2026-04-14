@@ -15,6 +15,12 @@ import uuid
 import time
 import os
 import json
+import re
+import csv
+import io
+import urllib.request
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import kis_auth as ka
 from domestic_stock_functions_ws import ccnl_krx, asking_price_krx, market_status_krx
@@ -22,7 +28,7 @@ from domestic_stock_functions import inquire_index_daily_price, inquire_index_pr
 
 from quant_dashboard import (
     app, state, get_current_user,
-    RiskConfig, StockSelectionConfig, StrategyConfig, OperationalConfig, ManualOrder,
+    RiskConfig, StockSelectionConfig, StrategyConfig, OperationalConfig, ManualOrder, MacroConfig,
     UnifiedRegimeSwitchConfig,
     _record_dashboard_http_shutdown_graceful,
     ensure_dashboard_atexit_registered,
@@ -394,6 +400,97 @@ def _vi_cls_code_implies_active(raw) -> bool:
     return True
 
 
+def _normalize_vi_col_name(name: Any) -> str:
+    return "".join(ch.lower() for ch in str(name or "") if ch.isalnum())
+
+
+def _parse_vi_time_value(raw: Any, base_date: datetime) -> Optional[datetime]:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s or s.lower() in ("nan", "none", "null", "nat", "-"):
+        return None
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if not digits:
+        return None
+    try:
+        if len(digits) >= 14:
+            return datetime.strptime(digits[:14], "%Y%m%d%H%M%S").replace(tzinfo=base_date.tzinfo)
+        if len(digits) == 12:
+            return datetime.strptime(base_date.strftime("%Y%m%d") + digits[-6:], "%Y%m%d%H%M%S").replace(tzinfo=base_date.tzinfo)
+        if len(digits) == 8:
+            # HHMMSSss 형태일 수 있어 앞 6자리만 사용
+            return datetime.strptime(base_date.strftime("%Y%m%d") + digits[:6], "%Y%m%d%H%M%S").replace(tzinfo=base_date.tzinfo)
+        if len(digits) == 6:
+            return datetime.strptime(base_date.strftime("%Y%m%d") + digits, "%Y%m%d%H%M%S").replace(tzinfo=base_date.tzinfo)
+        if len(digits) == 4:
+            return datetime.strptime(base_date.strftime("%Y%m%d") + digits + "00", "%Y%m%d%H%M%S").replace(tzinfo=base_date.tzinfo)
+    except Exception:
+        return None
+    return None
+
+
+def _rest_vi_time_based_active(df) -> Optional[bool]:
+    """
+    VI 현황 REST 응답에서 발동/해제 시각으로 현재 active 여부를 판정.
+    - 발동시각 있고 해제시각 없으면 active
+    - 해제시각 있으면 inactive
+    - 다수 row면 가장 최근 이벤트 기준
+    """
+    if df is None or getattr(df, "empty", True):
+        return False
+    tz = timezone(timedelta(hours=9))
+    base_date = datetime.now(tz)
+    normalized = {col: _normalize_vi_col_name(col) for col in df.columns}
+    release_cols = [
+        col for col, norm in normalized.items()
+        if ("virelis" in norm)
+        or ("virelease" in norm)
+        or (("vi" in norm or "relis" in norm) and any(k in norm for k in ("relis", "release", "reles", "rls", "end")))
+    ]
+    trigger_cols = [
+        col for col, norm in normalized.items()
+        if ("vimotn" in norm)
+        or ("viaplc" in norm and any(k in norm for k in ("time", "tm")))
+        or ("vitrgr" in norm)
+        or ("vitrigger" in norm)
+        or (("vi" in norm) and any(k in norm for k in ("motn", "trigger", "trgr", "start")) and any(k in norm for k in ("time", "tm")))
+        or norm == "trdecntrproctime"
+    ]
+    if not trigger_cols and not release_cols:
+        return None
+
+    latest_key = None
+    latest_active = None
+    saw_any_time = False
+    for idx, row in df.iterrows():
+        trigger_dt = None
+        release_dt = None
+        for col in trigger_cols:
+            trigger_dt = _parse_vi_time_value(row.get(col), base_date)
+            if trigger_dt is not None:
+                saw_any_time = True
+                break
+        for col in release_cols:
+            release_dt = _parse_vi_time_value(row.get(col), base_date)
+            if release_dt is not None:
+                saw_any_time = True
+                break
+        if trigger_dt is None and release_dt is None:
+            continue
+        event_dt = release_dt or trigger_dt
+        if event_dt is None:
+            continue
+        active = trigger_dt is not None and (release_dt is None or release_dt < trigger_dt)
+        key = (event_dt, int(idx))
+        if latest_key is None or key > latest_key:
+            latest_key = key
+            latest_active = active
+    if latest_active is not None:
+        return bool(latest_active)
+    return None if not saw_any_time else False
+
+
 def _rest_vi_dataframe_active(df) -> Optional[bool]:
     """
     VI 현황 REST 응답에서 '지금 적용 중'만 True.
@@ -403,6 +500,9 @@ def _rest_vi_dataframe_active(df) -> Optional[bool]:
     """
     if df is None or getattr(df, "empty", True):
         return False
+    time_based = _rest_vi_time_based_active(df)
+    if time_based is not None:
+        return time_based
     found_signal = False
     for col in df.columns:
         cl = str(col).lower().replace(" ", "")
@@ -2062,12 +2162,10 @@ def _apply_strategy_config_to_state(config: "StrategyConfig", update_unified_sna
     state.advance_ratio_down_market_skip = bool(getattr(config, "advance_ratio_down_market_skip", True))
     state.skip_buy_below_high_pct = max(0.0, min(0.20, float(getattr(config, "skip_buy_below_high_pct", 0.0) or 0.0)))
     state.regime_dual_switch_enabled = bool(getattr(config, "regime_dual_switch_enabled", getattr(state, "regime_dual_switch_enabled", True)))
-    state.regime_block_ma_buy_when_index_bear = bool(
-        getattr(config, "regime_block_ma_buy_when_index_bear", getattr(state, "regime_block_ma_buy_when_index_bear", True))
-    )
-    state.regime_block_ma_buy_when_stock_range = bool(
-        getattr(config, "regime_block_ma_buy_when_stock_range", getattr(state, "regime_block_ma_buy_when_stock_range", True))
-    )
+    # Deprecated: 시장 약세/박스 차단은 전역 필터(index MA, advance ratio, range)로 통합.
+    # 저장된 예전 설정은 읽되 런타임에서는 사용하지 않는다.
+    state.regime_block_ma_buy_when_index_bear = False
+    state.regime_block_ma_buy_when_stock_range = False
     state.regime_stock_range_lookback_minutes = max(2, min(120, int(getattr(config, "regime_stock_range_lookback_minutes", 15) or 15)))
     state.regime_stock_range_max_ratio = max(0.0005, min(0.05, float(getattr(config, "regime_stock_range_max_ratio", 0.0065) or 0.0065)))
     state.regime_mr_buy_enabled = bool(getattr(config, "regime_mr_buy_enabled", getattr(state, "regime_mr_buy_enabled", False)))
@@ -2127,6 +2225,505 @@ def _apply_stock_selection_config_dict_to_state(d: dict) -> None:
         )
     except Exception as e:
         logger.warning(f"저장된 종목선정 설정 적용 중 오류(무시): {e}")
+
+
+_MACRO_INPUT_FIELDS: Dict[str, Dict[str, Any]] = {
+    "vix": {"label": "VIX", "unit": ""},
+    "spx_fut_pct": {"label": "S&P500 선물", "unit": "%"},
+    "ndx_fut_pct": {"label": "Nasdaq100 선물", "unit": "%"},
+    "dxy": {"label": "DXY", "unit": ""},
+    "usdkrw": {"label": "USD/KRW", "unit": "원"},
+    "us2y": {"label": "미국 2년물", "unit": "%"},
+    "us10y": {"label": "미국 10년물", "unit": "%"},
+    "hy_oas": {"label": "HY OAS", "unit": "bp"},
+    "sofr": {"label": "SOFR", "unit": "%"},
+    "iorb": {"label": "IORB", "unit": "%"},
+    "tbill_3m": {"label": "3M T-bill", "unit": "%"},
+    "wti": {"label": "WTI", "unit": "$"},
+    "gold": {"label": "Gold", "unit": "$"},
+}
+
+
+def _macro_parse_number(raw: Any) -> Optional[float]:
+    text = str(raw or "").strip().replace(",", "")
+    if not text:
+        return None
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except Exception:
+        return None
+
+
+def _normalize_macro_config_dict(d: Optional[dict]) -> dict:
+    raw = d if isinstance(d, dict) else {}
+    legacy_metrics = raw.get("metrics") if isinstance(raw.get("metrics"), dict) else {}
+
+    normalized: Dict[str, Any] = {
+        "as_of_date": str(raw.get("as_of_date", "") or "").strip(),
+        "headline_note": str(raw.get("headline_note", "") or "").strip(),
+    }
+    for key in _MACRO_INPUT_FIELDS.keys():
+        value = raw.get(key)
+        if value is None and isinstance(legacy_metrics.get(key), dict):
+            value = legacy_metrics.get(key, {}).get("current_value")
+        normalized[key] = _macro_parse_number(value)
+    try:
+        cfg = MacroConfig.model_validate(normalized)
+        out = cfg.model_dump()
+    except Exception:
+        out = normalized
+    out_dict = {
+        "as_of_date": str(out.get("as_of_date", "") or "").strip(),
+        "headline_note": str(out.get("headline_note", "") or "").strip(),
+        **{k: out.get(k) for k in _MACRO_INPUT_FIELDS.keys()},
+    }
+    legacy_sofr_iorb = _macro_parse_number(raw.get("sofr_iorb"))
+    if legacy_sofr_iorb is None and isinstance(legacy_metrics.get("sofr_iorb"), dict):
+        legacy_sofr_iorb = _macro_parse_number(legacy_metrics.get("sofr_iorb", {}).get("current_value"))
+    legacy_tbill_sofr = _macro_parse_number(raw.get("tbill_sofr"))
+    if legacy_tbill_sofr is None and isinstance(legacy_metrics.get("tbill_sofr"), dict):
+        legacy_tbill_sofr = _macro_parse_number(legacy_metrics.get("tbill_sofr", {}).get("current_value"))
+
+    sofr = out_dict.get("sofr")
+    iorb = out_dict.get("iorb")
+    tbill_3m = out_dict.get("tbill_3m")
+    out_dict["sofr_iorb"] = (sofr - iorb) if (sofr is not None and iorb is not None) else legacy_sofr_iorb
+    out_dict["tbill_sofr"] = (tbill_3m - sofr) if (tbill_3m is not None and sofr is not None) else legacy_tbill_sofr
+    return out_dict
+
+
+def _macro_format_value(key: str, value: Optional[float]) -> str:
+    if value is None:
+        return "-"
+    if key == "spread_pctp":
+        return f"{value:.2f}%p"
+    meta = _MACRO_INPUT_FIELDS.get(key, {})
+    unit = str(meta.get("unit", "") or "")
+    if unit in ("%", "%p"):
+        return f"{value:.2f}{unit}"
+    if unit == "bp":
+        return f"{value:.0f}{unit}"
+    if unit == "$":
+        return f"{value:.1f}{unit}"
+    if unit == "원":
+        return f"{value:.1f}{unit}"
+    return f"{value:.2f}"
+
+
+def _macro_view_label(score: float, positive_label: str, negative_label: str) -> str:
+    if score >= 1.2:
+        return positive_label
+    if score <= -1.2:
+        return negative_label
+    return "중립"
+
+
+def _macro_score_payload(score: float, positive_label: str, negative_label: str) -> dict:
+    return {
+        "score": round(score, 2),
+        "label": _macro_view_label(score, positive_label, negative_label),
+    }
+
+
+def _macro_add_rule(
+    spx_scores: Dict[str, float],
+    ndx_scores: Dict[str, float],
+    fx_scores: Dict[str, float],
+    drivers: List[dict],
+    *,
+    message: str,
+    spx_delta: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    ndx_delta: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    fx_delta: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> None:
+    for bucket, delta in ((spx_scores, spx_delta), (ndx_scores, ndx_delta), (fx_scores, fx_delta)):
+        bucket["daily"] += float(delta[0])
+        bucket["weekly"] += float(delta[1])
+        bucket["monthly"] += float(delta[2])
+    drivers.append({
+        "message": message,
+        "strength": round(max(max(map(abs, spx_delta)), max(map(abs, ndx_delta)), max(map(abs, fx_delta))), 3),
+    })
+
+
+def _fetch_text_url(url: str, timeout: int = 6) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        charset = getattr(resp.headers, "get_content_charset", lambda: None)() or "utf-8"
+        return resp.read().decode(charset, "ignore")
+
+
+def _fetch_fred_latest(series_id: str) -> tuple[Optional[float], Optional[str]]:
+    try:
+        with urllib.request.urlopen(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}", timeout=10) as resp:
+            text = resp.read().decode("utf-8", "ignore")
+        reader = csv.DictReader(io.StringIO(text))
+        last_value = None
+        last_date = None
+        for row in reader:
+            raw_val = str(row.get(series_id, "") or "").strip()
+            if raw_val in ("", "."):
+                continue
+            try:
+                last_value = float(raw_val)
+                last_date = str(row.get("DATE", "") or row.get("observation_date", "") or "").strip()
+            except Exception:
+                continue
+        return last_value, last_date
+    except Exception:
+        return None, None
+
+
+def _fetch_stooq_quote(symbol: str) -> dict:
+    try:
+        text = _fetch_text_url(f"https://stooq.com/q/l/?s={symbol}&i=d").strip()
+        if not text:
+            return {}
+        row = next(csv.reader(io.StringIO(text)))
+        if not row or len(row) < 7:
+            return {}
+        def _num(idx: int) -> Optional[float]:
+            try:
+                raw = str(row[idx] or "").strip()
+                if raw in ("", "N/D"):
+                    return None
+                return float(raw)
+            except Exception:
+                return None
+        return {
+            "symbol": str(row[0] or "").strip(),
+            "date": str(row[1] or "").strip() if len(row) > 1 else "",
+            "time": str(row[2] or "").strip() if len(row) > 2 else "",
+            "open": _num(3),
+            "high": _num(4),
+            "low": _num(5),
+            "close": _num(6),
+        }
+    except Exception:
+        return {}
+
+
+def _build_macro_auto_fetch_config(base_cfg: Optional[dict] = None) -> tuple[dict, dict]:
+    cfg = _normalize_macro_config_dict(base_cfg)
+    fetched: Dict[str, Any] = {
+        "sources": {},
+        "warnings": [],
+        "failures": [],
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    def _apply(
+        key: str,
+        value: Optional[float],
+        source: str,
+        observed_at: Optional[str] = None,
+        source_url: Optional[str] = None,
+        description: Optional[str] = None,
+    ):
+        if value is None:
+            fetched["warnings"].append(f"{key} 수집 실패")
+            fetched["failures"].append(key)
+            return
+        cfg[key] = value
+        fetched["sources"][key] = {
+            "source": source,
+            "observed_at": observed_at or "",
+            "url": source_url or "",
+            "description": description or "",
+        }
+
+    today_kst = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d")
+    cfg["as_of_date"] = today_kst
+
+    fred_series = {
+        "vix": ("VIXCLS", "FRED VIXCLS", "https://fred.stlouisfed.org/series/VIXCLS", "CBOE 변동성지수 일별 종가"),
+        "us2y": ("DGS2", "FRED DGS2", "https://fred.stlouisfed.org/series/DGS2", "미국 2년물 국채수익률"),
+        "us10y": ("DGS10", "FRED DGS10", "https://fred.stlouisfed.org/series/DGS10", "미국 10년물 국채수익률"),
+        "hy_oas": ("BAMLH0A0HYM2", "FRED BAMLH0A0HYM2", "https://fred.stlouisfed.org/series/BAMLH0A0HYM2", "미국 하이일드 OAS"),
+        "sofr": ("SOFR", "FRED SOFR", "https://fred.stlouisfed.org/series/SOFR", "Secured Overnight Financing Rate"),
+        "iorb": ("IORB", "FRED IORB", "https://fred.stlouisfed.org/series/IORB", "Interest on Reserve Balances"),
+        "tbill_3m": ("DGS3MO", "FRED DGS3MO", "https://fred.stlouisfed.org/series/DGS3MO", "미국 3개월 국채수익률"),
+    }
+    stooq_symbols = {
+        "dxy": ("dx.f", "stooq DX.F", "https://stooq.com/q/?s=dx.f", "달러 인덱스 선물 프록시"),
+        "spx_fut_pct": ("es.f", "stooq ES.F", "https://stooq.com/q/?s=es.f", "E-mini S&P 500 선물"),
+        "ndx_fut_pct": ("nq.f", "stooq NQ.F", "https://stooq.com/q/?s=nq.f", "E-mini Nasdaq 100 선물"),
+        "usdkrw": ("usdkrw", "stooq USDKRW", "https://stooq.com/q/?s=usdkrw", "원달러 환율"),
+        "wti": ("cl.f", "stooq CL.F", "https://stooq.com/q/?s=cl.f", "WTI 원유 선물"),
+        "gold": ("gc.f", "stooq GC.F", "https://stooq.com/q/?s=gc.f", "금 선물"),
+    }
+    futures = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        for key, (series_id, source_name, source_url, description) in fred_series.items():
+            futures[executor.submit(_fetch_fred_latest, series_id)] = ("fred", key, source_name, source_url, description)
+        for key, (symbol, source_name, source_url, description) in stooq_symbols.items():
+            futures[executor.submit(_fetch_stooq_quote, symbol)] = ("stooq", key, source_name, source_url, description)
+
+        for future in as_completed(futures):
+            source_type, key, source_name, source_url, description = futures[future]
+            try:
+                result = future.result(timeout=0)
+            except Exception:
+                result = None
+            if source_type == "fred":
+                value, observed_at = result if isinstance(result, tuple) else (None, None)
+                _apply(key, value, source_name, observed_at, source_url, description)
+            else:
+                quote = result if isinstance(result, dict) else {}
+                value = quote.get("close")
+                if key in ("spx_fut_pct", "ndx_fut_pct"):
+                    op = quote.get("open")
+                    cl = quote.get("close")
+                    value = ((cl - op) / op * 100.0) if (op not in (None, 0) and cl is not None) else None
+                observed_at = ""
+                if quote.get("date"):
+                    observed_at = f"{quote.get('date')} {quote.get('time', '')}".strip()
+                _apply(key, value, source_name, observed_at, source_url, description)
+
+    cfg = _normalize_macro_config_dict(cfg)
+    fetched["computed"] = {
+        "sofr_iorb": cfg.get("sofr_iorb"),
+        "tbill_sofr": cfg.get("tbill_sofr"),
+    }
+    return cfg, fetched
+
+
+def _analyze_macro_config(config_dict: Optional[dict]) -> dict:
+    cfg = _normalize_macro_config_dict(config_dict)
+    spx_scores = {"daily": 0.0, "weekly": 0.0, "monthly": 0.0}
+    ndx_scores = {"daily": 0.0, "weekly": 0.0, "monthly": 0.0}
+    fx_scores = {"daily": 0.0, "weekly": 0.0, "monthly": 0.0}
+    drivers: List[dict] = []
+
+    spx = cfg.get("spx_fut_pct")
+    if spx is not None:
+        if spx >= 0.7:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="S&P500 선물 강세", spx_delta=(1.5, 0.9, 0.4), ndx_delta=(0.7, 0.4, 0.2), fx_delta=(-0.5, -0.3, -0.1))
+        elif spx >= 0.2:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="S&P500 선물 플러스", spx_delta=(0.9, 0.5, 0.2), ndx_delta=(0.3, 0.2, 0.1), fx_delta=(-0.3, -0.2, 0.0))
+        elif spx <= -0.7:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="S&P500 선물 약세", spx_delta=(-1.5, -0.9, -0.4), ndx_delta=(-0.7, -0.4, -0.2), fx_delta=(0.5, 0.3, 0.1))
+        elif spx <= -0.2:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="S&P500 선물 마이너스", spx_delta=(-0.9, -0.5, -0.2), ndx_delta=(-0.3, -0.2, -0.1), fx_delta=(0.3, 0.2, 0.0))
+
+    ndx = cfg.get("ndx_fut_pct")
+    if ndx is not None:
+        if ndx >= 0.9:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="Nasdaq100 선물 강세", spx_delta=(0.6, 0.3, 0.1), ndx_delta=(1.7, 1.0, 0.5), fx_delta=(-0.4, -0.2, 0.0))
+        elif ndx >= 0.3:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="Nasdaq100 선물 플러스", spx_delta=(0.2, 0.1, 0.0), ndx_delta=(1.0, 0.6, 0.2), fx_delta=(-0.2, -0.1, 0.0))
+        elif ndx <= -0.9:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="Nasdaq100 선물 약세", spx_delta=(-0.6, -0.3, -0.1), ndx_delta=(-1.7, -1.0, -0.5), fx_delta=(0.4, 0.2, 0.0))
+        elif ndx <= -0.3:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="Nasdaq100 선물 마이너스", spx_delta=(-0.2, -0.1, 0.0), ndx_delta=(-1.0, -0.6, -0.2), fx_delta=(0.2, 0.1, 0.0))
+
+    vix = cfg.get("vix")
+    if vix is not None:
+        if vix < 14:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="VIX 낮음", spx_delta=(0.9, 0.7, 0.4), ndx_delta=(1.0, 0.8, 0.5), fx_delta=(-0.6, -0.5, -0.3))
+        elif vix >= 28:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="VIX 고점권", spx_delta=(-2.0, -2.1, -1.4), ndx_delta=(-2.2, -2.3, -1.6), fx_delta=(1.4, 1.5, 1.0))
+        elif vix >= 22:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="VIX 높음", spx_delta=(-1.5, -1.6, -1.1), ndx_delta=(-1.7, -1.8, -1.2), fx_delta=(1.0, 1.1, 0.7))
+        elif vix >= 18:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="VIX 경계권", spx_delta=(-0.8, -0.9, -0.6), ndx_delta=(-1.0, -1.1, -0.7), fx_delta=(0.6, 0.7, 0.4))
+
+    dxy = cfg.get("dxy")
+    if dxy is not None:
+        if dxy < 102.5:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="달러 약세", spx_delta=(0.4, 0.8, 1.1), ndx_delta=(0.5, 0.9, 1.2), fx_delta=(-1.0, -1.4, -1.8))
+        elif dxy >= 107.0:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="달러 강세 심화", spx_delta=(-1.0, -1.4, -1.8), ndx_delta=(-1.2, -1.6, -2.0), fx_delta=(1.6, 1.9, 2.2))
+        elif dxy >= 105.5:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="달러 강세", spx_delta=(-0.7, -1.0, -1.4), ndx_delta=(-0.9, -1.2, -1.6), fx_delta=(1.2, 1.5, 1.8))
+        elif dxy >= 104.0:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="달러 소폭 강세", spx_delta=(-0.3, -0.6, -0.9), ndx_delta=(-0.4, -0.7, -1.0), fx_delta=(0.7, 0.9, 1.2))
+
+    usdkrw = cfg.get("usdkrw")
+    if usdkrw is not None:
+        if usdkrw < 1320:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="원화 강세 구간", spx_delta=(0.1, 0.3, 0.6), ndx_delta=(0.1, 0.2, 0.4), fx_delta=(-0.5, -0.9, -1.3))
+        elif usdkrw >= 1450:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="원달러 고점권", spx_delta=(-0.4, -0.7, -1.0), ndx_delta=(-0.5, -0.8, -1.1), fx_delta=(0.8, 1.3, 1.8))
+        elif usdkrw >= 1380:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="원달러 높은 레벨", spx_delta=(-0.2, -0.4, -0.7), ndx_delta=(-0.3, -0.5, -0.8), fx_delta=(0.4, 0.9, 1.3))
+
+    us2y = cfg.get("us2y")
+    if us2y is not None:
+        if us2y < 3.8:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="미국 2년물 안정", spx_delta=(0.1, 0.4, 0.7), ndx_delta=(0.2, 0.5, 0.9), fx_delta=(-0.3, -0.5, -0.7))
+        elif us2y >= 4.8:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="미국 2년물 고금리", spx_delta=(-0.6, -0.9, -1.2), ndx_delta=(-0.9, -1.2, -1.6), fx_delta=(0.7, 1.0, 1.3))
+        elif us2y >= 4.4:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="미국 2년물 부담", spx_delta=(-0.3, -0.6, -0.9), ndx_delta=(-0.5, -0.8, -1.1), fx_delta=(0.4, 0.7, 1.0))
+
+    us10y = cfg.get("us10y")
+    if us10y is not None:
+        if us10y < 4.0:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="미국 10년물 안정", spx_delta=(0.2, 0.5, 0.8), ndx_delta=(0.4, 0.7, 1.0), fx_delta=(-0.1, -0.2, -0.3))
+        elif us10y >= 4.8:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="미국 10년물 급등 부담", spx_delta=(-0.8, -1.0, -1.3), ndx_delta=(-1.1, -1.3, -1.7), fx_delta=(0.4, 0.6, 0.8))
+        elif us10y >= 4.5:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="미국 10년물 높은 레벨", spx_delta=(-0.4, -0.7, -1.0), ndx_delta=(-0.7, -1.0, -1.3), fx_delta=(0.2, 0.4, 0.6))
+
+    hy_oas = cfg.get("hy_oas")
+    if hy_oas is not None:
+        if hy_oas < 340:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="HY OAS 안정", spx_delta=(0.2, 0.7, 1.1), ndx_delta=(0.2, 0.6, 1.0), fx_delta=(-0.1, -0.4, -0.8))
+        elif hy_oas >= 450:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="HY OAS 확대", spx_delta=(-0.8, -1.2, -1.7), ndx_delta=(-0.9, -1.3, -1.8), fx_delta=(0.4, 0.8, 1.2))
+        elif hy_oas >= 400:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="HY OAS 경계", spx_delta=(-0.4, -0.8, -1.3), ndx_delta=(-0.5, -0.9, -1.4), fx_delta=(0.2, 0.5, 0.9))
+
+    sofr_iorb = cfg.get("sofr_iorb")
+    if sofr_iorb is not None:
+        if sofr_iorb < 0.02:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="SOFR-IORB 안정", spx_delta=(0.1, 0.2, 0.4), ndx_delta=(0.1, 0.2, 0.4), fx_delta=(-0.1, -0.2, -0.3))
+        elif sofr_iorb >= 0.15:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="SOFR-IORB 확대", spx_delta=(-0.4, -0.8, -1.2), ndx_delta=(-0.5, -0.9, -1.3), fx_delta=(0.3, 0.6, 0.9))
+        elif sofr_iorb >= 0.08:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="SOFR-IORB 소폭 확대", spx_delta=(-0.2, -0.5, -0.8), ndx_delta=(-0.3, -0.6, -0.9), fx_delta=(0.1, 0.3, 0.6))
+
+    tbill_sofr = cfg.get("tbill_sofr")
+    if tbill_sofr is not None:
+        if tbill_sofr < 0.05:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="T-bill-SOFR 안정", spx_delta=(0.1, 0.2, 0.4), ndx_delta=(0.1, 0.2, 0.4), fx_delta=(-0.1, -0.2, -0.3))
+        elif tbill_sofr >= 0.30:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="T-bill-SOFR 크게 확대", spx_delta=(-0.6, -0.9, -1.3), ndx_delta=(-0.7, -1.0, -1.4), fx_delta=(0.5, 0.8, 1.1))
+        elif tbill_sofr >= 0.15:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="T-bill-SOFR 확대", spx_delta=(-0.3, -0.7, -1.0), ndx_delta=(-0.4, -0.8, -1.1), fx_delta=(0.3, 0.6, 0.8))
+
+    wti = cfg.get("wti")
+    if wti is not None:
+        if wti >= 100:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="WTI 고유가", spx_delta=(-0.4, -0.7, -1.0), ndx_delta=(-0.5, -0.8, -1.1), fx_delta=(0.2, 0.3, 0.4))
+        elif wti >= 90:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="WTI 높은 레벨", spx_delta=(-0.2, -0.4, -0.6), ndx_delta=(-0.2, -0.5, -0.7), fx_delta=(0.1, 0.2, 0.3))
+        elif wti < 70:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="WTI 안정", spx_delta=(0.1, 0.2, 0.3), ndx_delta=(0.1, 0.2, 0.3), fx_delta=(-0.1, -0.1, -0.2))
+
+    gold = cfg.get("gold")
+    if gold is not None:
+        if gold >= 2400:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="금 강세(방어선호)", spx_delta=(-0.1, -0.3, -0.5), ndx_delta=(-0.2, -0.4, -0.6), fx_delta=(0.1, 0.1, 0.2))
+        elif gold < 2100:
+            _macro_add_rule(spx_scores, ndx_scores, fx_scores, drivers, message="금 안정권", spx_delta=(0.1, 0.2, 0.2), ndx_delta=(0.1, 0.2, 0.2), fx_delta=(0.0, -0.1, -0.1))
+
+    liquidity_pressure = 0.0
+    if vix is not None and vix >= 18:
+        liquidity_pressure += 1.0
+    if hy_oas is not None and hy_oas >= 400:
+        liquidity_pressure += 1.0
+    if sofr_iorb is not None and sofr_iorb >= 0.08:
+        liquidity_pressure += 1.0
+    if tbill_sofr is not None and tbill_sofr >= 0.15:
+        liquidity_pressure += 1.0
+
+    if liquidity_pressure >= 3.0:
+        liquidity_label = "긴장"
+        liquidity_summary = "유동성 긴장 신호가 누적되어 주간·월간 리스크 관리가 우선입니다."
+    elif liquidity_pressure >= 1.5:
+        liquidity_label = "경계"
+        liquidity_summary = "유동성 신호가 일부 악화되어 위험자산 추격은 신중한 구간입니다."
+    else:
+        liquidity_label = "안정"
+        liquidity_summary = "유동성 스트레스는 아직 제한적입니다."
+
+    filled_count = sum(1 for key in _MACRO_INPUT_FIELDS.keys() if cfg.get(key) is not None)
+    snapshots = [
+        {
+            "key": key,
+            "label": meta["label"],
+            "value": cfg.get(key),
+            "display_value": _macro_format_value(key, cfg.get(key)),
+        }
+        for key, meta in _MACRO_INPUT_FIELDS.items()
+    ]
+    snapshots.extend([
+        {
+            "key": "sofr_iorb",
+            "label": "SOFR - IORB",
+            "value": cfg.get("sofr_iorb"),
+            "display_value": _macro_format_value("spread_pctp", cfg.get("sofr_iorb")),
+        },
+        {
+            "key": "tbill_sofr",
+            "label": "3M T-bill - SOFR",
+            "value": cfg.get("tbill_sofr"),
+            "display_value": _macro_format_value("spread_pctp", cfg.get("tbill_sofr")),
+        },
+    ])
+
+    drivers = sorted(drivers, key=lambda x: x.get("strength", 0), reverse=True)
+    core_drivers = [d.get("message", "") for d in drivers[:5] if d.get("message")]
+
+    us_equity = {
+        "daily": _macro_score_payload((spx_scores["daily"] + ndx_scores["daily"]) / 2.0, "상승 우세", "하락 우세"),
+        "weekly": _macro_score_payload((spx_scores["weekly"] + ndx_scores["weekly"]) / 2.0, "상승 우세", "하락 우세"),
+        "monthly": _macro_score_payload((spx_scores["monthly"] + ndx_scores["monthly"]) / 2.0, "상승 우세", "하락 우세"),
+    }
+    spx_outlook = {
+        "daily": _macro_score_payload(spx_scores["daily"], "상승 우세", "하락 우세"),
+        "weekly": _macro_score_payload(spx_scores["weekly"], "상승 우세", "하락 우세"),
+        "monthly": _macro_score_payload(spx_scores["monthly"], "상승 우세", "하락 우세"),
+    }
+    nasdaq_outlook = {
+        "daily": _macro_score_payload(ndx_scores["daily"], "상승 우세", "하락 우세"),
+        "weekly": _macro_score_payload(ndx_scores["weekly"], "상승 우세", "하락 우세"),
+        "monthly": _macro_score_payload(ndx_scores["monthly"], "상승 우세", "하락 우세"),
+    }
+    usdkrw_outlook = {
+        "daily": _macro_score_payload(fx_scores["daily"], "상승 우세", "하락 우세"),
+        "weekly": _macro_score_payload(fx_scores["weekly"], "상승 우세", "하락 우세"),
+        "monthly": _macro_score_payload(fx_scores["monthly"], "상승 우세", "하락 우세"),
+    }
+
+    korea_raw = {
+        "daily": 0.55 * spx_scores["daily"] + 0.30 * ndx_scores["daily"] - 0.50 * fx_scores["daily"] - 0.35 * liquidity_pressure,
+        "weekly": 0.50 * spx_scores["weekly"] + 0.25 * ndx_scores["weekly"] - 0.55 * fx_scores["weekly"] - 0.40 * liquidity_pressure,
+        "monthly": 0.45 * spx_scores["monthly"] + 0.20 * ndx_scores["monthly"] - 0.60 * fx_scores["monthly"] - 0.45 * liquidity_pressure,
+    }
+    korea_market = {
+        "daily": _macro_score_payload(korea_raw["daily"], "우호적", "부담"),
+        "weekly": _macro_score_payload(korea_raw["weekly"], "우호적", "부담"),
+        "monthly": _macro_score_payload(korea_raw["monthly"], "우호적", "부담"),
+    }
+
+    eq_daily = us_equity["daily"]["label"]
+    fx_daily = usdkrw_outlook["daily"]["label"]
+    korea_daily = korea_market["daily"]["label"]
+    if eq_daily == "상승 우세" and fx_daily == "하락 우세":
+        one_liner = "리스크온 우세 > 금일 미장 강세와 원화 강세 조합입니다."
+    elif eq_daily == "하락 우세" and fx_daily == "상승 우세":
+        one_liner = "리스크오프 우세 > 금일 미장 부담과 원달러 상방 압력이 동반됩니다."
+    elif korea_daily == "우호적":
+        one_liner = "한국장까지 포함하면 단기 우호 구간으로 해석됩니다."
+    elif korea_daily == "부담":
+        one_liner = "한국장은 환율과 유동성 변수까지 보면 방어적으로 보는 편이 낫습니다."
+    else:
+        one_liner = "단기 방향성은 혼조이며 달러·금리·신용 스프레드 조합 확인이 우선입니다."
+    if cfg.get("headline_note"):
+        one_liner += f" ({cfg.get('headline_note')})"
+
+    return {
+        "as_of_date": cfg.get("as_of_date", ""),
+        "headline_note": cfg.get("headline_note", ""),
+        "filled_count": filled_count,
+        "total_inputs": len(_MACRO_INPUT_FIELDS),
+        "liquidity_label": liquidity_label,
+        "liquidity_summary": liquidity_summary,
+        "one_liner": one_liner,
+        "core_drivers": core_drivers,
+        "us_equity": us_equity,
+        "spx_outlook": spx_outlook,
+        "nasdaq_outlook": nasdaq_outlook,
+        "usdkrw": usdkrw_outlook,
+        "korea_market": korea_market,
+        "snapshots": snapshots,
+    }
 
 
 def _get_user_settings_store():
@@ -3541,33 +4138,6 @@ def _start_trading_engine_thread():
                                             mr_buy_candidate = _mr_buy_signal_ok(state, stock_code, current_price, bars)
                                         except Exception:
                                             mr_buy_candidate = False
-                                    if bool(getattr(state, "regime_dual_switch_enabled", False)) and ma_buy_candidate:
-                                        try:
-                                            idx_code = str(getattr(state, "index_ma_code", "1001") or "1001")
-                                            idx_period = max(5, min(60, int(getattr(state, "index_ma_period", 20) or 20)))
-                                            lb = max(2, min(120, int(getattr(state, "regime_stock_range_lookback_minutes", 15) or 15)))
-                                            max_rr = float(getattr(state, "regime_stock_range_max_ratio", 0.0065) or 0.0065)
-                                            box = _stock_minute_range_box(bars, float(current_price), lb)
-                                            is_tight = box is not None and box[2] < max_rr
-                                            if bool(getattr(state, "regime_block_ma_buy_when_index_bear", True)):
-                                                if not _get_index_ma_ok(idx_code, idx_period):
-                                                    _record_buy_skip(stock_code, "regime_index_bear")
-                                                    _throttled_skip_log(
-                                                        stock_code,
-                                                        "듀얼 레짐: 지수<N일MA → MA 추세 매수 제외",
-                                                        ttl_sec=30,
-                                                    )
-                                                    ma_buy_candidate = False
-                                            if ma_buy_candidate and bool(getattr(state, "regime_block_ma_buy_when_stock_range", True)) and is_tight:
-                                                _record_buy_skip(stock_code, "regime_stock_range")
-                                                _throttled_skip_log(
-                                                    stock_code,
-                                                    "듀얼 레짐: 종목 분봉 박스(좁음) → MA 추세 매수 제외",
-                                                    ttl_sec=30,
-                                                )
-                                                ma_buy_candidate = False
-                                        except Exception:
-                                            pass
                                     if ma_buy_candidate and mr_buy_candidate:
                                         mr_buy_candidate = False
                                     entry_buy = (
@@ -3999,16 +4569,6 @@ def _start_trading_engine_thread():
                                                             f"연속 손실 쿨다운({int(required - elapsed)}s 남음)",
                                                         )
                                                         continue
-                                        except Exception:
-                                            pass
-
-                                        # (1) 재진입 쿨다운: 직전 매도 직후 재매수 방지
-                                        try:
-                                            if getattr(state, "reentry_cooldown_seconds", 0) and getattr(state.risk_manager, "is_in_reentry_cooldown", None):
-                                                if state.risk_manager.is_in_reentry_cooldown(stock_code):
-                                                    _record_buy_skip(stock_code, "cooldown")
-                                                    _throttled_skip_log(stock_code, f"쿨다운({getattr(state, 'reentry_cooldown_seconds', 0)}s)")
-                                                    continue
                                         except Exception:
                                             pass
 
@@ -7132,6 +7692,81 @@ async def update_operational_config(config: OperationalConfig, current_user: str
         return JSONResponse({"success": False, "message": str(e)})
 
 
+@app.get("/api/macro")
+async def get_macro_config(current_user: str = Depends(get_current_user)):
+    store = _get_user_settings_store()
+    cfg = None
+    if store and getattr(store, "enabled", False):
+        try:
+            cfg = (store.load(current_user) or {}).get("macro_config")
+        except Exception:
+            cfg = None
+    if not cfg:
+        cfg = getattr(state, "macro_config", None) or {}
+    cfg = _normalize_macro_config_dict(cfg)
+    state.macro_config = cfg
+    return JSONResponse({
+        "success": True,
+        "config": cfg,
+        "analysis": _analyze_macro_config(cfg),
+        "fetch_meta": getattr(state, "macro_fetch_meta", None),
+    })
+
+
+@app.post("/api/macro/auto-fetch")
+async def auto_fetch_macro_config(current_user: str = Depends(get_current_user)):
+    try:
+        store = _get_user_settings_store()
+        base_cfg = None
+        if store and getattr(store, "enabled", False):
+            try:
+                base_cfg = (store.load(current_user) or {}).get("macro_config")
+            except Exception:
+                base_cfg = None
+        if not base_cfg:
+            base_cfg = getattr(state, "macro_config", None) or {}
+        cfg, fetched = _build_macro_auto_fetch_config(base_cfg)
+        state.macro_config = cfg
+        state.macro_fetch_meta = fetched
+        persisted = False
+        if store and getattr(store, "enabled", False):
+            persisted = bool(store.save(current_user, macro_config=cfg))
+        try:
+            audit_log(current_user, "config_save", {"section": "macro_auto_fetch"})
+        except Exception:
+            pass
+        return JSONResponse({
+            "success": True,
+            "persisted": persisted,
+            "config": cfg,
+            "analysis": _analyze_macro_config(cfg),
+            "fetched": fetched,
+            "fetch_meta": fetched,
+        })
+    except Exception as e:
+        logger.error(f"매크로 자동 수집 오류: {e}")
+        return JSONResponse({"success": False, "message": str(e)})
+
+
+@app.post("/api/macro")
+async def update_macro_config(config: MacroConfig, current_user: str = Depends(get_current_user)):
+    try:
+        cfg = _normalize_macro_config_dict(config.model_dump())
+        state.macro_config = cfg
+        store = _get_user_settings_store()
+        persisted = False
+        if store and getattr(store, "enabled", False):
+            persisted = bool(store.save(current_user, macro_config=cfg))
+        try:
+            audit_log(current_user, "config_save", {"section": "macro"})
+        except Exception:
+            pass
+        return JSONResponse({"success": True, "persisted": persisted, "config": cfg, "analysis": _analyze_macro_config(cfg)})
+    except Exception as e:
+        logger.error(f"매크로 설정 업데이트 오류: {e}")
+        return JSONResponse({"success": False, "message": str(e)})
+
+
 def _normalize_strategy_config_for_json(sc: dict) -> dict:
     """strategy_config 내 short_ma_period/long_ma_period 보장 및 Decimal 등 JSON 비호환 타입 정규화."""
     if not sc or not isinstance(sc, dict):
@@ -7162,6 +7797,8 @@ async def get_user_settings(current_user: str = Depends(get_current_user)):
     if not store or not getattr(store, "enabled", False):
         return JSONResponse({"success": False, "message": "DynamoDB 설정 저장소를 사용할 수 없습니다."})
     settings = store.load(current_user) or {}
+    if not settings.get("macro_config") and getattr(state, "macro_config", None):
+        settings = {**settings, "macro_config": getattr(state, "macro_config", None)}
     # strategy_config에 short_ma_period/long_ma_period가 항상 포함되도록 정규화 (전략 폼 DB 반영)
     sc = settings.get("strategy_config")
     if isinstance(sc, dict):

@@ -755,14 +755,10 @@ class RiskManager:
         if buy_price <= 0 or qty <= 0:
             return None
 
-        # 슬리피지 보수 반영: 매수 시 불리하게 체결된 것으로 가정한 기준가
-        try:
-            bps = float(getattr(self, "slippage_bps", 0) or 0)
-            bps = max(0.0, min(500.0, bps))
-            effective_buy = buy_price * (1.0 + bps / 10000.0)
-        except Exception:
-            effective_buy = buy_price
-        change_ratio = (float(current_price) - effective_buy) / effective_buy if effective_buy > 0 else 0.0
+        # 청산 트리거는 실제 체결가 기준으로 해석해야 설정 퍼센트와 체감이 일치한다.
+        # slippage_bps는 수익 추정/주문 리스크 보수화에 쓰되, 손절·익절 트리거 자체를 왜곡하지 않는다.
+        trigger_base_price = float(buy_price)
+        change_ratio = (float(current_price) - trigger_base_price) / trigger_base_price if trigger_base_price > 0 else 0.0
 
         # 비율 손절/익절 + ATR 손절/익절: 각각 유효할 때 더 타이트한 쪽(손절=높은 가격, 익절=낮은 목표가)을 적용
         min_stop_pct = 0.002
@@ -773,21 +769,21 @@ class RiskManager:
         if use_atr and hasattr(self, "get_intraday_vol_ratio"):
             lookback = max(2, min(300, int(getattr(self, "atr_lookback_ticks", 20) or 20)))
             vol_ratio = self.get_intraday_vol_ratio(stock_code, lookback=lookback)
-            if vol_ratio is not None and vol_ratio > 0 and effective_buy > 0:
-                atr_proxy = float(vol_ratio) * float(effective_buy)
+            if vol_ratio is not None and vol_ratio > 0 and trigger_base_price > 0:
+                atr_proxy = float(vol_ratio) * float(trigger_base_price)
                 stop_mult = max(0.5, min(5.0, float(getattr(self, "atr_stop_mult", 1.5) or 1.5)))
                 take_mult = max(0.5, min(10.0, float(getattr(self, "atr_take_mult", 2.0) or 2.0)))
-                cand_stop = effective_buy - stop_mult * atr_proxy
-                cand_take = effective_buy + take_mult * atr_proxy
+                cand_stop = trigger_base_price - stop_mult * atr_proxy
+                cand_take = trigger_base_price + take_mult * atr_proxy
                 # 진입 직후 변동성이 작으면 손절선이 매수가에 붙어 즉시 터지는 것 방지
-                if cand_stop < effective_buy * (1.0 - min_stop_pct):
+                if cand_stop < trigger_base_price * (1.0 - min_stop_pct):
                     atr_stop_price = cand_stop
-                if cand_take > effective_buy * (1.0 + min_take_pct):
+                if cand_take > trigger_base_price * (1.0 + min_take_pct):
                     atr_take_price = cand_take
 
         ratio_stop_price: Optional[float] = None
         if self.stop_loss_ratio and float(self.stop_loss_ratio) > 0:
-            ratio_stop_price = effective_buy * (1.0 - float(self.stop_loss_ratio))
+            ratio_stop_price = trigger_base_price * (1.0 - float(self.stop_loss_ratio))
 
         stop_candidates: list[tuple[float, str, str]] = []
         if ratio_stop_price is not None:
@@ -802,7 +798,23 @@ class RiskManager:
                     rsn = "손절(비율·ATR 중 타이트)"
                 return {"action": "sell", "quantity": qty, "reason": rsn, "trigger_code": tcode}
 
-        # 부분 익절
+        # 익절(전량) — 비율·ATR 중 더 낮은 목표가(먼저 도달)를 적용
+        ratio_take_price: Optional[float] = None
+        if self.take_profit_ratio and float(self.take_profit_ratio) > 0:
+            ratio_take_price = trigger_base_price * (1.0 + float(self.take_profit_ratio))
+        take_candidates: list[tuple[float, str, str]] = []
+        if ratio_take_price is not None:
+            take_candidates.append((ratio_take_price, "risk_take_profit_ratio", "익절"))
+        if atr_take_price is not None:
+            take_candidates.append((atr_take_price, "risk_atr_take_profit", "익절(ATR)"))
+        if take_candidates:
+            tp, tcode, rsn = min(take_candidates, key=lambda x: x[0])
+            if float(current_price) >= tp:
+                if len(take_candidates) > 1:
+                    rsn = "익절(비율·ATR 중 타이트)"
+                return {"action": "sell", "quantity": qty, "reason": rsn, "trigger_code": tcode}
+
+        # 부분 익절 — 전량 익절이 이미 도달한 강한 틱이면 먼저 전량 익절을 우선한다.
         try:
             if (
                 self.partial_take_profit_ratio
@@ -821,28 +833,12 @@ class RiskManager:
         except Exception:
             pass
 
-        # 익절(전량) — 비율·ATR 중 더 낮은 목표가(먼저 도달)를 적용
-        ratio_take_price: Optional[float] = None
-        if self.take_profit_ratio and float(self.take_profit_ratio) > 0:
-            ratio_take_price = effective_buy * (1.0 + float(self.take_profit_ratio))
-        take_candidates: list[tuple[float, str, str]] = []
-        if ratio_take_price is not None:
-            take_candidates.append((ratio_take_price, "risk_take_profit_ratio", "익절"))
-        if atr_take_price is not None:
-            take_candidates.append((atr_take_price, "risk_atr_take_profit", "익절(ATR)"))
-        if take_candidates:
-            tp, tcode, rsn = min(take_candidates, key=lambda x: x[0])
-            if float(current_price) >= tp:
-                if len(take_candidates) > 1:
-                    rsn = "익절(비율·ATR 중 타이트)"
-                return {"action": "sell", "quantity": qty, "reason": rsn, "trigger_code": tcode}
-
         # 트레일링 스탑
         try:
             if self.trailing_stop_ratio and float(self.trailing_stop_ratio) > 0:
-                highest = float(self._highest_price.get(stock_code) or buy_price)
+                highest = float(self._highest_price.get(stock_code) or trigger_base_price)
                 if highest > 0:
-                    gain = (highest - buy_price) / buy_price
+                    gain = (highest - trigger_base_price) / trigger_base_price
                     if gain >= float(self.trailing_activation_ratio or 0.0):
                         if float(current_price) <= highest * (1.0 - float(self.trailing_stop_ratio)):
                             return {"action": "sell", "quantity": qty, "reason": "트레일링스탑", "trigger_code": "risk_trailing_stop"}
@@ -872,13 +868,7 @@ class RiskManager:
         buy_price = float(self.positions[stock_code].get("buy_price") or 0)
         if buy_price <= 0:
             return None
-        try:
-            bps = float(getattr(self, "slippage_bps", 0) or 0)
-            bps = max(0.0, min(500.0, bps))
-            effective_buy = buy_price * (1.0 + bps / 10000.0)
-        except Exception:
-            effective_buy = buy_price
-        change_ratio = (current_price - effective_buy) / effective_buy if effective_buy > 0 else 0.0
+        change_ratio = (current_price - buy_price) / buy_price if buy_price > 0 else 0.0
         
         # 손절매
         if change_ratio <= -self.stop_loss_ratio:

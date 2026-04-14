@@ -520,6 +520,26 @@ class OperationalConfig(BaseModel):
     auto_schedule_username: str = ""  # 비면 admin 사용
 
 
+class MacroConfig(BaseModel):
+    as_of_date: str = ""
+    headline_note: str = ""
+    vix: Optional[float] = None
+    spx_fut_pct: Optional[float] = None
+    ndx_fut_pct: Optional[float] = None
+    dxy: Optional[float] = None
+    usdkrw: Optional[float] = None
+    us2y: Optional[float] = None
+    us10y: Optional[float] = None
+    hy_oas: Optional[float] = None
+    sofr: Optional[float] = None
+    iorb: Optional[float] = None
+    tbill_3m: Optional[float] = None
+    sofr_iorb: Optional[float] = None
+    tbill_sofr: Optional[float] = None
+    wti: Optional[float] = None
+    gold: Optional[float] = None
+
+
 class StrategyConfig(BaseModel):
     short_ma_period: int
     long_ma_period: int
@@ -632,10 +652,12 @@ class StrategyConfig(BaseModel):
     # 예: -1.5~-0.5 구간(실제 변동폭에 맞춤). -2.5~-1.0은 변동 작을 때 진입 안 나옴
     sap_revert_entry_from_pct: float = -1.5
     sap_revert_entry_to_pct: float = -0.5
-    # 듀얼 레짐(지수 MA + 종목 분봉 박스): 추세(MA 골든) vs 횡보(MR) 분기
-    regime_dual_switch_enabled: bool = True  # 단타 기본: 지수+종목 박스로 횡보 추세진입 완화
-    regime_block_ma_buy_when_index_bear: bool = True  # 지수 < N일 MA 이면 MA 추세 매수 후보 제외(기존 index_ma_filter와 별도로 동작)
-    regime_block_ma_buy_when_stock_range: bool = True  # 분봉 박스가 좁으면 MA 추세 매수 제외
+    # 듀얼 레짐(종목 분봉 박스 기반): 추세(MA 골든) vs 횡보(MR) 진입 방식 선택
+    regime_dual_switch_enabled: bool = True
+    # Deprecated: 시장 약세/박스 차단은 index_ma_filter, advance_ratio_filter, range 필터로 통합.
+    # 저장 호환을 위해 필드는 남기지만 런타임에서는 무시된다.
+    regime_block_ma_buy_when_index_bear: bool = False
+    regime_block_ma_buy_when_stock_range: bool = False
     regime_stock_range_lookback_minutes: int = 15  # 단타: 12~20분대 권장(프리셋별 조정)
     regime_stock_range_max_ratio: float = 0.0065  # (고-저)/현재가; ~0.65% 미만이면 좁은 박스
     regime_mr_buy_enabled: bool = False  # 오전·보수는 끔, 전일·오후·공격만 켜는 것을 권장

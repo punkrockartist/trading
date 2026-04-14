@@ -42,6 +42,7 @@ class DynamoDBUserSettingsStore:
         - strategy_config_json
         - stock_selection_config_json
         - operational_config_json
+        - macro_config_json
         - custom_slots_json (optional)  # {"1": {"name": "Custom 1", "risk_config": {...}, ...}, ...} 1~10
         - updated_at (ISO8601)
         - schema_version (int)
@@ -185,6 +186,7 @@ class DynamoDBUserSettingsStore:
                 ("strategy_config", "strategy_config_json"),
                 ("stock_selection_config", "stock_selection_config_json"),
                 ("operational_config", "operational_config_json"),
+                ("macro_config", "macro_config_json"),
             ):
                 raw = item.get(field)
                 if isinstance(raw, str) and raw.strip():
@@ -224,6 +226,7 @@ class DynamoDBUserSettingsStore:
         strategy_config: Optional[Dict[str, Any]] = None,
         stock_selection_config: Optional[Dict[str, Any]] = None,
         operational_config: Optional[Dict[str, Any]] = None,
+        macro_config: Optional[Dict[str, Any]] = None,
         custom_slots: Optional[Dict[str, Any]] = None,
     ) -> bool:
         if not self.enabled:
@@ -243,6 +246,9 @@ class DynamoDBUserSettingsStore:
             if operational_config is not None:
                 sets.append("operational_config_json=:oper")
                 values[":oper"] = json.dumps(operational_config, ensure_ascii=False)
+            if macro_config is not None:
+                sets.append("macro_config_json=:macro")
+                values[":macro"] = json.dumps(macro_config, ensure_ascii=False)
             if custom_slots is not None:
                 sets.append("custom_slots_json=:slots")
                 values[":slots"] = json.dumps(custom_slots, ensure_ascii=False)
