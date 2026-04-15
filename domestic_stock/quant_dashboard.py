@@ -700,6 +700,24 @@ async def get_current_user(
         headers={"WWW-Authenticate": "Bearer"},
     )
 
+
+GUEST_USERNAME = "guest"
+
+
+def is_guest_user(username: Optional[str]) -> bool:
+    """게스트(읽기 전용) 계정 여부."""
+    return str(username or "").strip().lower() == GUEST_USERNAME
+
+
+async def get_write_enabled_user(current_user: str = Depends(get_current_user)) -> str:
+    """쓰기 권한이 필요한 API용 의존성."""
+    if is_guest_user(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="guest 계정은 읽기 전용입니다. 이 기능은 사용할 수 없습니다.",
+        )
+    return current_user
+
 # ============================================================================
 # 로그인/회원가입 페이지
 # ============================================================================
@@ -744,7 +762,7 @@ async def logout():
 @app.post("/api/auth/change-password")
 async def change_password(
     body: ChangePasswordRequest,
-    current_user: str = Depends(get_current_user),
+    current_user: str = Depends(get_write_enabled_user),
 ):
     """로그인 비밀번호 변경 (현재 비밀번호 확인 필요)."""
     if not body.new_password or len(body.new_password) < 4:

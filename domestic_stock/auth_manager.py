@@ -83,6 +83,13 @@ class SimpleUserStore:
                 "email": "admin@example.com",
                 "created_at": datetime.now().isoformat(),
                 "is_active": True
+            },
+            "guest": {
+                "username": "guest",
+                "password_hash": self._hash_password("guest"),
+                "email": "guest@example.com",
+                "created_at": datetime.now().isoformat(),
+                "is_active": True
             }
         }
     
@@ -185,7 +192,7 @@ try:
             
             self.table = self.dynamodb.Table(table_name)
             self._ensure_table_exists()
-            self._ensure_default_admin()
+            self._ensure_default_accounts()
         
         def _ensure_table_exists(self):
             """테이블이 없으면 생성"""
@@ -211,25 +218,29 @@ try:
                         if create_error.response['Error']['Code'] != 'ResourceInUseException':
                             logger.error(f"테이블 생성 실패: {create_error}")
         
-        def _ensure_default_admin(self):
-            """기본 admin 계정이 없으면 생성"""
-            try:
-                response = self.table.get_item(Key={'username': 'admin'})
-                if 'Item' not in response:
-                    # admin 계정 생성
-                    self.table.put_item(
-                        Item={
-                            'username': 'admin',
-                            'password_hash': self._hash_password('admin123'),
-                            'email': 'admin@example.com',
-                            'created_at': datetime.now().isoformat(),
-                            'is_active': True
-                        },
-                        ConditionExpression='attribute_not_exists(username)'
-                    )
-                    logger.info("기본 admin 계정 생성됨 (username: admin, password: admin123)")
-            except ClientError as e:
-                logger.warning(f"기본 admin 계정 생성 실패 (무시): {e}")
+        def _ensure_default_accounts(self):
+            """기본 admin/guest 계정이 없으면 생성"""
+            defaults = [
+                ("admin", "admin123", "admin@example.com"),
+                ("guest", "guest", "guest@example.com"),
+            ]
+            for username, password, email in defaults:
+                try:
+                    response = self.table.get_item(Key={'username': username})
+                    if 'Item' not in response:
+                        self.table.put_item(
+                            Item={
+                                'username': username,
+                                'password_hash': self._hash_password(password),
+                                'email': email,
+                                'created_at': datetime.now().isoformat(),
+                                'is_active': True
+                            },
+                            ConditionExpression='attribute_not_exists(username)'
+                        )
+                        logger.info(f"기본 계정 생성됨 (username: {username})")
+                except ClientError as e:
+                    logger.warning(f"기본 계정 생성 실패 (무시): username={username}, err={e}")
         
         def _hash_password(self, password: str) -> str:
             """비밀번호 해시"""

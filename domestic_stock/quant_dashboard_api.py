@@ -27,7 +27,7 @@ from domestic_stock_functions_ws import ccnl_krx, asking_price_krx, market_statu
 from domestic_stock_functions import inquire_index_daily_price, inquire_index_price, fluctuation, volume_rank, inquire_vi_status
 
 from quant_dashboard import (
-    app, state, get_current_user,
+    app, state, get_current_user, is_guest_user,
     RiskConfig, StockSelectionConfig, StrategyConfig, OperationalConfig, ManualOrder, MacroConfig,
     UnifiedRegimeSwitchConfig,
     _record_dashboard_http_shutdown_graceful,
@@ -50,6 +50,15 @@ except Exception:  # pragma: no cover - 환경 의존
     OpenAI = None  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+
+def _deny_guest_write_access(current_user: str, feature: str = "이 기능") -> None:
+    """guest 계정의 쓰기/위험 기능 접근 차단."""
+    if is_guest_user(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail=f"guest 계정은 읽기 전용입니다. {feature}은(는) 사용할 수 없습니다.",
+        )
 
 # 매도 신호 출처 코드: system_*.log / trade_info["sell_trigger_code"].
 # RiskManager.check_exit_signal 의 trigger_code(risk_*)는 quant_trading_safe.py 와 동일 문자열.
@@ -1136,6 +1145,250 @@ def _mark_vi_reentry_bought(stock_code: str) -> None:
         return
     ctx["buy_done"] = True
     watch[code] = ctx
+
+
+def _engine_buy_skip_on_risk_gates(stock_code: str, current_price: float) -> bool:
+    """
+    리스크·거래소·VI 계열 매수 게이트. True면 매수 스킵(호출부 continue).
+    알파(시장 레짐·진입 품질)와 코드 경계를 분리한다.
+    """
+    try:
+        if getattr(state.risk_manager, "reentry_cooldown_seconds", 0) and getattr(state.risk_manager, "is_in_reentry_cooldown", None):
+            if state.risk_manager.is_in_reentry_cooldown(stock_code):
+                _record_buy_skip(stock_code, "cooldown")
+                _throttled_skip_log(stock_code, f"재진입 쿨다운({getattr(state.risk_manager, 'reentry_cooldown_seconds', 0)}s)")
+                return True
+    except Exception:
+        pass
+    try:
+        if bool(getattr(state, "circuit_breaker_filter_enabled", True)):
+            mkt = str(getattr(state, "circuit_breaker_market", "0001") or "0001")
+            thresh = float(getattr(state, "circuit_breaker_threshold_pct", -7.0) or -7.0)
+            is_risk, drop_pct = _get_exchange_circuit_breaker_risk(mkt, thresh)
+            if is_risk and drop_pct is not None:
+                _record_buy_skip(stock_code, "circuit_breaker")
+                _throttled_skip_log(
+                    stock_code,
+                    f"거래소 서킷(급락) 구간 추정: 지수 전일대비 {drop_pct:.1f}% (신규 매수 스킵)",
+                )
+                _tz = timezone(timedelta(hours=9))
+                _today_key = datetime.now(_tz).strftime("%Y%m%d")
+                action = str(getattr(state, "circuit_breaker_action", "skip_buy_only") or "skip_buy_only").strip().lower()
+                if action == "no_buy_rest_of_day" and getattr(state, "risk_manager", None):
+                    state.risk_manager.halt_new_buys_day = _today_key
+                    state.risk_manager.halt_new_buys_reason = "서킷브레이커(급락) 구간 → 당일 신규 매수 중지"
+                elif action in ("liquidate_all", "liquidate_partial") and getattr(state, "risk_manager", None):
+                    rm = state.risk_manager
+                    for code, pos in list(rm.positions.items()):
+                        qty = int(pos.get("quantity", 0) or 0)
+                        if qty <= 0:
+                            continue
+                        px = float(pos.get("current_price") or rm.last_prices.get(code) or pos.get("buy_price") or 0)
+                        if px <= 0:
+                            continue
+                        sell_qty = (qty // 2) if action == "liquidate_partial" else qty
+                        if sell_qty > 0:
+                            _handle_signal(
+                                code,
+                                "sell",
+                                px,
+                                f"서킷브레이커 구간 {action}",
+                                suggested_qty_override=sell_qty,
+                                sell_trigger_code=SELL_TRIG_CIRCUIT_BREAKER,
+                            )
+                return True
+    except Exception:
+        pass
+    try:
+        if bool(getattr(state, "sidecar_filter_enabled", True)):
+            mkt = str(getattr(state, "sidecar_market", "0001") or "0001")
+            cooling_min = max(1, min(30, int(getattr(state, "sidecar_cooling_minutes", 5) or 5)))
+            tz = timezone(timedelta(hours=9))
+            today_key = datetime.now(tz).strftime("%Y%m%d")
+            now_ts = time.time()
+            skip_until = float(getattr(state, "_sidecar_skip_until_ts", 0) or 0)
+            triggered_day = str(getattr(state, "_sidecar_triggered_day", "") or "")
+            if now_ts < skip_until:
+                _record_buy_skip(stock_code, "sidecar_cooling")
+                _throttled_skip_log(stock_code, f"사이드카 냉각 구간({cooling_min}분) 신규 매수 스킵")
+                return True
+            is_sidecar, chg_pct = _get_exchange_sidecar_risk(mkt)
+            if is_sidecar and chg_pct is not None and triggered_day != today_key:
+                state._sidecar_skip_until_ts = now_ts + cooling_min * 60
+                state._sidecar_triggered_day = today_key
+                _run_async_broadcast({
+                    "type": "log",
+                    "level": "warning",
+                    "message": f"사이드카 구간 추정: 지수 전일대비 {chg_pct:+.1f}% → {cooling_min}분간 신규 매수 스킵",
+                })
+                _record_buy_skip(stock_code, "sidecar")
+                action = str(getattr(state, "sidecar_action", "skip_buy_only") or "skip_buy_only").strip().lower()
+                if action == "no_buy_rest_of_day" and getattr(state, "risk_manager", None):
+                    state.risk_manager.halt_new_buys_day = today_key
+                    state.risk_manager.halt_new_buys_reason = "사이드카 구간 → 당일 신규 매수 중지"
+                elif action in ("liquidate_all", "liquidate_partial") and getattr(state, "risk_manager", None):
+                    rm = state.risk_manager
+                    for code, pos in list(rm.positions.items()):
+                        qty = int(pos.get("quantity", 0) or 0)
+                        if qty <= 0:
+                            continue
+                        px = float(pos.get("current_price") or rm.last_prices.get(code) or pos.get("buy_price") or 0)
+                        if px <= 0:
+                            continue
+                        sell_qty = (qty // 2) if action == "liquidate_partial" else qty
+                        if sell_qty > 0:
+                            _handle_signal(
+                                code,
+                                "sell",
+                                px,
+                                f"사이드카 구간 {action}",
+                                suggested_qty_override=sell_qty,
+                                sell_trigger_code=SELL_TRIG_SIDECAR,
+                            )
+                return True
+    except Exception:
+        pass
+    try:
+        if bool(getattr(state, "vi_filter_enabled", True)):
+            vi_cooling = max(1, min(30, int(getattr(state, "vi_cooling_minutes", 5) or 5)))
+            vi_skip_until = getattr(state, "_vi_skip_until", None) or {}
+            if not isinstance(vi_skip_until, dict):
+                vi_skip_until = {}
+            if vi_skip_until.get(stock_code, 0) > time.time():
+                _record_buy_skip(stock_code, "vi_cooling")
+                _throttled_skip_log(stock_code, "VI 냉각 구간(해당 종목) 신규 매수 스킵")
+                return True
+            vi_status = _get_stock_vi_status(stock_code)
+            vi_active_now = bool(vi_status.get("triggered", False))
+            vi_source = str(vi_status.get("source", "unknown") or "unknown")
+            vi_raw = vi_status.get("raw")
+            vi_note = str(vi_status.get("note", "") or "")
+            if vi_active_now and vi_source == "ws":
+                wt_buy = (_get_vi_reentry_watch() or {}).get(stock_code) or {}
+                was_buy = bool(wt_buy.get("active", False))
+                tz_b = timezone(timedelta(hours=9))
+                tws_b = datetime.now(tz_b).strftime("%Y-%m-%d %H:%M:%S")
+                _mark_vi_reentry_active(
+                    stock_code, current_price, trigger_at_kst=tws_b if not was_buy else None
+                )
+                state._vi_skip_until = {**vi_skip_until, stock_code: time.time() + vi_cooling * 60}
+                w_log = (_get_vi_reentry_watch() or {}).get(stock_code) or {}
+                t_log = _vi_kst_iso_to_hhmmss(w_log.get("vi_trigger_at_kst"))
+                _run_async_broadcast({
+                    "type": "log",
+                    "level": "warning",
+                    "message": (
+                        f"VI 활성 | 발동={t_log} 해제=- | source=WS raw={vi_raw} "
+                        f"→ {vi_cooling}분간 해당 종목 매수 스킵"
+                    ),
+                })
+                _record_buy_skip(stock_code, "vi")
+                return True
+            if vi_active_now:
+                _record_buy_skip(stock_code, "vi_rest_active")
+                t_log = _vi_kst_iso_to_hhmmss(vi_status.get("trigger_at_kst"))
+                r_log = _vi_kst_iso_to_hhmmss(vi_status.get("release_at_kst"))
+                _throttled_skip_log(
+                    stock_code,
+                    f"VI 활성 | 발동={t_log} 해제={r_log} | {vi_source} raw={vi_raw or '-'} {vi_note}".strip(),
+                    ttl_sec=30,
+                )
+                return True
+            vi_watch = (_get_vi_reentry_watch() or {}).get(stock_code) or {}
+            if bool(vi_watch.get("active", False)) and vi_source in ("rest_unknown", "cache_rest_unknown", "error", "cache_error"):
+                _record_buy_skip(stock_code, "vi_status_unknown")
+                _throttled_skip_log(
+                    stock_code,
+                    f"VI 상태 미확정({vi_source}) → WS 해제 대기",
+                    ttl_sec=30,
+                )
+                return True
+            if vi_source in ("ws", "cache_ws", "rest", "cache_rest"):
+                _mark_vi_reentry_released(
+                    stock_code,
+                    current_price,
+                    trigger_at_kst=vi_status.get("trigger_at_kst"),
+                    release_at_kst=vi_status.get("release_at_kst"),
+                )
+            vi_reentry_reason = _get_vi_reentry_skip_reason(stock_code, current_price)
+            if vi_reentry_reason:
+                _record_buy_skip(stock_code, "vi_reentry_wait")
+                _throttled_skip_log(stock_code, vi_reentry_reason)
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _engine_buy_skip_on_alpha_market_gates(stock_code: str, current_price: float) -> bool:
+    """
+    알파·시장 레짐 계열 매수 게이트(지수 MA, 상승비율, 상대강도, 거래대금 집중). True면 스킵.
+    리스크 게이트(_engine_buy_skip_on_risk_gates) 이후에 호출한다.
+    """
+    try:
+        if bool(getattr(state, "index_ma_filter_enabled", False)):
+            idx_code = str(getattr(state, "index_ma_code", "1001") or "1001")
+            idx_period = max(5, min(60, int(getattr(state, "index_ma_period", 20)) or 20))
+            if not _get_index_ma_ok(idx_code, idx_period):
+                _record_buy_skip(stock_code, "index_ma")
+                _throttled_skip_log(stock_code, "시장 레짐(지수<MA)")
+                return True
+    except Exception:
+        pass
+    try:
+        if bool(getattr(state, "advance_ratio_filter_enabled", False)):
+            mkt = str(getattr(state, "advance_ratio_market", "1001") or "1001")
+            min_pct = float(getattr(state, "advance_ratio_min_pct", 40.0) or 40.0) / 100.0
+            ratio = _get_advance_ratio(mkt)
+            if ratio is not None and ratio < min_pct:
+                _record_buy_skip(stock_code, "advance_ratio")
+                _throttled_skip_log(
+                    stock_code,
+                    f"시장 레짐(상승비율 {ratio*100:.1f}% < {min_pct*100:.0f}%)",
+                )
+                return True
+            if bool(getattr(state, "advance_ratio_down_market_skip", True)) and ratio is not None and ratio < 0.5:
+                _record_buy_skip(stock_code, "advance_ratio_down")
+                _throttled_skip_log(
+                    stock_code,
+                    f"하락장 강화 스킵(상승비율 {ratio*100:.1f}% < 50%)",
+                )
+                return True
+    except Exception:
+        pass
+    try:
+        if bool(getattr(state, "relative_strength_filter_enabled", False)):
+            idx_code = str(getattr(state, "relative_strength_index_code", "0001") or "0001")
+            margin_pct = float(getattr(state, "relative_strength_margin_pct", 0.0) or 0.0)
+            _, index_chg = _get_exchange_circuit_breaker_risk(idx_code, -20.0)
+            open_today = (getattr(state, "_stock_open_today", None) or {}).get(stock_code)
+            if index_chg is not None and open_today is not None and float(open_today) > 0:
+                stock_chg_pct = (float(current_price) - float(open_today)) / float(open_today) * 100.0
+                if stock_chg_pct <= index_chg + margin_pct:
+                    _record_buy_skip(stock_code, "relative_strength")
+                    _throttled_skip_log(
+                        stock_code,
+                        f"상대강도 미달(종목 {stock_chg_pct:.2f}% <= 지수 {index_chg:.2f}%+{margin_pct}%)",
+                    )
+                    return True
+    except Exception:
+        pass
+    try:
+        if bool(getattr(state, "trade_value_concentration_filter_enabled", False)):
+            mkt = str(getattr(state, "trade_value_concentration_market", "1001") or "1001")
+            top_n = max(2, min(20, int(getattr(state, "trade_value_concentration_top_n", 10)) or 10))
+            denom_n = max(top_n + 1, min(50, int(getattr(state, "trade_value_concentration_denom_n", 30)) or 30))
+            max_pct = float(getattr(state, "trade_value_concentration_max_pct", 45.0) or 45.0)
+            if not _get_trade_value_concentration_ok(mkt, top_n, denom_n, max_pct):
+                _record_buy_skip(stock_code, "trade_value_concentration")
+                _throttled_skip_log(
+                    stock_code,
+                    f"시장 레짐(거래대금 집중 상위{top_n}/{denom_n}>{max_pct:.0f}%)",
+                )
+                return True
+    except Exception:
+        pass
+    return False
 
 
 # 상승 종목 비율 캐시 (등락률 순위 API 기반)
@@ -4586,243 +4839,11 @@ def _start_trading_engine_thread():
                                             else "이동평균 크로스 조건 충족"
                                         )
                                         # 선정 종목에 있을 때만 매수. 포지션에만 있고 선정에 없는 종목(전일 잔여 등)은 매도만 허용·매수 스킵
-                                        # (0-0) 재진입 쿨다운: 직전 매도 직후 같은 종목 재매수 방지(횡보장 와입 방지) — 가장 먼저 검사
-                                        try:
-                                            if getattr(state.risk_manager, "reentry_cooldown_seconds", 0) and getattr(state.risk_manager, "is_in_reentry_cooldown", None):
-                                                if state.risk_manager.is_in_reentry_cooldown(stock_code):
-                                                    _record_buy_skip(stock_code, "cooldown")
-                                                    _throttled_skip_log(stock_code, f"재진입 쿨다운({getattr(state.risk_manager, 'reentry_cooldown_seconds', 0)}s)")
-                                                    continue
-                                        except Exception:
-                                            pass
-                                        # (0-0a) 거래소 서킷브레이커(급락) 구간: 전일 대비 지수 하락률이 N% 이하이면 신규 매수 스킵
-                                        try:
-                                            if bool(getattr(state, "circuit_breaker_filter_enabled", True)):
-                                                mkt = str(getattr(state, "circuit_breaker_market", "0001") or "0001")
-                                                thresh = float(getattr(state, "circuit_breaker_threshold_pct", -7.0) or -7.0)
-                                                is_risk, drop_pct = _get_exchange_circuit_breaker_risk(mkt, thresh)
-                                                if is_risk and drop_pct is not None:
-                                                    _record_buy_skip(stock_code, "circuit_breaker")
-                                                    _throttled_skip_log(
-                                                        stock_code,
-                                                        f"거래소 서킷(급락) 구간 추정: 지수 전일대비 {drop_pct:.1f}% (신규 매수 스킵)",
-                                                    )
-                                                    _tz = timezone(timedelta(hours=9))
-                                                    _today_key = datetime.now(_tz).strftime("%Y%m%d")
-                                                    action = str(getattr(state, "circuit_breaker_action", "skip_buy_only") or "skip_buy_only").strip().lower()
-                                                    if action == "no_buy_rest_of_day" and getattr(state, "risk_manager", None):
-                                                        state.risk_manager.halt_new_buys_day = _today_key
-                                                        state.risk_manager.halt_new_buys_reason = "서킷브레이커(급락) 구간 → 당일 신규 매수 중지"
-                                                    elif action in ("liquidate_all", "liquidate_partial") and getattr(state, "risk_manager", None):
-                                                        rm = state.risk_manager
-                                                        for code, pos in list(rm.positions.items()):
-                                                            qty = int(pos.get("quantity", 0) or 0)
-                                                            if qty <= 0:
-                                                                continue
-                                                            px = float(pos.get("current_price") or rm.last_prices.get(code) or pos.get("buy_price") or 0)
-                                                            if px <= 0:
-                                                                continue
-                                                            sell_qty = (qty // 2) if action == "liquidate_partial" else qty
-                                                            if sell_qty > 0:
-                                                                _handle_signal(
-                                                                    code,
-                                                                    "sell",
-                                                                    px,
-                                                                    f"서킷브레이커 구간 {action}",
-                                                                    suggested_qty_override=sell_qty,
-                                                                    sell_trigger_code=SELL_TRIG_CIRCUIT_BREAKER,
-                                                                )
-                                                    continue
-                                        except Exception:
-                                            pass
-                                        # (0-0a2) 사이드카 발동 가능 구간: 지수 ±5%(코스피)/±6%(코스닥) 변동 시 N분간 신규 매수 스킵
-                                        try:
-                                            if bool(getattr(state, "sidecar_filter_enabled", True)):
-                                                mkt = str(getattr(state, "sidecar_market", "0001") or "0001")
-                                                cooling_min = max(1, min(30, int(getattr(state, "sidecar_cooling_minutes", 5) or 5)))
-                                                tz = timezone(timedelta(hours=9))
-                                                today_key = datetime.now(tz).strftime("%Y%m%d")
-                                                now_ts = time.time()
-                                                skip_until = float(getattr(state, "_sidecar_skip_until_ts", 0) or 0)
-                                                triggered_day = str(getattr(state, "_sidecar_triggered_day", "") or "")
-                                                if now_ts < skip_until:
-                                                    _record_buy_skip(stock_code, "sidecar_cooling")
-                                                    _throttled_skip_log(stock_code, f"사이드카 냉각 구간({cooling_min}분) 신규 매수 스킵")
-                                                    continue
-                                                is_sidecar, chg_pct = _get_exchange_sidecar_risk(mkt)
-                                                if is_sidecar and chg_pct is not None and triggered_day != today_key:
-                                                    state._sidecar_skip_until_ts = now_ts + cooling_min * 60
-                                                    state._sidecar_triggered_day = today_key
-                                                    _run_async_broadcast({
-                                                        "type": "log",
-                                                        "level": "warning",
-                                                        "message": f"사이드카 구간 추정: 지수 전일대비 {chg_pct:+.1f}% → {cooling_min}분간 신규 매수 스킵",
-                                                    })
-                                                    _record_buy_skip(stock_code, "sidecar")
-                                                    action = str(getattr(state, "sidecar_action", "skip_buy_only") or "skip_buy_only").strip().lower()
-                                                    if action == "no_buy_rest_of_day" and getattr(state, "risk_manager", None):
-                                                        state.risk_manager.halt_new_buys_day = today_key  # today_key already in scope
-                                                        state.risk_manager.halt_new_buys_reason = "사이드카 구간 → 당일 신규 매수 중지"
-                                                    elif action in ("liquidate_all", "liquidate_partial") and getattr(state, "risk_manager", None):
-                                                        rm = state.risk_manager
-                                                        for code, pos in list(rm.positions.items()):
-                                                            qty = int(pos.get("quantity", 0) or 0)
-                                                            if qty <= 0:
-                                                                continue
-                                                            px = float(pos.get("current_price") or rm.last_prices.get(code) or pos.get("buy_price") or 0)
-                                                            if px <= 0:
-                                                                continue
-                                                            sell_qty = (qty // 2) if action == "liquidate_partial" else qty
-                                                            if sell_qty > 0:
-                                                                _handle_signal(
-                                                                    code,
-                                                                    "sell",
-                                                                    px,
-                                                                    f"사이드카 구간 {action}",
-                                                                    suggested_qty_override=sell_qty,
-                                                                    sell_trigger_code=SELL_TRIG_SIDECAR,
-                                                                )
-                                                    continue
-                                        except Exception:
-                                            pass
-                                        # (0-0a3) VI(종목별 변동성완화장치) 발동 시 해당 종목 N분 스킵
-                                        try:
-                                            if bool(getattr(state, "vi_filter_enabled", True)):
-                                                vi_cooling = max(1, min(30, int(getattr(state, "vi_cooling_minutes", 5) or 5)))
-                                                vi_skip_until = getattr(state, "_vi_skip_until", None) or {}
-                                                if not isinstance(vi_skip_until, dict):
-                                                    vi_skip_until = {}
-                                                if vi_skip_until.get(stock_code, 0) > time.time():
-                                                    _record_buy_skip(stock_code, "vi_cooling")
-                                                    _throttled_skip_log(stock_code, "VI 냉각 구간(해당 종목) 신규 매수 스킵")
-                                                    continue
-                                                vi_status = _get_stock_vi_status(stock_code)
-                                                vi_active_now = bool(vi_status.get("triggered", False))
-                                                vi_source = str(vi_status.get("source", "unknown") or "unknown")
-                                                vi_raw = vi_status.get("raw")
-                                                vi_note = str(vi_status.get("note", "") or "")
-                                                if vi_active_now and vi_source == "ws":
-                                                    wt_buy = (_get_vi_reentry_watch() or {}).get(stock_code) or {}
-                                                    was_buy = bool(wt_buy.get("active", False))
-                                                    tz_b = timezone(timedelta(hours=9))
-                                                    tws_b = datetime.now(tz_b).strftime("%Y-%m-%d %H:%M:%S")
-                                                    _mark_vi_reentry_active(
-                                                        stock_code, current_price, trigger_at_kst=tws_b if not was_buy else None
-                                                    )
-                                                    state._vi_skip_until = {**vi_skip_until, stock_code: time.time() + vi_cooling * 60}
-                                                    w_log = (_get_vi_reentry_watch() or {}).get(stock_code) or {}
-                                                    t_log = _vi_kst_iso_to_hhmmss(w_log.get("vi_trigger_at_kst"))
-                                                    _run_async_broadcast({
-                                                        "type": "log",
-                                                        "level": "warning",
-                                                        "message": (
-                                                            f"VI 활성 | 발동={t_log} 해제=- | source=WS raw={vi_raw} "
-                                                            f"→ {vi_cooling}분간 해당 종목 매수 스킵"
-                                                        ),
-                                                    })
-                                                    _record_buy_skip(stock_code, "vi")
-                                                    continue
-                                                if vi_active_now:
-                                                    _record_buy_skip(stock_code, "vi_rest_active")
-                                                    t_log = _vi_kst_iso_to_hhmmss(vi_status.get("trigger_at_kst"))
-                                                    r_log = _vi_kst_iso_to_hhmmss(vi_status.get("release_at_kst"))
-                                                    _throttled_skip_log(
-                                                        stock_code,
-                                                        f"VI 활성 | 발동={t_log} 해제={r_log} | {vi_source} raw={vi_raw or '-'} {vi_note}".strip(),
-                                                        ttl_sec=30,
-                                                    )
-                                                    continue
-                                                vi_watch = (_get_vi_reentry_watch() or {}).get(stock_code) or {}
-                                                if bool(vi_watch.get("active", False)) and vi_source in ("rest_unknown", "cache_rest_unknown", "error", "cache_error"):
-                                                    _record_buy_skip(stock_code, "vi_status_unknown")
-                                                    _throttled_skip_log(
-                                                        stock_code,
-                                                        f"VI 상태 미확정({vi_source}) → WS 해제 대기",
-                                                        ttl_sec=30,
-                                                    )
-                                                    continue
-                                                if vi_source in ("ws", "cache_ws", "rest", "cache_rest"):
-                                                    _mark_vi_reentry_released(
-                                                        stock_code,
-                                                        current_price,
-                                                        trigger_at_kst=vi_status.get("trigger_at_kst"),
-                                                        release_at_kst=vi_status.get("release_at_kst"),
-                                                    )
-                                                vi_reentry_reason = _get_vi_reentry_skip_reason(stock_code, current_price)
-                                                if vi_reentry_reason:
-                                                    _record_buy_skip(stock_code, "vi_reentry_wait")
-                                                    _throttled_skip_log(stock_code, vi_reentry_reason)
-                                                    continue
-                                        except Exception:
-                                            pass
-                                        # (0-0) 지수 MA 시장 레짐: 지수(코스닥 등)가 N일 MA 미만이면 매수 스킵
-                                        try:
-                                            if bool(getattr(state, "index_ma_filter_enabled", False)):
-                                                idx_code = str(getattr(state, "index_ma_code", "1001") or "1001")
-                                                idx_period = max(5, min(60, int(getattr(state, "index_ma_period", 20)) or 20))
-                                                if not _get_index_ma_ok(idx_code, idx_period):
-                                                    _record_buy_skip(stock_code, "index_ma")
-                                                    _throttled_skip_log(stock_code, "시장 레짐(지수<MA)")
-                                                    continue
-                                        except Exception:
-                                            pass
-                                        # (0-0b) 상승 종목 비율 시장 레짐: 상승 비율이 N% 미만이면 매수 스킵
-                                        try:
-                                            if bool(getattr(state, "advance_ratio_filter_enabled", False)):
-                                                mkt = str(getattr(state, "advance_ratio_market", "1001") or "1001")
-                                                min_pct = float(getattr(state, "advance_ratio_min_pct", 40.0) or 40.0) / 100.0
-                                                ratio = _get_advance_ratio(mkt)
-                                                if ratio is not None and ratio < min_pct:
-                                                    _record_buy_skip(stock_code, "advance_ratio")
-                                                    _throttled_skip_log(
-                                                        stock_code,
-                                                        f"시장 레짐(상승비율 {ratio*100:.1f}% < {min_pct*100:.0f}%)",
-                                                    )
-                                                    continue
-                                                # (6) 하락장 강화: 상승 비율 < 50%이면 전량 매수 스킵
-                                                if bool(getattr(state, "advance_ratio_down_market_skip", True)) and ratio is not None and ratio < 0.5:
-                                                    _record_buy_skip(stock_code, "advance_ratio_down")
-                                                    _throttled_skip_log(
-                                                        stock_code,
-                                                        f"하락장 강화 스킵(상승비율 {ratio*100:.1f}% < 50%)",
-                                                    )
-                                                    continue
-                                        except Exception:
-                                            pass
-                                        # (0-0d) 지수 대비 상대 강도: 종목 변동률 > 지수 변동률 + margin일 때만 매수
-                                        try:
-                                            if bool(getattr(state, "relative_strength_filter_enabled", False)):
-                                                idx_code = str(getattr(state, "relative_strength_index_code", "0001") or "0001")
-                                                margin_pct = float(getattr(state, "relative_strength_margin_pct", 0.0) or 0.0)
-                                                _, index_chg = _get_exchange_circuit_breaker_risk(idx_code, -20.0)
-                                                open_today = (getattr(state, "_stock_open_today", None) or {}).get(stock_code)
-                                                if index_chg is not None and open_today is not None and float(open_today) > 0:
-                                                    stock_chg_pct = (float(current_price) - float(open_today)) / float(open_today) * 100.0
-                                                    if stock_chg_pct <= index_chg + margin_pct:
-                                                        _record_buy_skip(stock_code, "relative_strength")
-                                                        _throttled_skip_log(
-                                                            stock_code,
-                                                            f"상대강도 미달(종목 {stock_chg_pct:.2f}% <= 지수 {index_chg:.2f}%+{margin_pct}%)",
-                                                        )
-                                                        continue
-                                        except Exception:
-                                            pass
-                                        # (0-0c) 거래대금 집중 시장 레짐: 상위 N종목 거래대금 비율이 X% 초과면 매수 스킵
-                                        try:
-                                            if bool(getattr(state, "trade_value_concentration_filter_enabled", False)):
-                                                mkt = str(getattr(state, "trade_value_concentration_market", "1001") or "1001")
-                                                top_n = max(2, min(20, int(getattr(state, "trade_value_concentration_top_n", 10)) or 10))
-                                                denom_n = max(top_n + 1, min(50, int(getattr(state, "trade_value_concentration_denom_n", 30)) or 30))
-                                                max_pct = float(getattr(state, "trade_value_concentration_max_pct", 45.0) or 45.0)
-                                                if not _get_trade_value_concentration_ok(mkt, top_n, denom_n, max_pct):
-                                                    _record_buy_skip(stock_code, "trade_value_concentration")
-                                                    _throttled_skip_log(
-                                                        stock_code,
-                                                        f"시장 레짐(거래대금 집중 상위{top_n}/{denom_n}>{max_pct:.0f}%)",
-                                                    )
-                                                    continue
-                                        except Exception:
-                                            pass
+                                        # 리스크·거래소·VI 게이트 → 알파·시장 레짐 게이트 (코드 경계 분리, 평가 순서 동일)
+                                        if _engine_buy_skip_on_risk_gates(stock_code, current_price):
+                                            continue
+                                        if _engine_buy_skip_on_alpha_market_gates(stock_code, current_price):
+                                            continue
                                         # (0) 스프레드 필터: 호가 스프레드가 너무 크면 매수 스킵
                                         try:
                                             max_spread = float(_eff_float("max_spread_ratio", 0.0) or 0.0)
@@ -6327,6 +6348,7 @@ async def _do_start_system(username: str) -> tuple:
 @app.post("/api/system/start")
 async def start_system(current_user: str = Depends(get_current_user)):
     """시스템 시작"""
+    _deny_guest_write_access(current_user, "시스템 시작")
     success, message = await _do_start_system(current_user)
     return JSONResponse({"success": success, "message": message})
 
@@ -6356,6 +6378,7 @@ async def set_trading_env(
     current_user: str = Depends(get_current_user)
 ):
     """모의투자/실전투자 환경 전환 (시스템 중지 상태에서만 가능)"""
+    _deny_guest_write_access(current_user, "투자 환경 변경")
     is_paper_trading = body.get("is_paper_trading", True)
     if not isinstance(is_paper_trading, bool):
         is_paper_trading = str(is_paper_trading).lower() in ("true", "1", "yes")
@@ -6387,6 +6410,7 @@ async def set_trade_mode(
     current_user: str = Depends(get_current_user)
 ):
     """매매 모드 전환: 수동(승인대기) / 자동(즉시 체결)"""
+    _deny_guest_write_access(current_user, "매매 모드 변경")
     try:
         manual_approval = body.get("manual_approval", True)
         if not isinstance(manual_approval, bool):
@@ -6410,6 +6434,7 @@ async def set_allow_real_auto_trading_override(
     - mode=block : 시스템 시작 시 실전+자동 조합 차단
     - mode=env  : 강제 차단 해제(기본 동작으로 복귀)
     """
+    _deny_guest_write_access(current_user, "실전 자동매매 오버라이드 변경")
     try:
         mode = str(body.get("mode", "env") or "env").strip().lower()
         if mode in ("block", "false", "0", "off", "deny", "no"):
@@ -6552,6 +6577,7 @@ async def stop_system(
     current_user: str = Depends(get_current_user)
 ):
     """시스템 중지"""
+    _deny_guest_write_access(current_user, "시스템 중지")
     success, message = await _do_stop_system(current_user, liquidate)
     return JSONResponse({"success": success, "message": message})
 
@@ -6855,6 +6881,7 @@ async def get_ai_report_daily(
     - 입력: system_YYYYMMDD.log, quant_trading_user_hist(해당일), quant_trading_user_settings 스냅샷
     - 출력: AI가 생성한 JSON 리포트 (요약, 지표 해석, 문제점, 파라미터 제안, 액션 아이템 등)
     """
+    _deny_guest_write_access(current_user, "AI 리포트 생성")
     try:
         tz = timezone(timedelta(hours=9))
         today = datetime.now(tz).strftime("%Y%m%d")
@@ -6896,6 +6923,7 @@ async def get_ai_report_daily(
 @app.post("/api/positions/sync-from-balance")
 async def sync_positions_from_balance(current_user: str = Depends(get_current_user)):
     """계좌 잔고 기준으로 포지션을 강제 동기화 (MTS 잔고와 불일치 시 복구용)."""
+    _deny_guest_write_access(current_user, "포지션 강제 동기화")
     try:
         if not state.strategy or not state.trenv or not state.risk_manager:
             ok = _ensure_initialized()
@@ -6923,6 +6951,7 @@ async def sync_positions_from_balance(current_user: str = Depends(get_current_us
 @app.post("/api/positions/liquidate")
 async def liquidate_position(body: Optional[dict] = None, current_user: str = Depends(get_current_user)):
     """해당 종목 전량 매도 신호 생성(수동 청산). 수동 모드면 승인대기, 자동 모드면 즉시 주문."""
+    _deny_guest_write_access(current_user, "수동 청산")
     stock_code = (body or {}).get("stock_code", "").strip().zfill(6)
     if not stock_code:
         return JSONResponse({"success": False, "message": "stock_code 필드가 필요합니다."}, status_code=400)
@@ -7645,6 +7674,7 @@ async def get_pending_signals(current_user: str = Depends(get_current_user)):
 @app.post("/api/signals/{signal_id}/approve")
 async def approve_signal(signal_id: str, current_user: str = Depends(get_current_user)):
     """신호 승인 후 주문 실행"""
+    _deny_guest_write_access(current_user, "신호 승인")
     if not state.strategy or not state.trenv or not state.risk_manager:
         ok = _ensure_initialized()
         if not ok or not state.strategy or not state.trenv or not state.risk_manager:
@@ -7783,6 +7813,7 @@ async def approve_signal(signal_id: str, current_user: str = Depends(get_current
 @app.post("/api/signals/{signal_id}/reject")
 async def reject_signal(signal_id: str, current_user: str = Depends(get_current_user)):
     """승인 대기 신호 거절"""
+    _deny_guest_write_access(current_user, "신호 거절")
     with pending_signals_lock:
         signal_data = state.pending_signals.get(signal_id)
         if not signal_data:
@@ -7816,6 +7847,7 @@ async def get_audit_log(
 @app.post("/api/config/risk")
 async def update_risk_config(config: RiskConfig, current_user: str = Depends(get_current_user)):
     """리스크 설정 업데이트"""
+    _deny_guest_write_access(current_user, "리스크 설정 저장")
     try:
         if not state.risk_manager:
             ok = _ensure_initialized()
@@ -7982,6 +8014,7 @@ async def update_risk_config(config: RiskConfig, current_user: str = Depends(get
 @app.post("/api/config/strategy")
 async def update_strategy_config(config: StrategyConfig, current_user: str = Depends(get_current_user)):
     """전략 설정(이동평균 기간) 업데이트"""
+    _deny_guest_write_access(current_user, "전략 설정 저장")
     try:
         if not state.strategy or not state.trenv or not state.risk_manager:
             ok = _ensure_initialized()
@@ -8070,6 +8103,7 @@ async def list_all_presets(current_user: str = Depends(get_current_user)):
 @app.post("/api/config/stock-selection")
 async def update_stock_selection_config(config: StockSelectionConfig, current_user: str = Depends(get_current_user)):
     """종목 선정 기준 업데이트"""
+    _deny_guest_write_access(current_user, "종목 선정 설정 저장")
     try:
         state.stock_selector = StockSelector(
             env_dv="demo" if state.is_paper_trading else "real",
@@ -8121,6 +8155,7 @@ async def update_stock_selection_config(config: StockSelectionConfig, current_us
 @app.post("/api/config/operational")
 async def update_operational_config(config: OperationalConfig, current_user: str = Depends(get_current_user)):
     """운영 옵션 저장: 자동 리밸런싱, 성과 기반 자동 추천"""
+    _deny_guest_write_access(current_user, "운영 옵션 저장")
     try:
         state.enable_auto_rebalance = bool(config.enable_auto_rebalance)
         state.auto_rebalance_interval_minutes = max(5, min(120, int(config.auto_rebalance_interval_minutes or 30)))
@@ -8176,6 +8211,7 @@ async def get_macro_config(current_user: str = Depends(get_current_user)):
 
 @app.post("/api/macro/auto-fetch")
 async def auto_fetch_macro_config(current_user: str = Depends(get_current_user)):
+    _deny_guest_write_access(current_user, "매크로 자동 수집")
     try:
         store = _get_user_settings_store()
         base_cfg = None
@@ -8211,6 +8247,7 @@ async def auto_fetch_macro_config(current_user: str = Depends(get_current_user))
 
 @app.post("/api/macro")
 async def update_macro_config(config: MacroConfig, current_user: str = Depends(get_current_user)):
+    _deny_guest_write_access(current_user, "매크로 저장")
     try:
         cfg = _normalize_macro_config_dict(config.model_dump())
         state.macro_config = cfg
@@ -8289,6 +8326,7 @@ async def save_custom_slot(
     body: dict = Body(..., embed=False),
 ):
     """커스텀 슬롯(1~10) 하나에 현재 설정 저장. slot_id, name, risk_config, strategy_config, stock_selection_config, operational_config."""
+    _deny_guest_write_access(current_user, "커스텀 슬롯 저장")
     store = _get_user_settings_store()
     if not store or not getattr(store, "enabled", False):
         return JSONResponse({"success": False, "message": "DynamoDB 설정 저장소를 사용할 수 없습니다."})
@@ -8352,6 +8390,7 @@ async def load_custom_slot_to_main(
     body: dict = Body(..., embed=False),
 ):
     """커스텀 슬롯(1~5) 내용을 메인 설정으로 불러오기. slot_id 필수."""
+    _deny_guest_write_access(current_user, "커스텀 슬롯 불러오기")
     store = _get_user_settings_store()
     if not store or not getattr(store, "enabled", False):
         return JSONResponse({"success": False, "message": "DynamoDB 설정 저장소를 사용할 수 없습니다."})
@@ -8401,6 +8440,7 @@ async def update_profile(
     body: dict = Body(..., embed=False),
 ):
     """현재 사용자 프로필 수정 (실전/모의 계좌, KIS app key/secret, AWS 키 등)."""
+    _deny_guest_write_access(current_user, "프로필 수정")
     try:
         ok = auth_manager.update_user_profile(current_user, **body)
         if not ok:
@@ -8418,6 +8458,7 @@ async def update_profile(
 @app.post("/api/stocks/select")
 async def select_stocks(current_user: str = Depends(get_current_user)):
     """종목 재선정. 실행 중에는 변경 불가(중지 → 재선정 → 재시작으로 통일)."""
+    _deny_guest_write_access(current_user, "종목 재선정")
     try:
         if getattr(state, "_reselect_in_progress", False):
             msg = "자동 재선정(저선정) 시퀀스 진행 중이라 종목 재선정을 수행할 수 없습니다. 잠시 후 다시 시도하세요."
@@ -8528,6 +8569,7 @@ async def select_stocks(current_user: str = Depends(get_current_user)):
 @app.post("/api/order/manual")
 async def execute_manual_order(order: ManualOrder, current_user: str = Depends(get_current_user)):
     """수동 주문 실행"""
+    _deny_guest_write_access(current_user, "수동 주문")
     try:
         if not state.strategy or not state.trenv or not state.risk_manager:
             ok = _ensure_initialized()

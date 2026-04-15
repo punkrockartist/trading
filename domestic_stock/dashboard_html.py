@@ -4,6 +4,7 @@
 
 def get_dashboard_html(username: str) -> str:
     """대시보드 HTML (반응형)"""
+    is_guest = str(username).strip().lower() == "guest"
     return f"""
 <!DOCTYPE html>
 <html lang="ko">
@@ -2365,7 +2366,7 @@ def get_dashboard_html(username: str) -> str:
                     <h2>설정 도움말</h2>
                     <div class="hint">
                         아래 설명은 “현재 시스템 구현 기준”으로, 값이 커질수록 보수적/공격적이 되는 방향을 함께 적었습니다.
-                        % 항목은 화면에는 퍼센트(예: 2.0)로 넣고, 내부에서는 비율(0.02)로 저장됩니다. 저장 후 다른 탭을 갔다 와도 설정이 유지되도록 각 탭에서 반드시 「저장」 버튼을 눌러 주세요.
+                        % 항목은 화면에는 퍼센트(예: 2.0)로 넣고, 내부에서는 비율(0.02)로 저장됩니다. 각 탭에서 「저장」을 누르면 런타임에는 즉시 반영되고, 로그에 <code>DB 반영</code> 또는 <code>런타임 반영(저장소 비활성)</code>이 표시됩니다.
                     </div>
 
                     <details>
@@ -2837,10 +2838,13 @@ quant_dashboard.get_dashboard_html(username)  ← quant_dashboard.py
   → HTML 렌더 (dashboard_html.get_dashboard_html 호출)
 클라이언트: WebSocket 연결 /api/ws → state.broadcast() 수신  ← quant_dashboard.py (TradingState)</pre>
                     <h3>2. 설정 로드/저장</h3>
-                    <pre class="doc-pre">API: GET /api/settings/risk 등  ← quant_dashboard_api.py
-  → user_settings_store.load_risk_config(username)  ← user_settings_store.py
-API: POST /api/settings/risk 등  ← quant_dashboard_api.py
-  → user_settings_store.save_risk_config(username, config)  ← user_settings_store.py
+                    <pre class="doc-pre">API: GET /api/config/user-settings  ← quant_dashboard_api.py
+  → store.load(username)  ← user_settings_store.py
+  → _apply_*_config_dict_to_state(...) 로 런타임 state 동기화
+API: POST /api/config/risk|strategy|stock-selection|operational
+  → state/risk_manager/strategy/selector 즉시 반영
+  → store.save(username, *_config=...) (DynamoDB 활성 시)
+  → 응답: {{"success": true, "persisted": true|false}}
   → audit_log(username, "config_save", ...)  ← audit_log.py</pre>
                     <h3>3. 종목 선정</h3>
                     <pre class="doc-pre">API: POST /api/stocks/select  ← quant_dashboard_api.py
@@ -2868,10 +2872,11 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
        → set_pending_order(), update_position()  ← quant_trading_safe.py (RiskManager)
   → reconcile 루프: _check_filled_order(), clear_pending_order()  ← quant_trading_safe.py</pre>
                     <h3>6. 승인 대기 (수동 모드)</h3>
-                    <pre class="doc-pre">엔진: manual_approval이 True면 safe_execute_order 내부 input() 대기  ← quant_trading_safe.py
-대시보드: 신호 발생 시 pending_signals 적재 → API GET /api/signals/pending  ← quant_dashboard_api.py
-  → 사용자 승인: POST /api/signals/approve  ← quant_dashboard_api.py
-  → safe_execute_order(..., manual_approval=False)  ← quant_trading_safe.py
+                    <pre class="doc-pre">엔진: 수동 모드면 신호를 pending 큐로 적재 (즉시 주문 안 함)
+대시보드: GET /api/signals/pending 으로 승인 대기 신호 조회
+  → 사용자 승인: POST /api/signals/{id}/approve
+  → 사용자 거절: POST /api/signals/{id}/reject
+  → 승인 시 safe_execute_order 경로로 실제 주문 실행
   → audit_log("signal_approve"|"signal_reject", ...)  ← audit_log.py</pre>
                 </div>
             </div>
@@ -2928,11 +2933,12 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     </ul>
                     <h3>API (quant_dashboard_api.py)</h3>
                     <ul class="doc-list">
-                        <li>설정: load_risk_config, save_risk_config 등 → user_settings_store</li>
-                        <li>종목: POST /api/stocks/select → StockSelector().select_stocks_by_fluctuation()</li>
-                        <li>시스템: start/stop, set-env, set-trade-mode</li>
-                        <li>승인: GET /api/signals/pending, POST /api/signals/approve|reject</li>
-                        <li>성과: GET /api/performance/export (CSV/JSON, 슬리피지·수수료 옵션)</li>
+                        <li>설정: GET <code>/api/config/user-settings</code>, POST <code>/api/config/risk|strategy|stock-selection|operational</code> (응답 <code>persisted</code>로 DB 반영 여부 확인)</li>
+                        <li>커스텀 슬롯: POST <code>/api/config/custom-slots/save|load</code> (커스텀 1~5 저장/복원)</li>
+                        <li>종목: POST <code>/api/stocks/select</code> → <code>StockSelector().select_stocks_by_fluctuation()</code></li>
+                        <li>시스템: <code>/api/system/start|stop</code>, <code>/api/system/set-env</code>, <code>/api/system/trade-mode</code></li>
+                        <li>승인: GET <code>/api/signals/pending</code>, POST <code>/api/signals/{id}/approve|reject</code></li>
+                        <li>성과: GET <code>/api/performance/export</code> (CSV/JSON, 슬리피지·수수료 옵션)</li>
                     </ul>
                 </div>
             </div>
@@ -3027,6 +3033,9 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
     </div>
 
     <script>
+        const CURRENT_USERNAME = "{username}";
+        const IS_GUEST_USER = {str(is_guest).lower()};
+
         let ws = null;
         let reconnectInterval = null;
         let pendingSignals = {{}};
@@ -3050,7 +3059,28 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
             ['gold', 'Gold'],
         ];
 
+        function guardGuestReadonly(actionLabel = '이 작업') {{
+            if (!IS_GUEST_USER) return false;
+            addLog(`guest 계정은 읽기 전용입니다. ${{actionLabel}}은(는) 사용할 수 없습니다.`, 'warning');
+            return true;
+        }}
+
+        function applyGuestReadonlyMode() {{
+            if (!IS_GUEST_USER) return;
+            const hdr = document.querySelector('.header-user');
+            if (hdr && !String(hdr.textContent || '').includes('읽기 전용')) {{
+                hdr.textContent = `${{String(hdr.textContent || '').trim()}} · guest(읽기 전용)`;
+            }}
+            document.querySelectorAll('.tab[data-tab="settings"], .tab[data-tab="ai-report"]').forEach(el => {{
+                el.style.display = 'none';
+            }});
+        }}
+
         function showTab(tabName) {{
+            if (IS_GUEST_USER && (tabName === 'settings' || tabName === 'ai-report')) {{
+                guardGuestReadonly('해당 탭 접근');
+                tabName = 'dashboard';
+            }}
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
             const tabEl = document.querySelector(`.tab[data-tab="${{tabName}}"]`);
@@ -3282,6 +3312,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
         }}
 
         async function saveMacroAnalysis() {{
+            if (guardGuestReadonly('매크로 저장')) return;
             const statusEl = document.getElementById('macro_status');
             const payload = buildMacroPayload();
             if (statusEl) statusEl.textContent = '저장·분석 중...';
@@ -3313,6 +3344,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
         }}
 
         async function autoFetchMacroAnalysis() {{
+            if (guardGuestReadonly('매크로 자동 수집')) return;
             const statusEl = document.getElementById('macro_status');
             if (statusEl) statusEl.textContent = '매크로 자동 수집 실행 중...';
             try {{
@@ -3346,6 +3378,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
         }}
 
         async function loadAiDailyReport() {{
+            if (guardGuestReadonly('AI 리포트 생성')) return;
             const dateEl = document.getElementById('ai_report_date');
             const statusEl = document.getElementById('ai_report_status');
             const containerEl = document.getElementById('ai_report_container');
@@ -3747,6 +3780,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
         }}
 
         async function saveProfile() {{
+            if (guardGuestReadonly('프로필 수정')) return;
             try {{
                 const get = (id) => {{ const el = document.getElementById(id); return el ? (el.value || '').trim() : ''; }};
                 const body = {{
@@ -3775,6 +3809,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
         }}
 
         async function changePassword() {{
+            if (guardGuestReadonly('비밀번호 변경')) return;
             const current = (document.getElementById('profile_current_password')?.value || '').trim();
             const newPw = (document.getElementById('profile_new_password')?.value || '').trim();
             const confirmPw = (document.getElementById('profile_new_password_confirm')?.value || '').trim();
@@ -4822,6 +4857,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
         }}
 
         async function setTradingEnv(isPaper) {{
+            if (guardGuestReadonly('투자 환경 변경')) return;
             try {{
                 const response = await fetch('/api/system/set-env', withAuth({{
                     method: 'POST',
@@ -4841,6 +4877,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
         }}
 
         async function setTradeMode(manualApproval) {{
+            if (guardGuestReadonly('매매 모드 변경')) return;
             try {{
                 const response = await fetch('/api/system/set-trade-mode', withAuth({{
                     method: 'POST',
@@ -4860,6 +4897,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
         }}
 
         async function startSystem() {{
+            if (guardGuestReadonly('시스템 시작')) return;
             try {{
                 // 시작 전 Preflight를 먼저 실행해 UI에 차단 사유를 즉시 표시
                 const pf = await runPreflight(true);
@@ -4881,6 +4919,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
         }}
 
         function openStopModal() {{
+            if (guardGuestReadonly('시스템 중지')) return;
             document.getElementById('liquidate_on_stop').checked = false;
             document.getElementById('stopModalOverlay').style.display = 'flex';
         }}
@@ -4900,6 +4939,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
         }}
 
         async function stopSystem(liquidate = false) {{
+            if (guardGuestReadonly('시스템 중지')) return;
             try {{
                 const response = await fetch(`/api/system/stop?liquidate=${{liquidate ? 'true' : 'false'}}`, withAuth({{ method: 'POST' }}));
                 const data = await response.json();
@@ -5193,6 +5233,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
         }}
 
         async function saveToSelectedSlot() {{
+            if (guardGuestReadonly('커스텀 슬롯 저장')) return;
             const v = document.getElementById('recommended_preset_select')?.value || '';
             const slotId = parseInt(v, 10);
             if (slotId < 1 || slotId > 5) {{
@@ -5224,6 +5265,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
         }}
 
         async function updateRiskConfig() {{
+            if (guardGuestReadonly('리스크 설정 저장')) return;
             try {{
                 const config = {{
                     max_single_trade_amount: parseInt(document.getElementById('max_trade_amount').value),
@@ -5276,14 +5318,18 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     atr_take_mult: parseFloat(document.getElementById('atr_take_mult')?.value) || 2,
                     atr_lookback_ticks: parseInt(document.getElementById('atr_lookback_ticks')?.value) || 20,
                 }};
-                const response = await fetch('/api/config/risk', {{
+                const response = await fetch('/api/config/risk', withAuth({{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
                     body: JSON.stringify(config)
-                }});
+                }}));
                 const data = await response.json();
                 if (data.success) {{
-                    addLog('리스크 설정 저장됨', 'info');
+                    if (data.persisted === false) {{
+                        addLog('리스크 설정 반영됨(런타임). DB 저장은 실패/비활성 상태입니다. 저장소 상태를 확인하세요.', 'warning');
+                    }} else {{
+                        addLog('리스크 설정 저장됨(DB 반영)', 'info');
+                    }}
                     updateSettingsSummaries();
                 }}
             }} catch (error) {{
@@ -5292,6 +5338,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
         }}
 
         async function updateStrategyConfig() {{
+            if (guardGuestReadonly('전략 설정 저장')) return;
             try {{
                 const config = {{
                     short_ma_period: parseInt(document.getElementById('short_ma_period').value),
@@ -5437,7 +5484,11 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 }});
                 const data = await response.json();
                 if (data.success) {{
-                    addLog(`전략 설정 저장됨 (short=${{config.short_ma_period}}, long=${{config.long_ma_period}}, buy_window=${{config.buy_window_start_hhmm}}-${{config.buy_window_end_hhmm}})`, 'info');
+                    if (data.persisted === false) {{
+                        addLog(`전략 설정 반영됨(런타임, short=${{config.short_ma_period}}, long=${{config.long_ma_period}}). DB 저장은 실패/비활성 상태입니다.`, 'warning');
+                    }} else {{
+                        addLog(`전략 설정 저장됨(DB, short=${{config.short_ma_period}}, long=${{config.long_ma_period}}, buy_window=${{config.buy_window_start_hhmm}}-${{config.buy_window_end_hhmm}})`, 'info');
+                    }}
                     updateSettingsSummaries();
                 }} else {{
                     addLog('전략 설정 저장 실패: ' + (data.message || '알 수 없는 오류'), 'error');
@@ -5611,6 +5662,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
         }}
 
         async function applyRecommendedPreset() {{
+            if (guardGuestReadonly('프리셋 적용')) return;
             const presetId = document.getElementById('recommended_preset_select')?.value || '';
             if (!presetId) {{
                 addLog('프리셋을 선택하세요', 'warning');
@@ -5919,6 +5971,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
         }}
 
         async function updateStockSelection(silent = false) {{
+            if (guardGuestReadonly('종목선정 설정 저장')) return false;
             try {{
                 const config = {{
                     min_price_change_ratio: parseFloat(document.getElementById('min_change').value) / 100,
@@ -5943,14 +5996,20 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     max_drawdown_from_high_ratio: (parseFloat(document.getElementById('max_drawdown_pct').value) || 12) / 100,
                     drawdown_filter_after_hhmm: (document.getElementById('drawdown_filter_after_hhmm').value || '12:00').trim(),
                 }};
-                const response = await fetch('/api/config/stock-selection', {{
+                const response = await fetch('/api/config/stock-selection', withAuth({{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
                     body: JSON.stringify(config)
-                }});
+                }}));
                 const data = await response.json();
                 if (data.success) {{
-                    if (!silent) addLog('종목 선정 기준 저장됨', 'info');
+                    if (!silent) {{
+                        if (data.persisted === false) {{
+                            addLog('종목 선정 기준 반영됨(런타임). DB 저장은 실패/비활성 상태입니다.', 'warning');
+                        }} else {{
+                            addLog('종목 선정 기준 저장됨(DB 반영)', 'info');
+                        }}
+                    }}
                     updateSettingsSummaries();
                     return true;
                 }} else {{
@@ -6021,6 +6080,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
         }}
 
         async function updateOperationalConfig() {{
+            if (guardGuestReadonly('운영 옵션 저장')) return;
             try {{
                 const body = {{
                     enable_auto_rebalance: !!document.getElementById('enable_auto_rebalance').checked,
@@ -6036,14 +6096,18 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                     liquidate_on_auto_stop: !!document.getElementById('liquidate_on_auto_stop').checked,
                     auto_schedule_username: (document.getElementById('auto_schedule_username').value || '').trim()
                 }};
-                const response = await fetch('/api/config/operational', {{
+                const response = await fetch('/api/config/operational', withAuth({{
                     method: 'POST',
-                    headers: {{ 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (localStorage.getItem('token') || '') }},
+                    headers: {{ 'Content-Type': 'application/json' }},
                     body: JSON.stringify(body)
-                }});
+                }}));
                 const data = await response.json();
                 if (data.success) {{
-                    addLog('운영 옵션 저장됨', 'info');
+                    if (data.persisted === false) {{
+                        addLog('운영 옵션 반영됨(런타임). DB 저장은 실패/비활성 상태입니다.', 'warning');
+                    }} else {{
+                        addLog('운영 옵션 저장됨(DB 반영)', 'info');
+                    }}
                 }} else {{
                     addLog('운영 옵션 저장 실패: ' + (data.message || '알 수 없음'), 'error');
                 }}
@@ -6053,6 +6117,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
         }}
 
         async function selectStocks(silent = false) {{
+            if (guardGuestReadonly('종목 재선정')) return {{ success: false, message: 'guest readonly' }};
             try {{
                 if (window._systemRunning) {{
                     const msg = '실행 중에는 종목을 재선정할 수 없습니다. 시스템을 중지 → 종목 재선정 → 시스템 시작 순서로 진행하세요.';
@@ -6223,6 +6288,7 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
 
         // 초기화
         connectWebSocket();
+        applyGuestReadonlyMode();
         const _sub = document.getElementById('settingsSubbar');
         if (_sub) _sub.style.display = 'none';
         const _perfSub = document.getElementById('performanceSubbar');
