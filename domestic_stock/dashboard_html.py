@@ -1170,6 +1170,7 @@ def get_dashboard_html(username: str) -> str:
                 </div>
                 <div id="macro_one_liner" style="padding:12px 14px; border:1px solid var(--border); background:var(--surface-2); border-radius:var(--radius); font-size:15px; font-weight:700; margin-bottom:8px;">한줄 평가가 여기에 표시됩니다.</div>
                 <div id="macro_liquidity_summary" class="hint" style="margin-bottom:12px;">유동성 요약이 여기에 표시됩니다.</div>
+                <div class="hint" style="margin-bottom:10px;">점수·판정: 절댓값이 1.2 이상이면 해당 구간에서 상승 우세 또는 하락 우세, 1.2 미만이면 중립입니다. USD/KRW는 점수가 양(+)이면 원화 약세(환율 상승) 쪽, 음(-)이면 원화 강세(환율 하락) 쪽 바이어스로 읽으면 됩니다.</div>
                 <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap:14px;">
                     <div style="min-width:0;">
                         <h3 style="font-size:15px; margin-bottom:8px;">S&amp;P 중심 미장</h3>
@@ -1225,7 +1226,7 @@ def get_dashboard_html(username: str) -> str:
                 </div>
                 <div style="margin-top:14px;">
                     <h3 style="font-size:15px; margin-bottom:8px;">한국장 영향</h3>
-                    <div class="hint" style="margin-bottom:8px;">미장 바이어스, 원달러 방향, 유동성 상태를 합성한 참고 카드입니다.</div>
+                    <div class="hint" style="margin-bottom:8px;">미장 바이어스, 원달러 방향, 유동성 상태를 합성한 참고 카드입니다. 점수·판정은 위와 동일하게 절댓값 1.2 기준입니다.</div>
                     <div style="overflow-x:auto;">
                         <table>
                             <thead>
@@ -4167,9 +4168,9 @@ API: POST /api/settings/risk 등  ← quant_dashboard_api.py
                 sidecar_cooling: '사이드카 냉각',
                 vi: 'VI 발동',
                 vi_cooling: 'VI 냉각',
-                vi_rest_active: 'VI 활성 추정(REST)',
+                vi_rest_active: 'VI 활성 (REST·캐시 등)',
                 vi_status_unknown: 'VI 상태 미확정',
-                vi_reentry_wait: 'VI 해제 후 재평가 대기',
+                vi_reentry_wait: 'VI재평가 (안정화·재돌파 대기)',
                 index_ma: '지수 MA 약세',
                 regime_index_bear: '구형 듀얼레짐 지수 약세',
                 regime_stock_range: '구형 듀얼레짐 박스 차단',

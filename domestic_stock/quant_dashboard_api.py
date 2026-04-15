@@ -41,6 +41,7 @@ from quant_trading_safe import safe_execute_order
 from audit_log import audit_log, audit_get
 from notifier import send_alert
 from system_log import system_log_append
+from user_settings_store import round_floats_for_json_storage
 
 try:
     # OpenAI Python SDK (v1.x). AI 리포트 생성을 위해 사용. 환경에 설치·키 설정이 안 되어 있으면 graceful fallback.
@@ -129,7 +130,7 @@ _index_change_cache_lock = threading.Lock()
 
 # VI(종목별 변동성완화장치) 캐시: key = stock_code, value = (triggered: bool, ts)
 _vi_status_cache: Dict[str, dict] = {}
-_vi_status_cache_ttl = 60  # 1분
+_vi_status_cache_ttl = 25  # VI는 WS·REST 어긋남이 잦아 짧게(초당 다수 종목 호출 시 API 한도 유의)
 _vi_status_cache_lock = threading.Lock()
 
 # WS 장운영정보가 이 시간 이상 갱신 없으면 REST로 재판단 (초)
@@ -404,7 +405,68 @@ def _normalize_vi_col_name(name: Any) -> str:
     return "".join(ch.lower() for ch in str(name or "") if ch.isalnum())
 
 
-def _parse_vi_time_value(raw: Any, base_date: datetime) -> Optional[datetime]:
+def _vi_krx_equity_vi_clock_sane(dt: Optional[datetime]) -> bool:
+    """
+    KRX 현물 VI 발동/해제로 볼 수 있는 시각 범위(장전·장중·시간외 단일가 등).
+    결제/기타 시각(예: 23:51)이 VI 해제로 잡히는 것을 걸러낸다.
+    """
+    if dt is None:
+        return False
+    try:
+        m = dt.hour * 60 + dt.minute
+        return (7 * 60 + 15) <= m <= (19 * 60 + 59)
+    except Exception:
+        return False
+
+
+_VI_REST_MAX_TRIGGER_RELEASE_SPAN_SEC = 6 * 3600
+
+
+def _rest_vi_sanitize_vi_times(
+    trigger_dt: Optional[datetime],
+    release_dt: Optional[datetime],
+) -> tuple:
+    """
+    [국내주식-055] inquire-vi-status(FHPST01390000) 등 REST에서 읽은 발동·해제 시각 정리.
+    - 시계가 KRX 현물 VI 구간을 벗나면 해당 값 제거.
+    - 발동 대비 해제가 비정상적으로 늦으면(다른 필드 오인) 해제만 제거.
+    - 같은 영업일 안에서 해제 < 발동이면 잘못 짝지어진 것으로 해제 제거.
+    """
+    tr = trigger_dt if _vi_krx_equity_vi_clock_sane(trigger_dt) else None
+    rel = release_dt if _vi_krx_equity_vi_clock_sane(release_dt) else None
+    if tr and rel:
+        try:
+            if tr.date() == rel.date() and rel < tr:
+                rel = None
+            elif rel > tr and (rel - tr).total_seconds() > _VI_REST_MAX_TRIGGER_RELEASE_SPAN_SEC:
+                rel = None
+        except Exception:
+            rel = None
+    return tr, rel
+
+
+def _vi_rest_in_vi_interval_now(
+    trigger_dt: Optional[datetime],
+    release_dt: Optional[datetime],
+    now: datetime,
+) -> bool:
+    """
+    REST로 얻은 발동·해제 시각과 현재 시각만으로 VI 적용 중인지 판단.
+    해제 시각이 있고 현재가 그 이후이면 비활성(발동만 있고 해제가 비어 있으면 발동 이후는 활성).
+    """
+    if trigger_dt is None:
+        return False
+    try:
+        if now < trigger_dt:
+            return False
+        if release_dt is not None and now >= release_dt:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _parse_vi_time_value(raw: Any, base_date: datetime, column_norm: str = "") -> Optional[datetime]:
     if raw is None:
         return None
     s = str(raw).strip()
@@ -413,12 +475,34 @@ def _parse_vi_time_value(raw: Any, base_date: datetime) -> Optional[datetime]:
     digits = "".join(ch for ch in s if ch.isdigit())
     if not digits:
         return None
+    cn = (column_norm or "").lower()
     try:
         if len(digits) >= 14:
             return datetime.strptime(digits[:14], "%Y%m%d%H%M%S").replace(tzinfo=base_date.tzinfo)
         if len(digits) == 12:
             return datetime.strptime(base_date.strftime("%Y%m%d") + digits[-6:], "%Y%m%d%H%M%S").replace(tzinfo=base_date.tzinfo)
         if len(digits) == 8:
+            # KIS: 8자리가 영업일(YYYYMMDD)인 열이 많고, HHMMSSss인 열도 있음 → 컬럼명으로 구분
+            looks_like_calendar_date = any(
+                k in cn for k in ("ymd", "date", "dt", "bsdt", "stdy", "trgt", "day", "basdt", "opnd")
+            ) and not any(k in cn for k in ("hhmm", "time", "tmss", "prtc", "hour", "cnttm"))
+            if looks_like_calendar_date:
+                try:
+                    d0 = datetime.strptime(digits, "%Y%m%d").date()
+                    if d0.year < 2000 or d0.year > 2100:
+                        raise ValueError("year")
+                    return datetime(d0.year, d0.month, d0.day, 0, 0, 0, tzinfo=base_date.tzinfo)
+                except Exception:
+                    pass
+            # YYYYMMDD 형태면 시각(HHMMSS)으로 오해하지 않음 (예: 20240415 → 20:24:04 오인 방지)
+            if not looks_like_calendar_date:
+                try:
+                    id8 = int(digits)
+                    if 20000101 <= id8 <= 21001231:
+                        datetime.strptime(digits, "%Y%m%d")
+                        return None
+                except Exception:
+                    pass
             # HHMMSSss 형태일 수 있어 앞 6자리만 사용
             return datetime.strptime(base_date.strftime("%Y%m%d") + digits[:6], "%Y%m%d%H%M%S").replace(tzinfo=base_date.tzinfo)
         if len(digits) == 6:
@@ -430,17 +514,15 @@ def _parse_vi_time_value(raw: Any, base_date: datetime) -> Optional[datetime]:
     return None
 
 
-def _rest_vi_time_based_active(df) -> Optional[bool]:
+def _rest_vi_collect_time_columns(df) -> tuple:
     """
-    VI 현황 REST 응답에서 발동/해제 시각으로 현재 active 여부를 판정.
-    - 발동시각 있고 해제시각 없으면 active
-    - 해제시각 있으면 inactive
-    - 다수 row면 가장 최근 이벤트 기준
+    VI REST DataFrame에서 발동/해제 시각으로 쓸 컬럼 목록.
+    한국투자 [국내주식-055] 변동성완화장치(VI) 현황 TR(FHPST01390000) 응답 필드
+    (vi_motn_*, vi_trgr_*, vi_rels_* / virelis* 등) 위주로 매칭한다.
+    vi_fnltm·결제시각 등 VI 해제와 무관한 열은 제외한다.
     """
     if df is None or getattr(df, "empty", True):
-        return False
-    tz = timezone(timedelta(hours=9))
-    base_date = datetime.now(tz)
+        return [], []
     normalized = {col: _normalize_vi_col_name(col) for col in df.columns}
     release_cols = [
         col for col, norm in normalized.items()
@@ -452,43 +534,292 @@ def _rest_vi_time_based_active(df) -> Optional[bool]:
         col for col, norm in normalized.items()
         if ("vimotn" in norm)
         or ("viaplc" in norm and any(k in norm for k in ("time", "tm")))
-        or ("vitrgr" in norm)
+        or (
+            ("vitrgr" in norm)
+            and not any(k in norm for k in ("prc", "prpr", "pct", "qty", "amt", "pbmn", "vol"))
+        )
         or ("vitrigger" in norm)
         or (("vi" in norm) and any(k in norm for k in ("motn", "trigger", "trgr", "start")) and any(k in norm for k in ("time", "tm")))
         or norm == "trdecntrproctime"
     ]
-    if not trigger_cols and not release_cols:
+    if trigger_cols or release_cols:
+        return list(dict.fromkeys(trigger_cols)), list(dict.fromkeys(release_cols))
+
+    def _skip_heavy(norm: str) -> bool:
+        if "vi" not in norm:
+            return True
+        if any(k in norm for k in ("cls", "stts", "type", "div", "kornm", "iscd", "prpr", "ctrt", "vrss", "pbmn", "vol", "amt")):
+            if not any(k in norm for k in ("tm", "time", "dt", "ymd", "hhmm", "hour", "motn", "trgr", "rels", "rls")):
+                return True
+        return False
+
+    trigger_cols = []
+    release_cols = []
+    for col, norm in normalized.items():
+        if _skip_heavy(norm):
+            continue
+        # 해제: VI 문맥 + (rels/release/rls/virend 등). fnltm·hjtm 등은 결제/장외 시각으로 VI와 무관할 수 있음.
+        if "vi" in norm and any(
+            k in norm
+            for k in (
+                "virelis",
+                "virelease",
+                "relis",
+                "rels",
+                "release",
+                "reles",
+                "rls",
+                "virend",
+            )
+        ):
+            release_cols.append(col)
+        elif any(
+            k in norm
+            for k in (
+                "trgr",
+                "motn",
+                "trigger",
+                "vimotn",
+                "viaplc",
+                "trdecntr",
+                "stdvi",
+                "dcnt",
+                "cnfm",
+                "aplc",
+            )
+        ):
+            if ("prc" in norm or "prpr" in norm or "vrss" in norm) and not any(
+                k in norm for k in ("tm", "time", "ymd", "dt", "hhmm", "hour")
+            ):
+                continue
+            trigger_cols.append(col)
+        elif any(k in norm for k in ("hhmm", "hour", "prtcntpbtm", "cnttm", "motntm")):
+            trigger_cols.append(col)
+    if trigger_cols or release_cols:
+        return trigger_cols, release_cols
+
+    tz = timezone(timedelta(hours=9))
+    base_date = datetime.now(tz)
+    for col in df.columns:
+        norm = _normalize_vi_col_name(col)
+        if "vi" not in norm or _skip_heavy(norm):
+            continue
+        try:
+            v0 = df.iloc[0][col]
+        except Exception:
+            continue
+        if _parse_vi_time_value(v0, base_date, norm) is None:
+            continue
+        if any(k in norm for k in ("rels", "release", "reles", "rls", "virend", "virelis")):
+            release_cols.append(col)
+        else:
+            trigger_cols.append(col)
+    return list(dict.fromkeys(trigger_cols)), list(dict.fromkeys(release_cols))
+
+
+def _format_kst_datetime(dt: Optional[datetime]) -> Optional[str]:
+    """VI REST 시각 등을 시스템 로그용 KST 문자열로."""
+    if dt is None:
+        return None
+    try:
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
         return None
 
+
+def _vi_kst_iso_to_hhmmss(kst_iso: Optional[str]) -> str:
+    """'2026-04-15 09:42:15' → '09:42:15', 없으면 '-'."""
+    if not kst_iso or str(kst_iso).strip() in ("-", "", "None"):
+        return "-"
+    s = str(kst_iso).strip()
+    if " " in s:
+        tail = s.split(" ", 1)[1].strip()
+        return tail[:8] if len(tail) >= 8 else tail
+    if len(s) >= 8 and s[2] == ":":
+        return s[:8]
+    return s
+
+
+def _rest_vi_scrape_times_from_row(row: Any, base_date: datetime) -> tuple:
+    """
+    열 이름이 1차 패턴에 안 잡혀도, 한 행에서 파싱 가능한 VI 관련 시각을 모아 정렬.
+    KRX 현물 VI 시각으로 타당한 값만 사용. 간격이 비정상적으로 크면 해제 후보를 쓰지 않음.
+    """
+    pts: List[datetime] = []
+    try:
+        cols = list(row.index)
+    except Exception:
+        cols = []
+    for col in cols:
+        norm = _normalize_vi_col_name(col)
+        if "vi" not in norm and "trgr" not in norm and "rels" not in norm and "motn" not in norm:
+            continue
+        if (
+            any(x in norm for x in ("cls", "stts", "type", "prc", "prpr", "qty", "vol", "amt", "pbmn"))
+            and "tm" not in norm
+            and "time" not in norm
+            and "ymd" not in norm
+            and "hh" not in norm
+        ):
+            continue
+        try:
+            d = _parse_vi_time_value(row.get(col), base_date, norm)
+        except Exception:
+            d = None
+        if d is not None and _vi_krx_equity_vi_clock_sane(d):
+            pts.append(d)
+    pts_u = sorted(set(pts))
+    if len(pts_u) >= 2:
+        span = (pts_u[-1] - pts_u[0]).total_seconds()
+        if span > _VI_REST_MAX_TRIGGER_RELEASE_SPAN_SEC:
+            return pts_u[0], None
+        return pts_u[0], pts_u[-1]
+    if len(pts_u) == 1:
+        return pts_u[0], None
+    return None, None
+
+
+def _rest_vi_scrape_release_after_trigger(
+    df,
+    base_date: datetime,
+    trigger_hint: Optional[datetime],
+) -> Optional[datetime]:
+    """
+    마지막 행만이 아니라 모든 행에서 scrape하여,
+    이미 알려진 발동 시각보다 늦은 가장 이른 해제 시각을 찾는다(rows>=2·열 분산 대응).
+    """
+    if trigger_hint is None or df is None or getattr(df, "empty", True):
+        return None
+    best: Optional[datetime] = None
+    try:
+        for _, row in df.iterrows():
+            st_sc, ed_sc = _rest_vi_scrape_times_from_row(row, base_date)
+            if ed_sc is None or ed_sc <= trigger_hint:
+                continue
+            if (ed_sc - trigger_hint).total_seconds() > _VI_REST_MAX_TRIGGER_RELEASE_SPAN_SEC:
+                continue
+            if st_sc is not None and ed_sc < st_sc:
+                continue
+            if best is None or ed_sc < best:
+                best = ed_sc
+    except Exception:
+        return None
+    return best if _vi_krx_equity_vi_clock_sane(best) else None
+
+
+def _rest_vi_aggregate_latest_times(df) -> tuple:
+    """
+    VI REST DataFrame에서 발동·해제 datetime 후보를 한 번만 계산한다.
+    (로그용 _rest_vi_latest_time_details와 매수 필터용 _rest_vi_time_based_active가 동일 소스를 쓰게 함)
+    Returns:
+        (saw_any_row: bool, latest_trigger: Optional[datetime], latest_release: Optional[datetime])
+        saw_any_row: 파싱 시도한 행이 하나라도 있었는지(cls 폴백용). 최종 tr/rel이 비어도 True일 수 있음.
+    """
+    if df is None or getattr(df, "empty", True):
+        return False, None, None
+    tz = timezone(timedelta(hours=9))
+    base_date = datetime.now(tz)
+    normalized = {col: _normalize_vi_col_name(col) for col in df.columns}
+    trigger_cols, release_cols = _rest_vi_collect_time_columns(df)
+    if not trigger_cols and not release_cols:
+        return False, None, None
     latest_key = None
-    latest_active = None
-    saw_any_time = False
+    latest_trigger: Optional[datetime] = None
+    latest_release: Optional[datetime] = None
+    saw_any_row = False
     for idx, row in df.iterrows():
         trigger_dt = None
-        release_dt = None
         for col in trigger_cols:
-            trigger_dt = _parse_vi_time_value(row.get(col), base_date)
-            if trigger_dt is not None:
-                saw_any_time = True
-                break
+            cn = normalized.get(col, "")
+            d = _parse_vi_time_value(row.get(col), base_date, cn)
+            if d is None:
+                continue
+            trigger_dt = d if trigger_dt is None else min(trigger_dt, d)
+        release_dt = None
         for col in release_cols:
-            release_dt = _parse_vi_time_value(row.get(col), base_date)
-            if release_dt is not None:
-                saw_any_time = True
-                break
+            cn = normalized.get(col, "")
+            d = _parse_vi_time_value(row.get(col), base_date, cn)
+            if d is None:
+                continue
+            release_dt = d if release_dt is None else max(release_dt, d)
+        trigger_dt, release_dt = _rest_vi_sanitize_vi_times(trigger_dt, release_dt)
         if trigger_dt is None and release_dt is None:
             continue
+        saw_any_row = True
         event_dt = release_dt or trigger_dt
         if event_dt is None:
             continue
-        active = trigger_dt is not None and (release_dt is None or release_dt < trigger_dt)
         key = (event_dt, int(idx))
         if latest_key is None or key > latest_key:
             latest_key = key
-            latest_active = active
-    if latest_active is not None:
-        return bool(latest_active)
-    return None if not saw_any_time else False
+            latest_trigger = trigger_dt
+            latest_release = release_dt
+    # 정적/동적 VI가 행으로 나뉘는 경우: 전 행 scrape 후 발동만 있으면 가장 이른 해제 후보를 채움
+    try:
+        for _, row in df.iterrows():
+            st_sc, ed_sc = _rest_vi_scrape_times_from_row(row, base_date)
+            if st_sc and ed_sc and ed_sc >= st_sc:
+                if latest_trigger is None and latest_release is None:
+                    latest_trigger, latest_release = st_sc, ed_sc
+                    saw_any_row = True
+                elif latest_release is not None and latest_trigger is None and st_sc < latest_release:
+                    latest_trigger = st_sc
+                    saw_any_row = True
+    except Exception:
+        pass
+    if latest_trigger is not None and latest_release is None:
+        fill_rel = _rest_vi_scrape_release_after_trigger(df, base_date, latest_trigger)
+        if fill_rel is not None:
+            latest_release = fill_rel
+            saw_any_row = True
+    latest_trigger, latest_release = _rest_vi_sanitize_vi_times(latest_trigger, latest_release)
+    return saw_any_row, latest_trigger, latest_release
+
+
+def _rest_vi_latest_time_details(df) -> Optional[Dict[str, Any]]:
+    """
+    KRX VI 현황 REST DataFrame에서 발동·해제 시각(KST)과 시간기반 활성 여부.
+    활성은 '현재 시각이 [발동, 해제) 구간 안인지'로 판정(해제 시각이 지나면 비활성).
+    """
+    if df is None or getattr(df, "empty", True):
+        return None
+    tz = timezone(timedelta(hours=9))
+    now = datetime.now(tz)
+    saw_any_row, latest_trigger, latest_release = _rest_vi_aggregate_latest_times(df)
+    if latest_trigger is None and latest_release is None and not saw_any_row:
+        return None
+    if latest_trigger is None and latest_release is None:
+        return {
+            "active_from_time": False,
+            "trigger_at_kst": None,
+            "release_at_kst": None,
+        }
+    latest_active = _vi_rest_in_vi_interval_now(latest_trigger, latest_release, now)
+    return {
+        "active_from_time": bool(latest_active),
+        "trigger_at_kst": _format_kst_datetime(latest_trigger),
+        "release_at_kst": _format_kst_datetime(latest_release) if latest_release else None,
+    }
+
+
+def _rest_vi_time_based_active(df) -> Optional[bool]:
+    """
+    VI 현황 REST 응답에서 발동/해제 시각으로 현재 active 여부를 판정.
+    해제 시각이 현재 시각 이전이면 비활성. (_rest_vi_latest_time_details와 동일 집계 사용)
+    """
+    if df is None or getattr(df, "empty", True):
+        return False
+    trigger_cols, release_cols = _rest_vi_collect_time_columns(df)
+    if not trigger_cols and not release_cols:
+        return None
+    tz = timezone(timedelta(hours=9))
+    now = datetime.now(tz)
+    saw_any_row, latest_trigger, latest_release = _rest_vi_aggregate_latest_times(df)
+    if not saw_any_row:
+        return None
+    if latest_trigger is None and latest_release is None:
+        return None
+    return _vi_rest_in_vi_interval_now(latest_trigger, latest_release, now)
 
 
 def _rest_vi_dataframe_active(df) -> Optional[bool]:
@@ -524,6 +855,9 @@ def _rest_vi_dataframe_active(df) -> Optional[bool]:
 def _get_stock_vi_status(stock_code: str) -> dict:
     """
     종목별 VI 활성 상태와 판정 소스를 함께 반환.
+    - 매 호출마다 REST(inquire-vi-status)를 조회해 발동/해제 시각으로 판정한다(캐시는 짧게).
+    - WS(vi_cls_code)는 REST에 시각이 없을 때만 보조로 쓰고, REST 시각으로 '해제 후'인데 WS만
+      활성으로 남는 경우에는 REST를 우선해 과매수 스킵을 줄인다.
     source:
       - cache_ws / cache_rest / cache_rest_unknown
       - ws
@@ -532,7 +866,14 @@ def _get_stock_vi_status(stock_code: str) -> dict:
       - invalid / error
     """
     if not stock_code or len(str(stock_code).strip()) < 6:
-        return {"triggered": False, "source": "invalid", "raw": None, "note": "invalid_code"}
+        return {
+            "triggered": False,
+            "source": "invalid",
+            "raw": None,
+            "note": "invalid_code",
+            "trigger_at_kst": None,
+            "release_at_kst": None,
+        }
     code = str(stock_code).strip().zfill(6)
     now_ts = time.time()
     with _vi_status_cache_lock:
@@ -542,70 +883,114 @@ def _get_stock_vi_status(stock_code: str) -> dict:
         cached["source"] = f"cache_{cached.get('source', 'unknown')}"
         return cached
 
-    status = {"triggered": False, "source": "rest_unknown", "raw": None, "note": ""}
+    status = {"triggered": False, "source": "rest_unknown", "raw": None, "note": "", "trigger_at_kst": None, "release_at_kst": None}
     try:
         ws_map = getattr(state, "_vi_ws_active", None) or {}
         ws_ent = ws_map.get(code)
+        ws_active = False
+        ws_raw = None
+        ws_age: Optional[float] = None
+        ws_fresh = False
         if ws_ent is not None:
             ws_active = bool(ws_ent[0])
             ws_ts = float(ws_ent[1] or 0.0)
             ws_raw = ws_ent[2] if len(ws_ent) >= 3 else None
             ws_age = now_ts - ws_ts if ws_ts > 0 else None
-            if ws_age is not None and ws_age < _VI_WS_STALE_SECONDS:
-                status = {
-                    "triggered": ws_active,
-                    "source": "ws",
-                    "raw": ws_raw,
-                    "note": f"age={ws_age:.1f}s",
-                }
-            else:
-                status["note"] = f"ws_stale age={ws_age:.1f}s" if ws_age is not None else "ws_missing_ts"
+            ws_fresh = ws_age is not None and ws_age < _VI_WS_STALE_SECONDS
 
-        if status.get("source") != "ws":
-            tz = timezone(timedelta(hours=9))
-            today_str = datetime.now(tz).strftime("%Y%m%d")
-            df = inquire_vi_status(
-                fid_div_cls_code="0",
-                fid_cond_scr_div_code="20139",
-                fid_mrkt_cls_code="0",
-                fid_input_iscd=code,
-                fid_rank_sort_cls_code="0",
-                fid_input_date_1=today_str,
-                fid_trgt_cls_code="",
-                fid_trgt_exls_cls_code="",
-            )
-            parsed = _rest_vi_dataframe_active(df)
-            if parsed is not None:
-                raw_values = []
-                try:
-                    for col in getattr(df, "columns", []):
-                        cl = str(col).lower().replace(" ", "")
-                        if "vi" in cl and any(k in cl for k in ("cls", "stts", "stat", "type", "code", "div", "aplc", "yn")):
-                            raw_values.extend([v for v in df[col].astype(str).str.strip().tolist() if v and v.lower() not in ("nan", "none")])
-                except Exception:
-                    raw_values = []
-                status = {
-                    "triggered": bool(parsed),
-                    "source": "rest",
-                    "raw": ",".join(raw_values[:5]) if raw_values else None,
-                    "note": f"rows={0 if df is None else len(df)}",
-                }
+        tz = timezone(timedelta(hours=9))
+        today_str = datetime.now(tz).strftime("%Y%m%d")
+        df = inquire_vi_status(
+            fid_div_cls_code="0",
+            fid_cond_scr_div_code="20139",
+            fid_mrkt_cls_code="0",
+            fid_input_iscd=code,
+            fid_rank_sort_cls_code="0",
+            fid_input_date_1=today_str,
+            fid_trgt_cls_code="",
+            fid_trgt_exls_cls_code="",
+        )
+        parsed = _rest_vi_dataframe_active(df)
+        raw_values: List[str] = []
+        try:
+            for col in getattr(df, "columns", []):
+                cl = str(col).lower().replace(" ", "")
+                if "vi" in cl and any(k in cl for k in ("cls", "stts", "stat", "type", "code", "div", "aplc", "yn")):
+                    raw_values.extend([v for v in df[col].astype(str).str.strip().tolist() if v and v.lower() not in ("nan", "none")])
+        except Exception:
+            raw_values = []
+        td = _rest_vi_latest_time_details(df)
+        have_td = isinstance(td, dict)
+        if have_td:
+            t_kst = td.get("trigger_at_kst")
+            r_kst = td.get("release_at_kst")
+            triggered = bool(td.get("active_from_time"))
+            rest_has_times = bool(t_kst or r_kst)
+        else:
+            t_kst = None
+            r_kst = None
+            triggered = bool(parsed) if parsed is not None else False
+            rest_has_times = False
+
+        note_bits = [f"rows={0 if df is None else len(df)}"]
+        if ws_ent is not None:
+            if ws_fresh:
+                note_bits.append(f"ws_age={ws_age:.1f}s raw={ws_raw}")
+            elif ws_age is not None:
+                note_bits.append(f"ws_stale age={ws_age:.1f}s")
             else:
-                status = {
-                    "triggered": False,
-                    "source": "rest_unknown",
-                    "raw": None,
-                    "note": "no_explicit_vi_columns",
-                }
+                note_bits.append("ws_missing_ts")
+
+        if ws_fresh:
+            if rest_has_times:
+                if ws_active and not triggered:
+                    note_bits.append("WS활성힌트 무시→REST시각상 해제됨")
+                src = "rest"
+            elif have_td:
+                if ws_active and not triggered:
+                    note_bits.append("WS활성힌트 무시→REST판정")
+                src = "rest"
+            else:
+                if ws_active:
+                    triggered = True
+                    note_bits.append("REST요약없음→WS활성")
+                    src = "ws"
+                else:
+                    triggered = False
+                    note_bits.append("REST요약없음→WS비활성")
+                    src = "ws"
+        else:
+            src = "rest" if parsed is not None or have_td else "rest_unknown"
+
+        if parsed is None and not have_td:
+            status = {
+                "triggered": False,
+                "source": "rest_unknown",
+                "raw": None,
+                "note": "no_explicit_vi_columns|" + "|".join(note_bits),
+                "trigger_at_kst": None,
+                "release_at_kst": None,
+            }
+        else:
+            status = {
+                "triggered": bool(triggered),
+                "source": src,
+                "raw": ",".join(raw_values[:5]) if raw_values else None,
+                "note": "|".join(note_bits),
+                "trigger_at_kst": t_kst,
+                "release_at_kst": r_kst,
+            }
     except Exception as e:
         logger.debug("VI status check failed for %s: %s", code, e)
-        status = {"triggered": False, "source": "error", "raw": None, "note": str(e)}
+        status = {"triggered": False, "source": "error", "raw": None, "note": str(e), "trigger_at_kst": None, "release_at_kst": None}
 
     out = {
         "triggered": bool(status.get("triggered", False)),
         "source": str(status.get("source", "error") or "error"),
         "raw": status.get("raw"),
         "note": str(status.get("note", "") or ""),
+        "trigger_at_kst": status.get("trigger_at_kst"),
+        "release_at_kst": status.get("release_at_kst"),
         "ts": now_ts,
     }
     with _vi_status_cache_lock:
@@ -625,22 +1010,35 @@ def _get_vi_reentry_watch() -> Dict[str, dict]:
     return watch
 
 
-def _mark_vi_reentry_active(stock_code: str, price: float = 0.0) -> None:
+def _mark_vi_reentry_active(
+    stock_code: str,
+    price: float = 0.0,
+    *,
+    trigger_at_kst: Optional[str] = None,
+    release_at_kst: Optional[str] = None,
+) -> None:
     code = str(stock_code or "").strip().zfill(6)
     if not code:
         return
+    tz = timezone(timedelta(hours=9))
+    now_kst = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
     watch = _get_vi_reentry_watch()
     prev = watch.get(code) or {}
     prev_high = float(prev.get("vi_high", 0.0) or 0.0) if bool(prev.get("active", False)) else 0.0
     px = float(price or 0.0)
+    was_active = bool(prev.get("active", False))
+    tr_kst = (prev.get("vi_trigger_at_kst") if was_active else None) or trigger_at_kst or now_kst
+    rel_kst = prev.get("vi_release_at_kst") if was_active else release_at_kst
     watch[code] = {
         "active": True,
-        "triggered_at": time.time(),
+        "triggered_at": time.time() if not was_active else float(prev.get("triggered_at", 0.0) or time.time()),
         "released_at": 0.0,
         "vi_high": max(prev_high, px),
         "ref_high": 0.0,
         "pass_logged": False,
         "buy_done": False,
+        "vi_trigger_at_kst": tr_kst,
+        "vi_release_at_kst": rel_kst,
     }
 
 
@@ -659,7 +1057,13 @@ def _update_vi_reentry_active_price(stock_code: str, price: float) -> None:
     watch[code] = ctx
 
 
-def _mark_vi_reentry_released(stock_code: str, price: float = 0.0) -> None:
+def _mark_vi_reentry_released(
+    stock_code: str,
+    price: float = 0.0,
+    *,
+    trigger_at_kst: Optional[str] = None,
+    release_at_kst: Optional[str] = None,
+) -> None:
     code = str(stock_code or "").strip().zfill(6)
     if not code:
         return
@@ -669,6 +1073,9 @@ def _mark_vi_reentry_released(stock_code: str, price: float = 0.0) -> None:
         return
     px = float(price or 0.0)
     ref_high = max(float(ctx.get("vi_high", 0.0) or 0.0), px)
+    tz = timezone(timedelta(hours=9))
+    rel_kst = release_at_kst or datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+    tr_kst = trigger_at_kst or ctx.get("vi_trigger_at_kst") or "-"
     watch[code] = {
         **ctx,
         "active": False,
@@ -676,6 +1083,8 @@ def _mark_vi_reentry_released(stock_code: str, price: float = 0.0) -> None:
         "ref_high": ref_high,
         "pass_logged": False,
         "buy_done": False,
+        "vi_trigger_at_kst": tr_kst,
+        "vi_release_at_kst": rel_kst,
     }
 
 
@@ -695,12 +1104,14 @@ def _get_vi_reentry_skip_reason(stock_code: str, current_price: float) -> Option
     stabilize_sec = max(0, min(180, int(getattr(state, "vi_reentry_stabilization_seconds", 20) or 20)))
     ready_at = released_at + stabilize_sec
     now_ts = time.time()
+    t_disp = _vi_kst_iso_to_hhmmss(ctx.get("vi_trigger_at_kst"))
+    r_disp = _vi_kst_iso_to_hhmmss(ctx.get("vi_release_at_kst"))
     if now_ts < ready_at:
-        return f"VI 해제 안정화 대기({int(max(1, ready_at - now_ts))}s)"
+        return f"VI재평가 | 발동={t_disp} 해제={r_disp} | 안정화 대기({int(max(1, ready_at - now_ts))}s)"
     breakout_buffer = max(0.0, min(0.03, float(getattr(state, "vi_reentry_breakout_buffer_ratio", 0.001) or 0.001)))
     breakout_px = ref_high * (1.0 + breakout_buffer)
     if float(current_price) < breakout_px:
-        return f"VI 재돌파 대기({breakout_px:,.0f}원 미만)"
+        return f"VI재평가 | 발동={t_disp} 해제={r_disp} | 재돌파 대기({breakout_px:,.0f}원 미만)"
     if not bool(ctx.get("pass_logged", False)):
         ctx["pass_logged"] = True
         _get_vi_reentry_watch()[code] = ctx
@@ -708,8 +1119,8 @@ def _get_vi_reentry_skip_reason(stock_code: str, current_price: float) -> Option
             "type": "log",
             "level": "info",
             "message": (
-                f"VI 재평가 통과 | {code} | 해제 후 {stabilize_sec}s 안정화 + "
-                f"직전 VI 고점 {ref_high:,.0f}원 재돌파 확인"
+                f"VI재평가 통과 | {code} | 발동={t_disp} 해제={r_disp} | "
+                f"해제 후 {stabilize_sec}s 안정화 + 직전 VI 고점 {ref_high:,.0f}원 재돌파"
             ),
         })
     return None
@@ -899,7 +1310,7 @@ def _build_risk_config_dict_from_rm() -> dict:
                 out[k] = getattr(rm, k)
     except Exception:
         pass
-    return out
+    return round_floats_for_json_storage(out) if out else {}
 
 
 def _compute_unified_regime_label(ur: UnifiedRegimeSwitchConfig) -> str:
@@ -985,7 +1396,7 @@ def _apply_unified_regime_merged_overlay() -> bool:
     prof_map = {"trend": ur.profile_trend, "range": ur.profile_range, "neutral": ur.profile_neutral}
     prof = prof_map.get(label, ur.profile_neutral)
     ms, mr = merge_strategy_risk(base_s, base_r, prof.strategy, prof.risk)
-    full_sc = {**ms, "unified_regime": ur.model_dump()}
+    full_sc = round_floats_for_json_storage({**ms, "unified_regime": ur.model_dump()})
     try:
         sc = StrategyConfig.model_validate(full_sc)
     except Exception as e:
@@ -2173,7 +2584,7 @@ def _apply_strategy_config_to_state(config: "StrategyConfig", update_unified_sna
     state.regime_mr_require_index_bull = bool(getattr(config, "regime_mr_require_index_bull", getattr(state, "regime_mr_require_index_bull", True)))
     if update_unified_snapshot:
         try:
-            cfg_dump = config.model_dump()
+            cfg_dump = round_floats_for_json_storage(config.model_dump())
             state._strategy_config_snapshot = cfg_dump
             state._unified_regime_base_strategy = {k: v for k, v in cfg_dump.items() if k != "unified_regime"}
         except Exception:
@@ -2292,7 +2703,7 @@ def _normalize_macro_config_dict(d: Optional[dict]) -> dict:
     tbill_3m = out_dict.get("tbill_3m")
     out_dict["sofr_iorb"] = (sofr - iorb) if (sofr is not None and iorb is not None) else legacy_sofr_iorb
     out_dict["tbill_sofr"] = (tbill_3m - sofr) if (tbill_3m is not None and sofr is not None) else legacy_tbill_sofr
-    return out_dict
+    return round_floats_for_json_storage(out_dict)
 
 
 def _macro_format_value(key: str, value: Optional[float]) -> str:
@@ -3484,7 +3895,17 @@ def _handle_signal(
                 vi_skip = {}
             _mark_vi_reentry_active(stock_code, price)
             state._vi_skip_until = {**vi_skip, stock_code: time.time() + vi_cooling * 60}
-            _run_async_broadcast({"type": "log", "level": "warning", "message": f"주문 거절(VI): {stock_code} → {vi_cooling}분간 해당 종목 매수 스킵"})
+            _vs_vi = _get_stock_vi_status(stock_code)
+            _t_vi = _vi_kst_iso_to_hhmmss(_vs_vi.get("trigger_at_kst"))
+            _r_vi = _vi_kst_iso_to_hhmmss(_vs_vi.get("release_at_kst"))
+            _run_async_broadcast({
+                "type": "log",
+                "level": "warning",
+                "message": (
+                    f"VI 활성 | 주문거절 | 발동={_t_vi} 해제={_r_vi} "
+                    f"→ {vi_cooling}분간 해당 종목 매수 스킵"
+                ),
+            })
         if details.get("error_type") == "auth_expired":
             _run_async_broadcast({"type": "log", "level": "error", "message": "토큰 만료 가능성. 재로그인 후 이용하세요."})
             try:
@@ -3719,11 +4140,19 @@ def _start_trading_engine_thread():
                                     except Exception:
                                         last_px = 0.0
                                     if vi_active:
-                                        _mark_vi_reentry_active(code, last_px)
+                                        wt_ws = (_get_vi_reentry_watch() or {}).get(code) or {}
+                                        was_ws = bool(wt_ws.get("active", False))
+                                        tz_h0 = timezone(timedelta(hours=9))
+                                        tws_line = datetime.now(tz_h0).strftime("%Y-%m-%d %H:%M:%S")
+                                        _mark_vi_reentry_active(code, last_px, trigger_at_kst=tws_line if not was_ws else None)
                                     with _vi_status_cache_lock:
                                         _vi_status_cache.pop(code, None)
                                     if prev is not None and prev[0] and not vi_active:
-                                        _mark_vi_reentry_released(code, last_px)
+                                        pctx = (_get_vi_reentry_watch() or {}).get(code) or {}
+                                        trig_disp = _vi_kst_iso_to_hhmmss(pctx.get("vi_trigger_at_kst"))
+                                        tz_h0 = timezone(timedelta(hours=9))
+                                        rel_s = datetime.now(tz_h0).strftime("%Y-%m-%d %H:%M:%S")
+                                        _mark_vi_reentry_released(code, last_px, release_at_kst=rel_s)
                                         vi_skip = getattr(state, "_vi_skip_until", None) or {}
                                         if isinstance(vi_skip, dict) and vi_skip.get(code, 0) > time.time():
                                             state._vi_skip_until = {k: v for k, v in vi_skip.items() if k != code}
@@ -3732,13 +4161,18 @@ def _start_trading_engine_thread():
                                             _run_async_broadcast({
                                                 "type": "log",
                                                 "level": "info",
-                                                "message": f"VI 해제(장운영 WS): {code} raw={vi_raw} → 해당 종목 VI 냉각 해제, 매수 필터 재평가",
+                                                "message": (
+                                                    f"VI 해제 | 발동={trig_disp} 해제={_vi_kst_iso_to_hhmmss(rel_s)} | 장운영 WS raw={vi_raw} "
+                                                    f"→ 냉각 해제·매수 필터 재평가"
+                                                ),
                                             })
                                     elif (prev is None or not prev[0]) and vi_active:
+                                        wctx = (_get_vi_reentry_watch() or {}).get(code) or {}
+                                        t_show = _vi_kst_iso_to_hhmmss(wctx.get("vi_trigger_at_kst"))
                                         _run_async_broadcast({
                                             "type": "log",
                                             "level": "warning",
-                                            "message": f"VI 상태 감지(장운영 WS): {code} raw={vi_raw}",
+                                            "message": f"VI 활성 | 발동={t_show} 해제=- | 장운영 WS raw={vi_raw}",
                                         })
                             except Exception as ex:
                                 logger.debug("H0STMKO0 VI 처리 실패: %s", ex)
@@ -4268,20 +4702,33 @@ def _start_trading_engine_thread():
                                                 vi_raw = vi_status.get("raw")
                                                 vi_note = str(vi_status.get("note", "") or "")
                                                 if vi_active_now and vi_source == "ws":
-                                                    _mark_vi_reentry_active(stock_code, current_price)
+                                                    wt_buy = (_get_vi_reentry_watch() or {}).get(stock_code) or {}
+                                                    was_buy = bool(wt_buy.get("active", False))
+                                                    tz_b = timezone(timedelta(hours=9))
+                                                    tws_b = datetime.now(tz_b).strftime("%Y-%m-%d %H:%M:%S")
+                                                    _mark_vi_reentry_active(
+                                                        stock_code, current_price, trigger_at_kst=tws_b if not was_buy else None
+                                                    )
                                                     state._vi_skip_until = {**vi_skip_until, stock_code: time.time() + vi_cooling * 60}
+                                                    w_log = (_get_vi_reentry_watch() or {}).get(stock_code) or {}
+                                                    t_log = _vi_kst_iso_to_hhmmss(w_log.get("vi_trigger_at_kst"))
                                                     _run_async_broadcast({
                                                         "type": "log",
                                                         "level": "warning",
-                                                        "message": f"VI 발동(종목): {stock_code} source=WS raw={vi_raw} → {vi_cooling}분간 해당 종목 매수 스킵",
+                                                        "message": (
+                                                            f"VI 활성 | 발동={t_log} 해제=- | source=WS raw={vi_raw} "
+                                                            f"→ {vi_cooling}분간 해당 종목 매수 스킵"
+                                                        ),
                                                     })
                                                     _record_buy_skip(stock_code, "vi")
                                                     continue
                                                 if vi_active_now:
                                                     _record_buy_skip(stock_code, "vi_rest_active")
+                                                    t_log = _vi_kst_iso_to_hhmmss(vi_status.get("trigger_at_kst"))
+                                                    r_log = _vi_kst_iso_to_hhmmss(vi_status.get("release_at_kst"))
                                                     _throttled_skip_log(
                                                         stock_code,
-                                                        f"VI 활성 추정({vi_source}) raw={vi_raw or '-'} {vi_note}".strip(),
+                                                        f"VI 활성 | 발동={t_log} 해제={r_log} | {vi_source} raw={vi_raw or '-'} {vi_note}".strip(),
                                                         ttl_sec=30,
                                                     )
                                                     continue
@@ -4295,7 +4742,12 @@ def _start_trading_engine_thread():
                                                     )
                                                     continue
                                                 if vi_source in ("ws", "cache_ws", "rest", "cache_rest"):
-                                                    _mark_vi_reentry_released(stock_code, current_price)
+                                                    _mark_vi_reentry_released(
+                                                        stock_code,
+                                                        current_price,
+                                                        trigger_at_kst=vi_status.get("trigger_at_kst"),
+                                                        release_at_kst=vi_status.get("release_at_kst"),
+                                                    )
                                                 vi_reentry_reason = _get_vi_reentry_skip_reason(stock_code, current_price)
                                                 if vi_reentry_reason:
                                                     _record_buy_skip(stock_code, "vi_reentry_wait")
@@ -7243,7 +7695,16 @@ async def approve_signal(signal_id: str, current_user: str = Depends(get_current
                 vi_skip = {}
             _mark_vi_reentry_active(sc, float(signal_data.get("price") or 0.0))
             state._vi_skip_until = {**vi_skip, sc: time.time() + vi_cooling * 60}
-            await state.broadcast({"type": "log", "level": "warning", "message": f"주문 거절(VI): {sc} → {vi_cooling}분간 해당 종목 매수 스킵"})
+            _vs_ap = _get_stock_vi_status(sc)
+            _tap = _vi_kst_iso_to_hhmmss(_vs_ap.get("trigger_at_kst"))
+            _rap = _vi_kst_iso_to_hhmmss(_vs_ap.get("release_at_kst"))
+            await state.broadcast({
+                "type": "log",
+                "level": "warning",
+                "message": (
+                    f"VI 활성 | 주문거절 | 발동={_tap} 해제={_rap} → {vi_cooling}분간 해당 종목 매수 스킵"
+                ),
+            })
         if details.get("error_type") == "auth_expired":
             await state.broadcast({"type": "log", "level": "error", "message": "토큰 만료 가능성. 재로그인 후 이용하세요."})
             try:
@@ -7498,7 +7959,7 @@ async def update_risk_config(config: RiskConfig, current_user: str = Depends(get
             pass
 
         try:
-            state._unified_regime_base_risk = config.model_dump()
+            state._unified_regime_base_risk = round_floats_for_json_storage(config.model_dump())
         except Exception:
             pass
         try:
@@ -7787,7 +8248,7 @@ def _normalize_strategy_config_for_json(sc: dict) -> dict:
     for k, v in list(out.items()):
         if isinstance(v, Decimal):
             out[k] = int(v) if v % 1 == 0 else float(v)
-    return out
+    return round_floats_for_json_storage(out)
 
 
 @app.get("/api/config/user-settings")
@@ -7803,6 +8264,7 @@ async def get_user_settings(current_user: str = Depends(get_current_user)):
     sc = settings.get("strategy_config")
     if isinstance(sc, dict):
         settings = {**settings, "strategy_config": _normalize_strategy_config_for_json(sc)}
+    settings = round_floats_for_json_storage(settings)
     # DB에서 불러온 설정을 state에 반영 → 리스크 관리 등 화면값과 실제 적용값·DB가 같아짐
     _apply_risk_config_dict_to_state(settings.get("risk_config"))
     _apply_operational_config_dict_to_state(settings.get("operational_config"))
@@ -8108,7 +8570,16 @@ async def execute_manual_order(order: ManualOrder, current_user: str = Depends(g
                     vi_skip = {}
                 _mark_vi_reentry_active(sc, float(getattr(order, "price", 0.0) or 0.0))
                 state._vi_skip_until = {**vi_skip, sc: time.time() + vi_cooling * 60}
-                await state.broadcast({"type": "log", "level": "warning", "message": f"주문 거절(VI): {sc} → {vi_cooling}분간 해당 종목 매수 스킵"})
+                _vs_mo = _get_stock_vi_status(sc)
+                _tmo = _vi_kst_iso_to_hhmmss(_vs_mo.get("trigger_at_kst"))
+                _rmo = _vi_kst_iso_to_hhmmss(_vs_mo.get("release_at_kst"))
+                await state.broadcast({
+                    "type": "log",
+                    "level": "warning",
+                    "message": (
+                        f"VI 활성 | 주문거절 | 발동={_tmo} 해제={_rmo} → {vi_cooling}분간 해당 종목 매수 스킵"
+                    ),
+                })
             if details.get("error_type") == "auth_expired":
                 await state.broadcast({"type": "log", "level": "error", "message": "토큰 만료 가능성. 재로그인 후 이용하세요."})
                 try:

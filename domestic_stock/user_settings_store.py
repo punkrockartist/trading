@@ -1,10 +1,38 @@
 import json
 import logging
+import math
 import os
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+# JSON 저장·API 응답에서 float 이진 표현 꼬리(예: 0.011000000000000001) 제거용
+_JSON_FLOAT_DECIMALS = 8
+
+
+def round_floats_for_json_storage(obj: Any, ndigits: int = _JSON_FLOAT_DECIMALS) -> Any:
+    """
+    dict/list 트리 안의 float을 소수 ndigits 자리로 반올림해 JSON 직렬화·비교·로그를 깔끔하게 한다.
+    정수에 가까운 float은 int로 바꿔 Dynamo 숫자 타입과도 맞춘다.
+    """
+    if isinstance(obj, float):
+        if not math.isfinite(obj):
+            return obj
+        r = round(obj, ndigits)
+        if r.is_integer() and abs(r) < 2**53:
+            return int(r)
+        return r
+    if isinstance(obj, Decimal):
+        return round_floats_for_json_storage(float(obj), ndigits)
+    if isinstance(obj, dict):
+        return {k: round_floats_for_json_storage(v, ndigits) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [round_floats_for_json_storage(v, ndigits) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(round_floats_for_json_storage(v, ndigits) for v in obj)
+    return obj
 
 
 def _ensure_dotenv_loaded():
@@ -191,13 +219,13 @@ class DynamoDBUserSettingsStore:
                 raw = item.get(field)
                 if isinstance(raw, str) and raw.strip():
                     try:
-                        out[key] = json.loads(raw)
+                        out[key] = round_floats_for_json_storage(json.loads(raw))
                     except Exception:
                         continue
             raw_slots = item.get("custom_slots_json")
             if isinstance(raw_slots, str) and raw_slots.strip():
                 try:
-                    out["custom_slots"] = json.loads(raw_slots)
+                    out["custom_slots"] = round_floats_for_json_storage(json.loads(raw_slots))
                 except Exception:
                     out["custom_slots"] = {}
             else:
@@ -236,22 +264,22 @@ class DynamoDBUserSettingsStore:
             values: Dict[str, Any] = {}
             if risk_config is not None:
                 sets.append("risk_config_json=:risk")
-                values[":risk"] = json.dumps(risk_config, ensure_ascii=False)
+                values[":risk"] = json.dumps(round_floats_for_json_storage(risk_config), ensure_ascii=False)
             if strategy_config is not None:
                 sets.append("strategy_config_json=:strategy")
-                values[":strategy"] = json.dumps(strategy_config, ensure_ascii=False)
+                values[":strategy"] = json.dumps(round_floats_for_json_storage(strategy_config), ensure_ascii=False)
             if stock_selection_config is not None:
                 sets.append("stock_selection_config_json=:stocksel")
-                values[":stocksel"] = json.dumps(stock_selection_config, ensure_ascii=False)
+                values[":stocksel"] = json.dumps(round_floats_for_json_storage(stock_selection_config), ensure_ascii=False)
             if operational_config is not None:
                 sets.append("operational_config_json=:oper")
-                values[":oper"] = json.dumps(operational_config, ensure_ascii=False)
+                values[":oper"] = json.dumps(round_floats_for_json_storage(operational_config), ensure_ascii=False)
             if macro_config is not None:
                 sets.append("macro_config_json=:macro")
-                values[":macro"] = json.dumps(macro_config, ensure_ascii=False)
+                values[":macro"] = json.dumps(round_floats_for_json_storage(macro_config), ensure_ascii=False)
             if custom_slots is not None:
                 sets.append("custom_slots_json=:slots")
-                values[":slots"] = json.dumps(custom_slots, ensure_ascii=False)
+                values[":slots"] = json.dumps(round_floats_for_json_storage(custom_slots), ensure_ascii=False)
 
             now = datetime.now(timezone.utc).isoformat()
             sets.append("updated_at=:u")
