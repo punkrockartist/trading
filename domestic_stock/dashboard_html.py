@@ -739,6 +739,35 @@ def get_dashboard_html(username: str) -> str:
         }}
         .preflight-kv .k {{ color: var(--muted); }}
         .preflight-kv code {{ font-size: 12px; }}
+        .guest-notice-wrap {{
+            background: var(--subnav-row-bg);
+            border-top: 1px solid var(--border);
+            border-bottom: 1px solid var(--border);
+        }}
+        .guest-notice {{
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 7px var(--container-pad);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #6b3f00;
+            font-size: 12px;
+            line-height: 1.35;
+        }}
+        .guest-notice-icon {{
+            width: 18px;
+            height: 18px;
+            border-radius: 999px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            background: #fff5db;
+            border: 1px solid #f0d7a1;
+            font-size: 11px;
+            flex-shrink: 0;
+        }}
+        .guest-notice strong {{ color: #5a3200; }}
         @media (min-width: 768px) {{
             :root {{
                 --container-pad: 20px;
@@ -818,6 +847,7 @@ def get_dashboard_html(username: str) -> str:
             </div>
         </div>
         </div>
+        {('<div class="guest-notice-wrap"><div class="guest-notice"><span class="guest-notice-icon">&#128274;</span><span><strong>게스트 안내:</strong> 현재 계정은 둘러보기 전용입니다. 실거래/자동매매 기능은 유료 서비스 가입 후 이용할 수 있습니다.</span></div></div>' if is_guest else '')}
 
     <div class="container">
 
