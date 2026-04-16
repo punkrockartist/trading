@@ -59,18 +59,18 @@ class RiskManager:
         # 최소 매수 수량 (0/1이면 사실상 제한 없음)
         self.min_order_quantity = 1
         
-        # 손절매/익절매 설정 (오전 단타: 실제 체결 변동폭에 맞춘 기본값)
-        self.stop_loss_ratio = 0.005  # 0.5% 손실 시 매도 (기본 2%→0.5%)
-        self.take_profit_ratio = 0.01  # 1% 수익 시 매도 (기본 5%→1%)
+        # 손절매/익절매 설정 (짧은 왕복·제세금 부담 완화: 익절·트레일을 다소 넓게)
+        self.stop_loss_ratio = 0.006  # 0.6% (틱 노이즈 대비 0.5%→소폭 완화)
+        self.take_profit_ratio = 0.014  # 1.4% (고정 익절 목표를 넓혀 회전·세금 누적 완화)
         # ATR(또는 틱 변동성) 배수 손절/익절: True면 변동성 기반 거리 사용
         self.use_atr_for_stop_take = False
         self.atr_stop_mult = 1.5  # 손절 = 매수가 - atr_stop_mult * ATR
         self.atr_take_mult = 2.0  # 익절 = 매수가 + atr_take_mult * ATR
         self.atr_lookback_ticks = 20  # ATR 대용 틱 변동성 lookback
-        # 트레일링 스탑 (단타: 0.4% 하락 시 정리, 0.6% 수익부터 활성화)
-        self.trailing_stop_ratio = 0.004  # 0.4%
-        self.trailing_activation_ratio = 0.006  # 0.6% 수익 이상일 때부터 trailing 적용
-        # 부분 익절 (0이면 사용 안 함)
+        # 트레일링 스탑 (너무 이른 활성화·좁은 트레일은 과매매 유발 → 완화)
+        self.trailing_stop_ratio = 0.01  # 1.0% 고점 대비 하락 시 청산
+        self.trailing_activation_ratio = 0.008  # 0.8% 수익 이상일 때부터 trailing 적용
+        # 부분 익절 (0이면 사용 안 함). 사용 시 오늘 실거래 패턴 기준 권장: 0.01(1%)
         self.partial_take_profit_ratio = 0.0
         self.partial_take_profit_fraction = 0.5  # 0~1
         

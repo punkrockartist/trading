@@ -4,7 +4,7 @@
 테이블 스키마 (생성 시):
 - PK: username (S)
 - SK: sk (S), 값 예: YYYYMMDD#HHmmss#id — 일자·시간 순 정렬, 동일 초 구분용 id
-- 속성: date, time, stock_code, order_type, quantity, price, pnl, reason, timestamp, ttl
+- 속성: date, time, stock_code, order_type, quantity, price, pnl, reason, timestamp, env_dv, ttl
 - TTL: ttl (N) 속성에 Unix epoch 초 설정 시, 해당 시각 경과 후 자동 삭제 (10일 보관)
 """
 
@@ -164,6 +164,9 @@ class DynamoDBUserHistStore:
             reason = trade_info.get("reason")
             if reason is not None:
                 item["reason"] = str(reason)
+            env_dv = trade_info.get("env_dv")
+            if env_dv not in (None, ""):
+                item["env_dv"] = str(env_dv).strip()[:16]
             stock_name = trade_info.get("stock_name")
             if stock_name not in (None, ""):
                 item["stock_name"] = str(stock_name).strip()[:80]
@@ -222,6 +225,7 @@ class DynamoDBUserHistStore:
                     "pnl": float(it["pnl"]) if it.get("pnl") is not None else None,
                     "reason": it.get("reason"),
                     "timestamp": it.get("timestamp"),
+                    "env_dv": str(it.get("env_dv") or ""),
                 }
                 out.append(rec)
             return out

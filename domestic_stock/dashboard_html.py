@@ -1393,12 +1393,12 @@ def get_dashboard_html(username: str) -> str:
                 <h3 class="settings-block-title">B. 손익 절단·일·월·누적 한도</h3>
                 <div class="form-group">
                     <label>손절매 비율 (%): <code class="setting-var">stop_loss_ratio</code></label>
-                    <input type="number" id="stop_loss" value="0.5" step="0.1" min="0.1" max="10" title="오전 단타는 0.5~1.2% 권장">
-                    <div class="hint">오전 단타: 0.5~1.2% 권장. 2%는 스윙에 가깝습니다.</div>
+                    <input type="number" id="stop_loss" value="0.6" step="0.1" min="0.1" max="10" title="짧은 왕복·비용 부담 시 0.6~0.9% 권장">
+                    <div class="hint">오전 단타: 0.5~1.2% 흔함. 제세금·수수료 대비 너무 타이트하면 노이즈 손절이 늘 수 있어 0.6% 전후 권장.</div>
                 </div>
                 <div class="form-group">
                     <label>익절매 비율 (%): <code class="setting-var">take_profit_ratio</code></label>
-                    <input type="number" id="take_profit" value="1" step="0.1" min="0.2" max="20">
+                    <input type="number" id="take_profit" value="1.4" step="0.1" min="0.2" max="20">
                 </div>
                 <div class="form-group">
                     <label>일일 손실 한도 (원): <code class="setting-var">daily_loss_limit</code></label>
@@ -1556,7 +1556,7 @@ def get_dashboard_html(username: str) -> str:
                         <div class="form-group">
                             <label>부분 익절 트리거(%): <code class="setting-var">partial_take_profit_ratio</code></label>
                             <input type="number" id="partial_tp_pct" value="0" step="0.1" min="0" max="50">
-                            <div class="hint">실제 매수 체결가 대비 수익률 기준입니다. 같은 틱에서 전량 익절선까지 함께 도달하면 전량 익절이 우선합니다.</div>
+                            <div class="hint">실제 매수 체결가 대비 수익률 기준입니다. 사용 시 너무 낮으면(예: 0.7%) 매도세금·재진입 루프가 커질 수 있어 1.0% 전후 권장. 같은 틱에서 전량 익절선까지 함께 도달하면 전량 익절이 우선합니다.</div>
                         </div>
                         <div class="form-group">
                             <label>부분 익절 비율(%): <code class="setting-var">partial_take_profit_fraction</code></label>
@@ -1564,12 +1564,12 @@ def get_dashboard_html(username: str) -> str:
                         </div>
                         <div class="form-group">
                             <label>트레일링 스탑 (%): <code class="setting-var">trailing_stop_ratio</code></label>
-                            <input type="number" id="trailing_stop_pct" value="0.5" step="0.1" min="0" max="50">
-                            <div class="hint">실제 매수 체결가 기준으로 수익이 난 뒤, 기록한 고점 대비 이 비율만큼 밀리면 청산합니다.</div>
+                            <input type="number" id="trailing_stop_pct" value="1.0" step="0.1" min="0" max="50">
+                            <div class="hint">고점 대비 이 비율만큼 밀리면 청산. 0.7%대는 잦은 매도에 유리해 제세금 누적이 될 수 있어 1.0% 전후 권장.</div>
                         </div>
                         <div class="form-group">
                             <label>트레일링 활성화 최소 수익(%): <code class="setting-var">trailing_activation_ratio</code></label>
-                            <input type="number" id="trailing_activation_pct" value="0.6" step="0.1" min="0" max="50">
+                            <input type="number" id="trailing_activation_pct" value="0.8" step="0.1" min="0" max="50">
                         </div>
                         <div class="form-group">
                             <label style="display:flex; align-items:center; gap:8px;">
@@ -2784,6 +2784,8 @@ def get_dashboard_html(username: str) -> str:
                                     <th>주문수량</th>
                                     <th>체결수량</th>
                                     <th>체결가</th>
+                                    <th>평균매수가(계산)</th>
+                                    <th>매도 손익(세전)</th>
                                 </tr>
                             </thead>
                             <tbody id="account_trade_history_body">
@@ -4660,7 +4662,7 @@ API: POST /api/config/risk|strategy|stock-selection|operational
             }});
 
             if (!rows.length) {{
-                tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color: var(--muted);">해당 조건의 거래내역이 없습니다.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="10" style="text-align:center; color: var(--muted);">해당 조건의 거래내역이 없습니다.</td></tr>';
                 return;
             }}
 
@@ -4752,6 +4754,16 @@ API: POST /api/config/risk|strategy|stock-selection|operational
                 if (sideFilter && side !== sideFilter) return false;
                 if (pdnoFilter && pdno !== pdnoFilter) return false;
                 return true;
+            }}).sort((a, b) => {{
+                const ad = String(_accountTradeKey(a, 'ord_dt', 'ORD_DT') || '');
+                const bd = String(_accountTradeKey(b, 'ord_dt', 'ORD_DT') || '');
+                if (ad !== bd) return bd.localeCompare(ad);
+                const at = String(_accountTradeKey(a, 'ord_tmd', 'ORD_TMD') || '').padStart(6, '0');
+                const bt = String(_accountTradeKey(b, 'ord_tmd', 'ORD_TMD') || '').padStart(6, '0');
+                if (at !== bt) return bt.localeCompare(at);
+                const ao = String(_accountTradeKey(a, 'odno', 'ODNO', 'ord_no', 'ORD_NO') || '');
+                const bo = String(_accountTradeKey(b, 'odno', 'ODNO', 'ord_no', 'ORD_NO') || '');
+                return bo.localeCompare(ao);
             }});
 
             if (!rows.length) {{
@@ -4769,6 +4781,8 @@ API: POST /api/config/risk|strategy|stock-selection|operational
                 const ordQty = _accountTradeKey(r, 'ord_qty', 'ORD_QTY');
                 const ccldQty = _accountTradeKey(r, 'ccld_qty', 'CCLD_QTY', 'tot_ccld_qty', 'TOT_CCLD_QTY', 'ccld_qty_tot', 'CCLD_QTY_TOT') || ordQty;
                 const avgPrc = _accountTradeKey(r, 'avg_prvs', 'AVG_PRC', 'ccld_unpr', 'CCLD_UNPR', 'ord_unpr', 'ORD_UNPR');
+                const calcAvgBuy = _accountTradeKey(r, 'calc_avg_buy_price');
+                const calcPnlGross = _accountTradeKey(r, 'calc_realized_pnl_gross');
                 const row = document.createElement('tr');
                 row.innerHTML = `
                     <td>${{ordDt ? ordDt.replace(/(\\d{{4}})(\\d{{2}})(\\d{{2}})/, '$1-$2-$3') : '-'}}</td>
@@ -4779,6 +4793,8 @@ API: POST /api/config/risk|strategy|stock-selection|operational
                     <td>${{ordQty != null && ordQty !== '' ? formatNumber(Number(ordQty)) : '-'}}</td>
                     <td>${{ccldQty != null && ccldQty !== '' ? formatNumber(Number(ccldQty)) : (ordQty != null && ordQty !== '' ? formatNumber(Number(ordQty)) : '-')}}</td>
                     <td>${{avgPrc != null && avgPrc !== '' ? formatNumber(Number(avgPrc)) + '원' : '-'}}</td>
+                    <td>${{calcAvgBuy != null && calcAvgBuy !== '' ? formatNumber(Math.round(Number(calcAvgBuy))) + '원' : '-'}}</td>
+                    <td style="color:${{calcPnlGross > 0 ? '#2563eb' : (calcPnlGross < 0 ? 'var(--danger)' : 'inherit')}};">${{calcPnlGross != null && calcPnlGross !== '' ? formatNumber(Math.round(Number(calcPnlGross))) + '원' : '-'}}</td>
                 `;
                 tbody.appendChild(row);
             }});
@@ -4824,14 +4840,14 @@ API: POST /api/config/risk|strategy|stock-selection|operational
                 const tbody = document.getElementById('account_trade_history_body');
                 tbody.innerHTML = '';
                 if (data.error && !data.rows) {{
-                    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color: var(--danger);">' + (data.error || '조회 실패') + '</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center; color: var(--danger);">' + (data.error || '조회 실패') + '</td></tr>';
                     return;
                 }}
                 accountTradeRows = data.rows || [];
                 updateAccountTradeFilters();
                 renderAccountTrades();
                 if (!accountTradeRows.length) {{
-                    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color: var(--muted);">' + (data.date || dateStr) + ' 거래내역이 없습니다.</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center; color: var(--muted);">' + (data.date || dateStr) + ' 거래내역이 없습니다.</td></tr>';
                 }}
             }} catch (e) {{
                 addLog('계좌 거래내역 조회 실패: ' + e, 'error');

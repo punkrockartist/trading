@@ -123,6 +123,7 @@ _user_settings_store_init_error: Optional[str] = None
 _user_result_store = None
 _signal_skip_log_last_at: Dict[str, float] = {}
 _signal_skip_log_lock = threading.Lock()
+_signal_info_log_last_at: Dict[str, float] = {}
 _last_atr_log_ts: Dict[str, float] = {}  # ATR 필터 로그 throttle (종목별 5분)
 _last_sap_log_ts: Dict[str, float] = {}  # SAP 필터 로그 throttle (종목별 5분)
 _skip_stats_lock = threading.Lock()
@@ -2435,6 +2436,7 @@ async def _pending_order_reconciler_loop():
                             "pnl": pnl,
                             "reason": "체결확인",
                             "order_status": "filled",
+                            "env_dv": env_dv,
                         }
                         if side == "sell":
                             trade_info["sell_trigger_code"] = _rec_tc
@@ -2558,6 +2560,24 @@ def _throttled_skip_log(stock_code: str, reason: str, *, ttl_sec: int = 30):
             "type": "log",
             "level": "info",
             "message": f"BUY 스킵 | {stock_code} | {reason}",
+        })
+    except Exception:
+        return
+
+
+def _throttled_info_log(key: str, message: str, *, ttl_sec: int = 30):
+    """엔진 정보 로그(후보 진입/주문 시도 등) 스팸 방지용 throttle."""
+    try:
+        now_ts = time.time()
+        with _signal_skip_log_lock:
+            last = float(_signal_info_log_last_at.get(key) or 0.0)
+            if now_ts - last < float(ttl_sec):
+                return
+            _signal_info_log_last_at[key] = now_ts
+        _run_async_broadcast({
+            "type": "log",
+            "level": "info",
+            "message": message,
         })
     except Exception:
         return
@@ -4190,6 +4210,7 @@ def _handle_signal(
                 "pnl": None,
                 "reason": reason or "",
                 "order_status": str(details.get("status") or "accepted_pending"),
+                "env_dv": str(details.get("env_dv") or ("demo" if state.is_paper_trading else "real")),
             }
             if str(signal).lower() == "sell":
                 trade_info["sell_trigger_code"] = (sell_trigger_code or "").strip() or SELL_TRIG_UNKNOWN
@@ -4239,6 +4260,7 @@ def _handle_signal(
         "pnl": pnl_val,
         "reason": reason or "",
         "order_status": str(details.get("status") or "filled"),
+        "env_dv": str(details.get("env_dv") or ("demo" if state.is_paper_trading else "real")),
     }
     if str(signal).lower() == "sell":
         trade_info["sell_trigger_code"] = (sell_trigger_code or "").strip() or SELL_TRIG_UNKNOWN
@@ -4838,6 +4860,14 @@ def _start_trading_engine_thread():
                                             if mr_buy_candidate and not ma_buy_candidate
                                             else "이동평균 크로스 조건 충족"
                                         )
+                                        _throttled_info_log(
+                                            f"entry_cand:{stock_code}:{buy_signal_reason}",
+                                            (
+                                                f"ENTRY_CAND | {stock_code} | reason={buy_signal_reason} "
+                                                f"| sMA={float(short_ma):.2f} lMA={float(long_ma):.2f} px={float(current_price):.0f}"
+                                            ),
+                                            ttl_sec=30,
+                                        )
                                         # 선정 종목에 있을 때만 매수. 포지션에만 있고 선정에 없는 종목(전일 잔여 등)은 매도만 허용·매수 스킵
                                         # 리스크·거래소·VI 게이트 → 알파·시장 레짐 게이트 (코드 경계 분리, 평가 순서 동일)
                                         if _engine_buy_skip_on_risk_gates(stock_code, current_price):
@@ -4987,8 +5017,8 @@ def _start_trading_engine_thread():
                                                                     stock_code,
                                                                     # low/high를 1자리 반올림하지 않고, -0.05 같은 경계값을 정확히 확인할 수 있게 소수 2자리 표시
                                                                     f"SAP 풀백 범위 밖으로 신규 매수 스킵(dev={dev:.2f}% not in [{low:.2f}%,{high:.2f}%])",
-                                                        )
-                                                        continue
+                                                                )
+                                                                continue
                                                     except Exception:
                                                         pass
                                         except Exception:
@@ -5419,6 +5449,15 @@ def _start_trading_engine_thread():
                                     if signal_type == "buy" and stock_code not in (state.selected_stocks or []):
                                         signal_type = None
                                     if signal_type:
+                                        if signal_type == "buy":
+                                            _throttled_info_log(
+                                                f"buy_attempt:{stock_code}",
+                                                (
+                                                    f"BUY 주문 시도 | {stock_code} | reason={buy_signal_reason} "
+                                                    f"| px={float(current_price):.0f}"
+                                                ),
+                                                ttl_sec=15,
+                                            )
                                         _ma_trig = SELL_TRIG_MA_DEAD_CROSS if signal_type == "sell" else None
                                         _handle_signal(
                                             stock_code,
@@ -5784,7 +5823,7 @@ def _preflight_check(username: str) -> Dict[str, Any]:
     }
 
 
-def _replay_daily_buy_notional_from_rows(rows: List[dict]) -> float:
+def _replay_daily_buy_notional_from_rows(rows: List[dict], target_env_dv: Optional[str] = None) -> float:
     """
     당일 거래를 시간순 재생해 일매수 한도 소모분을 복원.
     매수: +(가격×수량), 매도: 보유분이 있으면 -(평단×매도수량), 없으면 -(매도가×수량) 근사.
@@ -5799,7 +5838,12 @@ def _replay_daily_buy_notional_from_rows(rows: List[dict]) -> float:
         pos_qty: Dict[str, int] = {}
         pos_avg: Dict[str, float] = {}
         net = 0.0
+        env_filter = str(target_env_dv or "").strip().lower()
         for t in sorted_rows:
+            if env_filter:
+                rec_env = str(t.get("env_dv") or "").strip().lower()
+                if rec_env != env_filter:
+                    continue
             ot = (t.get("order_type") or "").strip().lower()
             code = str(t.get("stock_code") or "").strip().zfill(6)
             q = int(t.get("quantity") or 0)
@@ -5833,7 +5877,7 @@ def _replay_daily_buy_notional_from_rows(rows: List[dict]) -> float:
         return 0.0
 
 
-def _load_today_daily_buy_notional(current_user: str) -> Optional[float]:
+def _load_today_daily_buy_notional(current_user: str, env_dv: Optional[str] = None) -> Optional[float]:
     """당일 user_hist를 시간순 재생한 일매수 한도 소모분. 저장소 없거나 실패 시 None."""
     if not current_user:
         return None
@@ -5847,7 +5891,7 @@ def _load_today_daily_buy_notional(current_user: str) -> Optional[float]:
             rows = hist.get_trades(current_user, today, today)
             if not rows:
                 return 0.0
-            return _replay_daily_buy_notional_from_rows(rows)
+            return _replay_daily_buy_notional_from_rows(rows, target_env_dv=env_dv)
     except Exception:
         pass
     return None
@@ -5858,7 +5902,8 @@ def _restore_daily_buy_notional_from_hist(username: str) -> None:
     rm = getattr(state, "risk_manager", None)
     if not rm or not username:
         return
-    n = _load_today_daily_buy_notional(username)
+    env_dv = "demo" if getattr(state, "is_paper_trading", True) else "real"
+    n = _load_today_daily_buy_notional(username, env_dv=env_dv)
     if n is None:
         return
     try:
@@ -5869,12 +5914,36 @@ def _restore_daily_buy_notional_from_hist(username: str) -> None:
         pass
 
 
-def _load_today_daily_stats(current_user: str) -> tuple:
-    """당일 일일 손익·거래 횟수를 user_result 또는 user_hist에서 조회. (daily_pnl, daily_trades) 또는 (None, None)."""
+def _load_today_daily_stats(current_user: str, env_dv: Optional[str] = None) -> tuple:
+    """
+    당일 일일 손익·거래 횟수 조회.
+    - env_dv 미지정: 기존 동작(user_result 우선, 없으면 user_hist)
+    - env_dv 지정: 해당 환경(demo/real)의 user_hist만 집계(모의/실전 오염 방지)
+    """
     if not current_user:
         return (None, None)
     tz = timezone(timedelta(hours=9))
     today = datetime.now(tz).strftime("%Y%m%d")
+    env_filter = str(env_dv or "").strip().lower()
+    if env_filter:
+        try:
+            from user_hist_store import get_user_hist_store
+            hist = get_user_hist_store()
+            if hist and getattr(hist, "enabled", False):
+                rows = hist.get_trades(current_user, today, today) or []
+                rows = [t for t in rows if str(t.get("env_dv") or "").strip().lower() == env_filter]
+                if not rows:
+                    return (0.0, 0)
+                daily_pnl = sum(
+                    float(t.get("pnl") or 0)
+                    for t in rows
+                    if (t.get("order_type") or "").strip().lower() == "sell" and t.get("pnl") is not None
+                )
+                daily_trades = sum(1 for t in rows if (t.get("order_type") or "").strip().lower() == "buy")
+                return (daily_pnl, daily_trades)
+        except Exception:
+            pass
+        return (0.0, 0)
     try:
         store = _get_user_result_store()
         if store and store.enabled:
@@ -5907,14 +5976,16 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
         # 시스템 중지 상태에서도 DB( user_result / user_hist ) 기준 당일 손익·거래 횟수 표시
         daily_pnl, daily_trades = 0, 0
         try:
-            pnl, cnt = _load_today_daily_stats(current_user)
+            env_dv = "demo" if getattr(state, "is_paper_trading", True) else "real"
+            pnl, cnt = _load_today_daily_stats(current_user, env_dv=env_dv)
             if pnl is not None and cnt is not None:
                 daily_pnl, daily_trades = float(pnl), int(cnt)
         except Exception:
             pass
         dbn_stop = 0.0
         try:
-            n = _load_today_daily_buy_notional(current_user)
+            env_dv = "demo" if getattr(state, "is_paper_trading", True) else "real"
+            n = _load_today_daily_buy_notional(current_user, env_dv=env_dv)
             if n is not None:
                 dbn_stop = float(n)
         except Exception:
@@ -5979,7 +6050,8 @@ async def get_system_status(current_user: str = Depends(get_current_user)):
     try:
         rm = state.risk_manager
         if float(getattr(rm, "daily_pnl", 0) or 0) == 0:
-            pnl, cnt = _load_today_daily_stats(current_user)
+            env_dv = "demo" if getattr(state, "is_paper_trading", True) else "real"
+            pnl, cnt = _load_today_daily_stats(current_user, env_dv=env_dv)
             if pnl is not None:
                 rm.daily_pnl = float(pnl)
                 # 거래 횟수는 이미 값이 있으면 유지, 없으면 DB 기준으로 채움
@@ -6295,7 +6367,8 @@ async def _do_start_system(username: str) -> tuple:
 
         # 시작 시 당일 손익·거래 횟수 복원(초기화로 0이 된 값은 DB/거래내역 기준으로 합산 유지)
         try:
-            pnl, cnt = _load_today_daily_stats(username)
+            env_dv = "demo" if getattr(state, "is_paper_trading", True) else "real"
+            pnl, cnt = _load_today_daily_stats(username, env_dv=env_dv)
             if pnl is not None and cnt is not None:
                 state.risk_manager.daily_pnl = float(pnl)
                 state.risk_manager.daily_trades = int(cnt)
@@ -6682,7 +6755,10 @@ async def get_positions(current_user: str = Depends(get_current_user)):
 @app.get("/api/trades")
 async def get_trades(limit: int = 50, current_user: str = Depends(get_current_user)):
     """거래 내역 조회 (메모리, 최근 limit건)"""
-    return JSONResponse(state.trade_history[-limit:])
+    env_dv = "demo" if getattr(state, "is_paper_trading", True) else "real"
+    history = getattr(state, "trade_history", []) or []
+    filtered = [t for t in history if str(t.get("env_dv") or "").strip().lower() == env_dv]
+    return JSONResponse(filtered[-limit:])
 
 
 @app.get("/api/trades/system")
@@ -6693,6 +6769,7 @@ async def get_trades_system(
 ):
     """매매 시스템 거래내역: DB(quant_trading_user_hist) 또는 메모리. 미지정 시 오늘."""
     tz = timezone(timedelta(hours=9))
+    env_dv = "demo" if getattr(state, "is_paper_trading", True) else "real"
     today = datetime.now(tz).strftime("%Y%m%d")
     d_from = date_from or today
     d_to = date_to or today
@@ -6705,6 +6782,7 @@ async def get_trades_system(
             pass
         if store and store.enabled:
             rows = store.get_trades(current_user, d_from, d_to)
+            rows = [r for r in rows if str(r.get("env_dv") or "").strip().lower() == env_dv]
             if rows:
                 # timestamp 필드로 정렬 (최신 먼저)
                 for r in rows:
@@ -6714,6 +6792,7 @@ async def get_trades_system(
                 return JSONResponse(rows)
         # fallback: 메모리에서 해당 기간만
         history = getattr(state, "trade_history", []) or []
+        history = [t for t in history if str(t.get("env_dv") or "").strip().lower() == env_dv]
         out = []
         for t in history:
             ts = (t.get("timestamp") or "")
@@ -7049,7 +7128,7 @@ async def get_trades_account(
             return None
 
         cols = list(df1.columns)
-        rows = []
+        raw_rows = []
         for _, r in df1.iterrows():
             row = {c: _to_native(r.get(c)) for c in cols}
             ccld_qty = _pick(row, "ccld_qty", "CCLD_QTY", "tot_ccld_qty", "TOT_CCLD_QTY", "ccld_qty_tot", "CCLD_QTY_TOT")
@@ -7057,7 +7136,79 @@ async def get_trades_account(
                 row["ccld_qty"] = ccld_qty
             elif _pick(row, "ord_qty", "ORD_QTY") is not None:
                 row["ccld_qty"] = _pick(row, "ord_qty", "ORD_QTY")
-            rows.append(row)
+            raw_rows.append(row)
+
+        def _to_int(v):
+            try:
+                if v is None or v == "":
+                    return 0
+                return int(float(str(v).replace(",", "")))
+            except Exception:
+                return 0
+
+        def _to_float(v):
+            try:
+                if v is None or v == "":
+                    return 0.0
+                return float(str(v).replace(",", ""))
+            except Exception:
+                return 0.0
+
+        # 계좌 거래내역에 "매도 실현손익(세전, 추정)"을 보강한다.
+        # - 당일 체결행을 시각순으로 정렬
+        # - 종목별 FIFO(선입선출)로 매도 체결 수량을 매수 lot와 매칭
+        # - 분할체결/부분매도에도 일관된 내부 산출값 제공
+        rows = list(raw_rows)
+        rows.sort(
+            key=lambda x: (
+                str(_pick(x, "ord_dt", "ORD_DT") or ""),
+                str(_pick(x, "ord_tmd", "ORD_TMD") or ""),
+                str(_pick(x, "odno", "ODNO", "ord_no", "ORD_NO") or ""),
+            )
+        )
+        buy_lots_by_code = {}
+        for row in rows:
+            code = str(_pick(row, "pdno", "PDNO") or "").strip()
+            side_cd = str(_pick(row, "sll_buy_dvsn_cd", "SLL_BUY_DVSN_CD") or "").strip()
+            qty = _to_int(_pick(row, "ccld_qty", "CCLD_QTY", "tot_ccld_qty", "TOT_CCLD_QTY", "ord_qty", "ORD_QTY"))
+            price = _to_float(_pick(row, "avg_prvs", "AVG_PRC", "ccld_unpr", "CCLD_UNPR", "ord_unpr", "ORD_UNPR"))
+
+            row["calc_side"] = "buy" if side_cd == "02" else ("sell" if side_cd == "01" else "")
+            row["calc_qty"] = qty
+            row["calc_price"] = price
+            row["calc_avg_buy_price"] = None
+            row["calc_realized_pnl_gross"] = None
+
+            if not code or qty <= 0 or price <= 0:
+                continue
+
+            if side_cd == "02":
+                buy_lots_by_code.setdefault(code, []).append({"qty": qty, "price": price})
+                continue
+
+            if side_cd != "01":
+                continue
+
+            lots = buy_lots_by_code.setdefault(code, [])
+            remain = qty
+            matched_qty = 0
+            matched_cost = 0.0
+            realized = 0.0
+            while remain > 0 and lots:
+                lot = lots[0]
+                m = min(remain, int(lot["qty"]))
+                buy_px = float(lot["price"])
+                matched_qty += m
+                matched_cost += buy_px * m
+                realized += (price - buy_px) * m
+                lot["qty"] = int(lot["qty"]) - m
+                remain -= m
+                if lot["qty"] <= 0:
+                    lots.pop(0)
+
+            if matched_qty > 0:
+                row["calc_avg_buy_price"] = matched_cost / matched_qty
+                row["calc_realized_pnl_gross"] = realized
         return JSONResponse({"rows": rows, "date": inqr_date})
     except Exception as e:
         logger.warning("get_trades_account failed: %s", e, exc_info=True)
@@ -7190,6 +7341,8 @@ def _today_trades_from_user_hist(current_user: str) -> list:
         tz = timezone(timedelta(hours=9))
         today_yyyymmdd = datetime.now(tz).strftime("%Y%m%d")
         rows = hist.get_trades(current_user, today_yyyymmdd, today_yyyymmdd)
+        env_dv = "demo" if getattr(state, "is_paper_trading", True) else "real"
+        rows = [r for r in rows if str(r.get("env_dv") or "").strip().lower() == env_dv]
         if not rows:
             return []
         today_trades = []
@@ -7227,7 +7380,8 @@ def _get_today_daily_row(current_user: str) -> Optional[dict]:
     if store and store.enabled:
         rows = store.query_range(current_user, today_yyyymmdd, today_yyyymmdd)
     if not rows:
-        rows = _daily_rows_from_user_hist(current_user, today_yyyymmdd, today_yyyymmdd)
+        env_dv = "demo" if getattr(state, "is_paper_trading", True) else "real"
+        rows = _daily_rows_from_user_hist(current_user, today_yyyymmdd, today_yyyymmdd, env_dv=env_dv)
     if not rows:
         return None
     r = rows[0]
@@ -7337,7 +7491,7 @@ async def get_performance_store_status(current_user: str = Depends(get_current_u
     })
 
 
-def _daily_rows_from_user_hist(username: str, date_from: str, date_to: str) -> list:
+def _daily_rows_from_user_hist(username: str, date_from: str, date_to: str, env_dv: Optional[str] = None) -> list:
     """quant_trading_user_hist를 일자별로 집계해 일별 성과 형태의 리스트 반환. (user_result 비었을 때 보강용)"""
     try:
         from user_hist_store import get_user_hist_store
@@ -7345,6 +7499,9 @@ def _daily_rows_from_user_hist(username: str, date_from: str, date_to: str) -> l
         if not hist or not getattr(hist, "enabled", False):
             return []
         all_rows = hist.get_trades(username, date_from, date_to)
+        env_filter = str(env_dv or "").strip().lower()
+        if env_filter:
+            all_rows = [r for r in all_rows if str(r.get("env_dv") or "").strip().lower() == env_filter]
         if not all_rows:
             return []
         # 일자별로 그룹화: pnl(매도만), trade_count(매수 건수), wins, losses, gross_profit, gross_loss
@@ -7410,7 +7567,8 @@ async def get_performance_daily(
         if store and store.enabled:
             rows = store.query_range(current_user, date_from, date_to)
         if not rows:
-            rows = _daily_rows_from_user_hist(current_user, date_from, date_to)
+            env_dv = "demo" if getattr(state, "is_paper_trading", True) else "real"
+            rows = _daily_rows_from_user_hist(current_user, date_from, date_to, env_dv=env_dv)
             if rows:
                 source = "user_hist"
         # Decimal 등 JSON 비호환 타입 제거 + equity 기준 pnl/return_pct 보정(대시보드 0 표시 방지)
@@ -7650,7 +7808,8 @@ async def get_performance_period_stats(
         if store and store.enabled:
             rows = store.query_range(current_user, date_from, date_to)
         if not rows:
-            rows = _daily_rows_from_user_hist(current_user, date_from, date_to)
+            env_dv = "demo" if getattr(state, "is_paper_trading", True) else "real"
+            rows = _daily_rows_from_user_hist(current_user, date_from, date_to, env_dv=env_dv)
         stats = _period_stats_from_daily_rows(rows, date_from, date_to)
         return JSONResponse({"success": True, "period_stats": stats})
     except Exception as e:
