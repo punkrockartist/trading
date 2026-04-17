@@ -408,6 +408,7 @@ class RiskManager:
                 "odno": str(odno or "").strip(),
                 "reason": str(reason or ""),
                 "sell_trigger_code": str(sell_trigger_code or "").strip() if str(side).lower() == "sell" else "",
+                "reconciled_ccld_qty": 0,
             }
 
     def clear_pending_order(self, stock_code: str, side: Optional[str] = None) -> None:

@@ -1848,8 +1848,9 @@ def _extract_exec_from_ccld_df(df, fallback_qty: int, fallback_px: float) -> dic
     """체결조회 output1에서 체결수량/가격을 최대한 안전하게 추정.
 
     한국투자 일별체결조회는 동일 주문(ODNO)에 대해 행별 `CCLD_QTY`(분할체결 1건)와
-    주문 누적 `TOT_CCLD_QTY`가 함께 올 수 있다. 첫 행의 `CCLD_QTY`만 보면 1주로
-    착각하는 경우가 있어, 누적 합계 필드를 우선하고 없으면 행별 체결량을 합산한다.
+    주문 누적 `TOT_CCLD_QTY`가 함께 올 수 있다. `TOT_*`는 행마다 갱신되므로 **첫 행만**
+    보면 분할 체결 직후 누적(예: 8주)만 잡히고 실제 누적(33주)과 어긋날 수 있어,
+    모든 행에서 `TOT_CCLD_QTY`의 **최댓값**을 쓴다. `TOT`이 없으면 행별 체결량 합산.
     """
     qty_keys_total = [
         "TOT_CCLD_QTY",
@@ -1883,22 +1884,31 @@ def _extract_exec_from_ccld_df(df, fallback_qty: int, fallback_px: float) -> dic
             return {"qty": int(fallback_qty or 0), "px": float(fallback_px or 0.0), "fields": {}}
         row0 = rows[0]
 
-        tot_qty = _to_int(_pick_first(row0, qty_keys_total), 0)
-        if tot_qty > 0:
-            qty = tot_qty
-            px = _to_float(_pick_first(row0, px_keys), float(fallback_px or 0.0))
-            if px <= 0:
-                px = float(fallback_px or 0.0)
-            return {"qty": int(qty), "px": float(px), "fields": row0, "columns": list(df.columns)}
-
         sum_q = 0
         w_px = 0.0
+        max_tot = 0
+        best_tot_row = row0
         for r in rows:
+            tq = _to_int(_pick_first(r, qty_keys_total), 0)
+            if tq > max_tot:
+                max_tot = tq
+                best_tot_row = r
             cq = _to_int(_pick_first(r, qty_keys_line), 0)
             pq = _to_float(_pick_first(r, px_keys), 0.0)
             if cq > 0 and pq > 0:
                 sum_q += cq
                 w_px += cq * pq
+
+        if max_tot > 0:
+            qty = max_tot
+            if sum_q > 0:
+                px = w_px / sum_q
+            else:
+                px = _to_float(_pick_first(best_tot_row, px_keys), float(fallback_px or 0.0))
+            if px <= 0:
+                px = float(fallback_px or 0.0)
+            return {"qty": int(qty), "px": float(px), "fields": best_tot_row, "columns": list(df.columns)}
+
         if sum_q > 0:
             qty = sum_q
             px = w_px / sum_q
@@ -1922,8 +1932,8 @@ def _reconcile_pending_orders_sync(max_per_run: int = 5, min_check_interval_sec:
     """
     pending 주문을 조회해 체결되었으면 포지션/거래내역 반영 이벤트를 생성.
     - 실제 I/O(inquire_daily_ccld) 포함: asyncio.to_thread로 호출되어야 함.
-    - 부분 체결: 체결 조회의 exec_qty/exec_px만 반영. RiskManager.update_position이
-      부분 매도 시 남은 수량 유지하므로 부분 체결은 정상 처리됨.
+    - 분할 체결: 체결조회의 누적 체결 수량과 pending의 reconciled_ccld_qty 차이만
+      포지션에 반영하고, 주문 수량(quantity)만큼 채워질 때까지 pending을 유지한다.
     """
     events: List[dict] = []
     try:
@@ -2067,31 +2077,41 @@ def _reconcile_pending_orders_sync(max_per_run: int = 5, min_check_interval_sec:
                 continue
 
             exec_info = _extract_exec_from_ccld_df(df_filled, fallback_qty=qty_fallback, fallback_px=px_fallback)
-            exec_qty = int(exec_info.get("qty") or 0)
+            exec_qty_total = int(exec_info.get("qty") or 0)
             exec_px = float(exec_info.get("px") or 0.0)
 
-            if exec_qty <= 0 or exec_px <= 0:
+            if exec_qty_total <= 0 or exec_px <= 0:
                 checked += 1
                 continue
 
-            # ODNO 없이 접수된 pending: 동일 종목 다건 혼동 방지 — 수량·가격 일치 검증
+            ord_qty = _to_int(item.get("quantity"), 0)
+            if ord_qty > 0 and exec_qty_total > ord_qty:
+                exec_qty_total = ord_qty
+
+            already = _to_int(item.get("reconciled_ccld_qty"), 0)
+            delta = exec_qty_total - already
+            if delta <= 0:
+                checked += 1
+                continue
+
+            # ODNO 없이 접수된 pending: 동일 종목 다건 혼동 방지 — 누적 체결이 주문 수량을 넘지 않게
             if odno_orig_empty:
-                if exec_qty != qty_fallback:
+                if qty_fallback > 0 and exec_qty_total > qty_fallback:
                     checked += 1
                     continue
                 if px_fallback > 0 and abs(exec_px - px_fallback) / px_fallback > 0.05:
                     checked += 1
                     continue
 
-            # 포지션 반영
+            # 포지션 반영 (이번 주기 신규 체결분만)
             pnl = None
             try:
                 if side == "buy":
                     # 추가 매수(동일 종목 누적)도 반영해야 MTS 잔고와 일치함
-                        rm.update_position(stock_code, exec_px, exec_qty, "buy")
+                    rm.update_position(stock_code, exec_px, delta, "buy")
                 else:
                     if stock_code in getattr(rm, "positions", {}):
-                        pnl = rm.update_position(stock_code, exec_px, exec_qty, "sell")
+                        pnl = rm.update_position(stock_code, exec_px, delta, "sell")
                     else:
                         # 포지션이 없으면 반영 불가: pending만 제거하지 않고 유지(운영자가 확인)
                         checked += 1
@@ -2100,20 +2120,33 @@ def _reconcile_pending_orders_sync(max_per_run: int = 5, min_check_interval_sec:
                 checked += 1
                 continue
 
-            # pending clear
-            try:
-                if hasattr(rm, "clear_pending_order"):
-                    rm.clear_pending_order(stock_code, side=side)
-                else:
+            fully_done = (ord_qty > 0 and exec_qty_total >= ord_qty) if ord_qty > 0 else True
+            if fully_done:
+                try:
+                    if hasattr(rm, "clear_pending_order"):
+                        rm.clear_pending_order(stock_code, side=side)
+                    else:
+                        pending.pop(key, None)
+                except Exception:
                     pending.pop(key, None)
-            except Exception:
-                pending.pop(key, None)
+            else:
+                try:
+                    item["reconciled_ccld_qty"] = int(exec_qty_total)
+                    if lock:
+                        with lock:
+                            pending[key] = item
+                    else:
+                        pending[key] = item
+                except Exception:
+                    pass
 
             events.append({
                 "kind": "pending_filled",
                 "stock_code": stock_code,
                 "side": side,
-                "qty": exec_qty,
+                "qty": delta,
+                "qty_cumulative": exec_qty_total,
+                "qty_order": ord_qty if ord_qty > 0 else None,
                 "px": exec_px,
                 "pnl": pnl,
                 "env_dv": env_dv,
@@ -2411,6 +2444,8 @@ async def _pending_order_reconciler_loop():
                         side = str(ev.get("side") or "").lower()
                         code = str(ev.get("stock_code") or "").strip().zfill(6)
                         qty = int(ev.get("qty") or 0)
+                        qty_cum = int(ev.get("qty_cumulative") or qty)
+                        qty_ord = ev.get("qty_order")
                         px = float(ev.get("px") or 0.0)
                         odno = str(ev.get("odno") or "").strip()
                         env_dv = str(ev.get("env_dv") or "-")
@@ -2419,7 +2454,17 @@ async def _pending_order_reconciler_loop():
                         _rec_tc = ""
                         if side == "sell":
                             _rec_tc = str(ev.get("sell_trigger_code") or "").strip() or SELL_TRIG_RECONCILE_PENDING_FILL
-                        _rec_msg = f"주문 체결 확인 | {side.upper()} {code} qty={qty} px={px:,.0f} env={env_dv} odno={odno or '-'}"
+                        _ord_part = ""
+                        try:
+                            if qty_ord is not None and int(qty_ord) > 0:
+                                _ord_part = f" 주문={int(qty_ord)}"
+                        except Exception:
+                            _ord_part = ""
+                        _rec_msg = (
+                            f"주문 체결 확인 | {side.upper()} {code} "
+                            f"이번반영={qty} 누적체결={qty_cum}{_ord_part} "
+                            f"px={px:,.0f} env={env_dv} odno={odno or '-'}"
+                        )
                         if side == "sell":
                             _rec_msg += f" | 매도트리거={_rec_tc} | 매도사유=체결확인(지연)"
                         await state.broadcast({
