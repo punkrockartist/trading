@@ -1543,6 +1543,29 @@ def get_dashboard_html(username: str) -> str:
                             <label>이탈률 상한(%): <code class="setting-var">sap_deviation_max_pct</code></label>
                             <input type="number" id="sap_deviation_max_pct" value="3" step="0.5" min="0.5" max="20">
                         </div>
+                        <div class="form-group">
+                            <label style="display:flex; align-items:center; gap:8px;">
+                                <input type="checkbox" id="sideways_be_exit_enabled">
+                                횡보 구간 본전/소폭익절 청산 <code class="setting-var">sideways_be_exit_enabled</code>
+                            </label>
+                            <div class="hint">진입 후 일정 시간 경과 + 박스권(낮은 range)일 때, 진입가보다 조금 높아지면 청산합니다.</div>
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>최소 보유 시간(초): <code class="setting-var">sideways_be_hold_seconds</code></label>
+                            <input type="number" id="sideways_be_hold_seconds" value="180" min="0" max="7200" step="10">
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>본전 청산 버퍼(%): <code class="setting-var">sideways_be_buffer_ratio</code></label>
+                            <input type="number" id="sideways_be_buffer_pct" value="0.05" min="0" max="2" step="0.01">
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>횡보 판정 lookback(틱): <code class="setting-var">sideways_be_range_lookback_ticks</code></label>
+                            <input type="number" id="sideways_be_range_lookback_ticks" value="24" min="5" max="300">
+                        </div>
+                        <div class="form-group" style="margin-left:12px;">
+                            <label>횡보 판정 최대 range(%): <code class="setting-var">sideways_be_max_range_ratio</code></label>
+                            <input type="number" id="sideways_be_max_range_pct" value="0.12" min="0" max="5" step="0.01">
+                        </div>
                         <details>
                             <summary>레거시(합산 손실 한도)</summary>
                             <div class="form-group">
@@ -1621,6 +1644,9 @@ def get_dashboard_html(username: str) -> str:
                                 <option value="scalp_morning_balanced">오전 단타(밸런스)</option>
                                 <option value="scalp_morning_strict">오전 단타(엄격)</option>
                                 <option value="scalp_light">단타(가벼움)</option>
+                            </optgroup>
+                            <optgroup label="진입 완화 (기존 설정 유지)">
+                                <option value="trend_relaxed">연속상승·강세 체감 시 (007660 유형)</option>
                             </optgroup>
                         </select>
                         <div class="hint" style="margin-top:8px;">
@@ -3103,15 +3129,23 @@ API: POST /api/config/risk|strategy|stock-selection|operational
             if (hdr && !String(hdr.textContent || '').includes('읽기 전용')) {{
                 hdr.textContent = `${{String(hdr.textContent || '').trim()}} · guest(읽기 전용)`;
             }}
-            document.querySelectorAll('.tab[data-tab="settings"], .tab[data-tab="ai-report"]').forEach(el => {{
+            // 설정 탭은 열람 가능(visible), 대신 입력/저장은 비활성화.
+            const settingsRoot = document.getElementById('tab-settings');
+            if (settingsRoot) {{
+                settingsRoot.querySelectorAll('input, select, textarea, button').forEach(el => {{
+                    el.disabled = true;
+                }});
+            }}
+            // AI 리포트 탭은 기존 정책 유지(비노출)
+            document.querySelectorAll('.tab[data-tab="ai-report"]').forEach(el => {{
                 el.style.display = 'none';
             }});
         }}
 
         function showTab(tabName) {{
-            if (IS_GUEST_USER && (tabName === 'settings' || tabName === 'ai-report')) {{
+            if (IS_GUEST_USER && tabName === 'ai-report') {{
                 guardGuestReadonly('해당 탭 접근');
-                tabName = 'dashboard';
+                tabName = 'status';
             }}
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
@@ -4668,14 +4702,23 @@ API: POST /api/config/risk|strategy|stock-selection|operational
 
             rows.forEach(t => {{
                 const ts = t.timestamp || (t.date && t.time ? t.date.replace(/(\\d{{4}})(\\d{{2}})(\\d{{2}})/, '$1-$2-$3') + 'T' + (t.time || '000000').replace(/(\\d{{2}})(\\d{{2}})(\\d{{2}})/, '$1:$2:$3') : '');
+                const acceptedTs = (t.accepted_timestamp || '').toString().trim();
                 const reason = (t.reason || '').toString().trim() || '-';
                 const pnl = t.pnl != null ? formatNumber(t.pnl) + '원' : '-';
                 const stockLabel = _stockLabelFromTrade(t);
                 const normStatus = _systemTradeNormStatus(t);
                 const statusLabel = _systemTradeStatusLabel(normStatus);
+                const filledTime = ts ? new Date(ts).toLocaleTimeString() : '-';
+                const acceptedTime = acceptedTs ? new Date(acceptedTs).toLocaleTimeString() : '';
+                const timeCell = (acceptedTime && normStatus === 'filled' && acceptedTime !== filledTime)
+                    ? `${{acceptedTime}} → ${{filledTime}}`
+                    : filledTime;
+                const timeTitle = (acceptedTime && normStatus === 'filled' && acceptedTime !== filledTime)
+                    ? `접수: ${{acceptedTime}}, 체결: ${{filledTime}}`
+                    : '';
                 const row = document.createElement('tr');
                 row.innerHTML = `
-                    <td>${{ts ? new Date(ts).toLocaleTimeString() : '-'}}</td>
+                    <td title="${{timeTitle}}">${{timeCell}}</td>
                     <td>${{stockLabel}}</td>
                     <td style="color:${{statusLabel.startsWith('접수') ? 'var(--muted)' : 'var(--text)'}};">${{statusLabel}}</td>
                     <td>${{(t.order_type || '').toLowerCase() === 'buy' ? '매수' : '매도'}}</td>
@@ -4689,9 +4732,30 @@ API: POST /api/config/risk|strategy|stock-selection|operational
         }}
 
         function addTradeToHistory(trade) {{
-            // 실시간 trade 이벤트도 필터 대상이므로 배열에 누적 후 렌더
+            // 실시간 trade 이벤트도 필터 대상이므로 배열에 누적(동일 주문은 upsert) 후 렌더
             try {{
-                systemTradeRows = [trade, ...(systemTradeRows || [])];
+                const next = Array.isArray(systemTradeRows) ? [...systemTradeRows] : [];
+                const code = (trade?.stock_code || '').toString().trim();
+                const side = (trade?.order_type || '').toString().toLowerCase();
+                const status = (trade?.order_status || trade?.status || '').toString().toLowerCase();
+                const odno = (trade?.odno || '').toString().trim();
+                let merged = false;
+                if (status === 'filled' && code && side) {{
+                    for (let i = 0; i < next.length; i++) {{
+                        const prev = next[i] || {{}};
+                        const pCode = (prev.stock_code || '').toString().trim();
+                        const pSide = (prev.order_type || '').toString().toLowerCase();
+                        const pStatus = (prev.order_status || prev.status || '').toString().toLowerCase();
+                        const pOdno = (prev.odno || '').toString().trim();
+                        if (pCode !== code || pSide !== side || pStatus !== 'accepted_pending') continue;
+                        if (odno && pOdno && odno !== pOdno) continue;
+                        next[i] = {{ ...prev, ...trade, accepted_timestamp: prev.timestamp || prev.accepted_timestamp || '' }};
+                        merged = true;
+                        break;
+                    }}
+                }}
+                if (!merged) next.unshift(trade);
+                systemTradeRows = next;
                 if (systemTradeRows.length > 500) systemTradeRows = systemTradeRows.slice(0, 500);
             }} catch (e) {{}}
             updateSystemTradeFilters();
@@ -5084,6 +5148,11 @@ API: POST /api/config/risk|strategy|stock-selection|operational
                     if (risk.atr_ratio_max_pct != null) document.getElementById('atr_ratio_max_pct').value = risk.atr_ratio_max_pct;
                     if (risk.sap_deviation_filter_enabled != null) document.getElementById('sap_deviation_filter_enabled').checked = !!risk.sap_deviation_filter_enabled;
                     if (risk.sap_deviation_max_pct != null) document.getElementById('sap_deviation_max_pct').value = risk.sap_deviation_max_pct;
+                    if (risk.sideways_be_exit_enabled != null) {{ const el = document.getElementById('sideways_be_exit_enabled'); if (el) el.checked = !!risk.sideways_be_exit_enabled; }}
+                    if (risk.sideways_be_hold_seconds != null) {{ const el = document.getElementById('sideways_be_hold_seconds'); if (el) el.value = risk.sideways_be_hold_seconds; }}
+                    if (risk.sideways_be_buffer_ratio != null) {{ const el = document.getElementById('sideways_be_buffer_pct'); if (el) el.value = (Number(risk.sideways_be_buffer_ratio) * 100).toFixed(2); }}
+                    if (risk.sideways_be_range_lookback_ticks != null) {{ const el = document.getElementById('sideways_be_range_lookback_ticks'); if (el) el.value = risk.sideways_be_range_lookback_ticks; }}
+                    if (risk.sideways_be_max_range_ratio != null) {{ const el = document.getElementById('sideways_be_max_range_pct'); if (el) el.value = (Number(risk.sideways_be_max_range_ratio) * 100).toFixed(2); }}
                     if (risk.trailing_stop_ratio != null) document.getElementById('trailing_stop_pct').value = (risk.trailing_stop_ratio * 100).toFixed(1);
                     if (risk.trailing_activation_ratio != null) document.getElementById('trailing_activation_pct').value = (risk.trailing_activation_ratio * 100).toFixed(1);
                     if (risk.partial_take_profit_ratio != null) document.getElementById('partial_tp_pct').value = (risk.partial_take_profit_ratio * 100).toFixed(1);
@@ -5347,6 +5416,11 @@ API: POST /api/config/risk|strategy|stock-selection|operational
                     atr_ratio_max_pct: parseFloat(document.getElementById('atr_ratio_max_pct')?.value) || 0,
                     sap_deviation_filter_enabled: !!document.getElementById('sap_deviation_filter_enabled')?.checked,
                     sap_deviation_max_pct: parseFloat(document.getElementById('sap_deviation_max_pct')?.value) || 3,
+                    sideways_be_exit_enabled: !!document.getElementById('sideways_be_exit_enabled')?.checked,
+                    sideways_be_hold_seconds: Math.max(0, Math.min(7200, parseInt(document.getElementById('sideways_be_hold_seconds')?.value, 10) || 180)),
+                    sideways_be_buffer_ratio: (parseFloat(document.getElementById('sideways_be_buffer_pct')?.value) || 0) / 100,
+                    sideways_be_range_lookback_ticks: Math.max(5, Math.min(300, parseInt(document.getElementById('sideways_be_range_lookback_ticks')?.value, 10) || 24)),
+                    sideways_be_max_range_ratio: (parseFloat(document.getElementById('sideways_be_max_range_pct')?.value) || 0) / 100,
                     max_trades_per_day: parseInt(document.getElementById('max_trades_per_day')?.value) || 12,
                     max_trades_per_stock_per_day: parseInt(document.getElementById('max_trades_per_stock_per_day')?.value) || 0,
                     max_positions_count: parseInt(document.getElementById('max_positions_count')?.value) || 0,
@@ -5562,6 +5636,44 @@ API: POST /api/config/risk|strategy|stock-selection|operational
                         document.getElementById('long_ma_period').value = 21;
                     }}
                     addLog('MA 프리셋 적용: ' + n, 'info');
+                    await updateStrategyConfig();
+                    updateSettingsSummaries();
+                    return;
+                }}
+
+                // 연속 상승 종목이 ENTRY_CAND는 뜨는데 slope/모멘텀/보강/분봉추세에서 막히는 경우 — MA·매수창은 유지하고 진입 필터만 완화
+                if (n === 'trend_relaxed') {{
+                    const ids = [
+                        'min_short_ma_slope_pct', 'momentum_lookback_ticks', 'min_momentum_pct',
+                        'entry_confirm_enabled', 'entry_confirm_min_count',
+                        'confirm_trade_value_surge_enabled', 'trade_value_surge_lookback_ticks', 'trade_value_surge_ratio',
+                        'minute_trend_enabled', 'minute_trend_lookback_bars', 'minute_trend_min_green_bars',
+                        'minute_trend_mode', 'minute_trend_early_only',
+                        'early_min_short_ma_slope_pct', 'early_momentum_lookback_ticks', 'early_min_momentum_pct',
+                    ];
+                    for (const id of ids) {{
+                        if (!document.getElementById(id)) {{
+                            addLog('trend_relaxed: UI 필드 없음: ' + id, 'warning');
+                            return;
+                        }}
+                    }}
+                    document.getElementById('min_short_ma_slope_pct').value = 0.015;
+                    document.getElementById('momentum_lookback_ticks').value = 8;
+                    document.getElementById('min_momentum_pct').value = 0.15;
+                    document.getElementById('entry_confirm_enabled').checked = true;
+                    document.getElementById('entry_confirm_min_count').value = 1;
+                    document.getElementById('confirm_trade_value_surge_enabled').checked = true;
+                    document.getElementById('trade_value_surge_lookback_ticks').value = 20;
+                    document.getElementById('trade_value_surge_ratio').value = 2.5;
+                    document.getElementById('minute_trend_enabled').checked = true;
+                    document.getElementById('minute_trend_lookback_bars').value = 2;
+                    document.getElementById('minute_trend_min_green_bars').value = 1;
+                    document.getElementById('minute_trend_mode').value = 'higher_close';
+                    document.getElementById('minute_trend_early_only').checked = false;
+                    document.getElementById('early_min_short_ma_slope_pct').value = 0.015;
+                    document.getElementById('early_momentum_lookback_ticks').value = 8;
+                    document.getElementById('early_min_momentum_pct').value = 0.22;
+                    addLog('전략 프리셋 trend_relaxed: slope 0.015%/틱, 모멘텀 0.15%, 보강 1/1, 분봉추세 완화(2봉·1충족·higher_close), 거래대금급증 2.5배', 'info');
                     await updateStrategyConfig();
                     updateSettingsSummaries();
                     return;

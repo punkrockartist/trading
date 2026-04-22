@@ -2482,6 +2482,7 @@ async def _pending_order_reconciler_loop():
                             "reason": "체결확인",
                             "order_status": "filled",
                             "env_dv": env_dv,
+                            "odno": odno or "",
                         }
                         if side == "sell":
                             trade_info["sell_trigger_code"] = _rec_tc
@@ -2713,6 +2714,16 @@ def _apply_risk_config_dict_to_state(d: dict, update_unified_risk_base: bool = T
             rm.sap_deviation_filter_enabled = bool(d.get("sap_deviation_filter_enabled", False))
         if "sap_deviation_max_pct" in d:
             rm.sap_deviation_max_pct = max(0.1, min(20.0, float(d.get("sap_deviation_max_pct") or 3.0)))
+        if "sideways_be_exit_enabled" in d:
+            rm.sideways_be_exit_enabled = bool(d.get("sideways_be_exit_enabled", False))
+        if "sideways_be_hold_seconds" in d:
+            rm.sideways_be_hold_seconds = max(0, min(7200, int(d.get("sideways_be_hold_seconds") or 180)))
+        if "sideways_be_buffer_ratio" in d:
+            rm.sideways_be_buffer_ratio = max(0.0, min(0.02, float(d.get("sideways_be_buffer_ratio") or 0.0005)))
+        if "sideways_be_range_lookback_ticks" in d:
+            rm.sideways_be_range_lookback_ticks = max(5, min(300, int(d.get("sideways_be_range_lookback_ticks") or 24)))
+        if "sideways_be_max_range_ratio" in d:
+            rm.sideways_be_max_range_ratio = max(0.0, min(0.05, float(d.get("sideways_be_max_range_ratio") or 0.0012)))
         if "max_position_size_ratio" in d:
             rm.max_position_size_ratio = float(d.get("max_position_size_ratio") or 0.1)
         if "expand_position_ratio_1_stock" in d:
@@ -4256,6 +4267,13 @@ def _handle_signal(
                 "reason": reason or "",
                 "order_status": str(details.get("status") or "accepted_pending"),
                 "env_dv": str(details.get("env_dv") or ("demo" if state.is_paper_trading else "real")),
+                "odno": str(
+                    (
+                        ((details.get("order_response") or {}).get("summary") or {}).get("odno")
+                        or details.get("odno")
+                        or ""
+                    )
+                ).strip(),
             }
             if str(signal).lower() == "sell":
                 trade_info["sell_trigger_code"] = (sell_trigger_code or "").strip() or SELL_TRIG_UNKNOWN
@@ -4291,6 +4309,20 @@ def _handle_signal(
         suggested_qty = int(details.get("quantity") or 0)
     except Exception:
         suggested_qty = 0
+    executed_qty = 0
+    try:
+        executed_qty = int(details.get("executed_quantity") or 0)
+    except Exception:
+        executed_qty = 0
+    if executed_qty <= 0:
+        executed_qty = suggested_qty
+    executed_price = 0.0
+    try:
+        executed_price = float(details.get("executed_price") or 0.0)
+    except Exception:
+        executed_price = 0.0
+    if executed_price <= 0:
+        executed_price = float(price or 0.0)
     pnl_val = details.get("pnl")
     if pnl_val is not None:
         try:
@@ -4300,12 +4332,19 @@ def _handle_signal(
     trade_info = {
         "stock_code": stock_code,
         "order_type": signal,
-        "quantity": suggested_qty,
-        "price": price,
+        "quantity": executed_qty,
+        "price": executed_price,
         "pnl": pnl_val,
         "reason": reason or "",
         "order_status": str(details.get("status") or "filled"),
         "env_dv": str(details.get("env_dv") or ("demo" if state.is_paper_trading else "real")),
+        "odno": str(
+            (
+                ((details.get("order_response") or {}).get("summary") or {}).get("odno")
+                or details.get("odno")
+                or ""
+            )
+        ).strip(),
     }
     if str(signal).lower() == "sell":
         trade_info["sell_trigger_code"] = (sell_trigger_code or "").strip() or SELL_TRIG_UNKNOWN
@@ -4318,11 +4357,11 @@ def _handle_signal(
             "type": "log",
             "level": "info",
             "message": (
-                f"자동 체결: {stock_code} SELL {price:,.0f}원 | 매도트리거={_tc_f} | 매도사유={reason or '-'}"
+                f"자동 체결: {stock_code} SELL {executed_price:,.0f}원 | 매도트리거={_tc_f} | 매도사유={reason or '-'}"
             ),
         })
     else:
-        _run_async_broadcast({"type": "log", "message": f"자동 체결: {stock_code} {signal.upper()} {price:,.0f}원", "level": "info"})
+        _run_async_broadcast({"type": "log", "message": f"자동 체결: {stock_code} {signal.upper()} {executed_price:,.0f}원", "level": "info"})
 
 
 def _request_active_kis_ws_close() -> None:
@@ -8137,11 +8176,25 @@ async def update_risk_config(config: RiskConfig, current_user: str = Depends(get
             state.risk_manager.atr_ratio_max_pct = max(0.0, min(20.0, float(getattr(config, "atr_ratio_max_pct", 0) or 0)))
             state.risk_manager.sap_deviation_filter_enabled = bool(getattr(config, "sap_deviation_filter_enabled", False))
             state.risk_manager.sap_deviation_max_pct = max(0.1, min(20.0, float(getattr(config, "sap_deviation_max_pct", 3.0) or 3.0)))
+            state.risk_manager.sideways_be_exit_enabled = bool(getattr(config, "sideways_be_exit_enabled", False))
+            state.risk_manager.sideways_be_hold_seconds = max(0, min(7200, int(getattr(config, "sideways_be_hold_seconds", 180) or 180)))
+            state.risk_manager.sideways_be_buffer_ratio = max(0.0, min(0.02, float(getattr(config, "sideways_be_buffer_ratio", 0.0005) or 0.0005)))
+            state.risk_manager.sideways_be_range_lookback_ticks = max(
+                5, min(300, int(getattr(config, "sideways_be_range_lookback_ticks", 24) or 24))
+            )
+            state.risk_manager.sideways_be_max_range_ratio = max(
+                0.0, min(0.05, float(getattr(config, "sideways_be_max_range_ratio", 0.0012) or 0.0012))
+            )
         except Exception:
             state.risk_manager.atr_filter_enabled = False
             state.risk_manager.atr_ratio_max_pct = 0.0
             state.risk_manager.sap_deviation_filter_enabled = False
             state.risk_manager.sap_deviation_max_pct = 3.0
+            state.risk_manager.sideways_be_exit_enabled = False
+            state.risk_manager.sideways_be_hold_seconds = 180
+            state.risk_manager.sideways_be_buffer_ratio = 0.0005
+            state.risk_manager.sideways_be_range_lookback_ticks = 24
+            state.risk_manager.sideways_be_max_range_ratio = 0.0012
         state.risk_manager.max_trades_per_day = config.max_trades_per_day
         state.risk_manager.max_trades_per_stock_per_day = max(0, min(20, int(getattr(config, "max_trades_per_stock_per_day", 0) or 0)))
         state.risk_manager.max_position_size_ratio = float(config.max_position_size_ratio)

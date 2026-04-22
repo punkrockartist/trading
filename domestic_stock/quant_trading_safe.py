@@ -135,6 +135,12 @@ class RiskManager:
         # SAP(세션 평균가) 이탈 필터: |현재가-SAP|/SAP*100 > sap_deviation_max_pct 이면 스킵
         self.sap_deviation_filter_enabled = False
         self.sap_deviation_max_pct = 3.0
+        # 횡보 구간 본전/소폭익절 청산: 진입 후 일정 시간 경과 + 박스권일 때만 진입가 위에서 청산
+        self.sideways_be_exit_enabled = False
+        self.sideways_be_hold_seconds = 180
+        self.sideways_be_buffer_ratio = 0.0005
+        self.sideways_be_range_lookback_ticks = 24
+        self.sideways_be_max_range_ratio = 0.0012
 
         # 현재 상태 추적
         self.daily_trades = 0  # 거래 횟수 (매수+매도 = 1회)
@@ -846,6 +852,39 @@ class RiskManager:
         except Exception:
             pass
 
+        # 횡보 구간 본전/소폭익절 청산
+        # - 진입 후 hold_seconds 경과
+        # - 최근 lookback_ticks 범위가 max_range_ratio 이하(박스권)
+        # - 현재가가 (진입가 * (1 + buffer_ratio)) 이상일 때만 청산
+        try:
+            if bool(getattr(self, "sideways_be_exit_enabled", False)):
+                pos_buy_time = pos.get("buy_time")
+                hold_sec = max(0, int(getattr(self, "sideways_be_hold_seconds", 180) or 0))
+                elapsed_ok = True
+                if hold_sec > 0 and isinstance(pos_buy_time, datetime):
+                    elapsed = (datetime.now() - pos_buy_time).total_seconds()
+                    elapsed_ok = elapsed >= hold_sec
+                if elapsed_ok:
+                    lookback = max(5, min(300, int(getattr(self, "sideways_be_range_lookback_ticks", 24) or 24)))
+                    max_rr = max(0.0, min(0.05, float(getattr(self, "sideways_be_max_range_ratio", 0.0012) or 0.0012)))
+                    be_buf = max(0.0, min(0.02, float(getattr(self, "sideways_be_buffer_ratio", 0.0005) or 0.0005)))
+                    hist = self._price_history.get(stock_code) or []
+                    if len(hist) >= lookback and float(current_price) > 0:
+                        recent = hist[-lookback:]
+                        hi = max(float(p) for p in recent)
+                        lo = min(float(p) for p in recent)
+                        rr = (hi - lo) / float(current_price) if float(current_price) > 0 else 0.0
+                        be_price = trigger_base_price * (1.0 + be_buf)
+                        if rr <= max_rr and float(current_price) >= float(be_price):
+                            return {
+                                "action": "sell",
+                                "quantity": qty,
+                                "reason": "횡보 본전청산",
+                                "trigger_code": "risk_sideways_breakeven",
+                            }
+        except Exception:
+            pass
+
         return None
     
     def is_in_reentry_cooldown(self, stock_code: str) -> bool:
@@ -1223,7 +1262,66 @@ def _check_filled_order(env_dv: str, trenv, ord_dv: str, stock_code: str, odno: 
             return {"ok": True, "found": False, "rows": 0}
 
         # 체결조회는 ODNO가 없을 수도 있으니 rows만으로도 '있음' 판정
-        return {"ok": True, "found": True, "rows": int(len(df1.index)), "columns": list(df1.columns)}
+        exec_qty = 0
+        exec_px = 0.0
+        try:
+            qty_total_cols = ["TOT_CCLD_QTY", "tot_ccld_qty", "CCLD_QTY_TOT", "ccld_qty_tot"]
+            qty_line_cols = ["CCLD_QTY", "ccld_qty", "ORD_QTY", "ord_qty"]
+            px_cols = ["CCLD_UNPR", "ccld_unpr", "CCLD_PRC", "ccld_prc", "AVG_PRC", "avg_prc", "AVG_UNPR", "avg_unpr", "ORD_UNPR", "ord_unpr"]
+
+            max_tot = 0
+            sum_q = 0
+            w_px = 0.0
+            for _, row in df1.iterrows():
+                r = row.to_dict()
+                tq = 0
+                for c in qty_total_cols:
+                    try:
+                        v = r.get(c)
+                        if v not in (None, "", " "):
+                            tq = int(float(v))
+                            break
+                    except Exception:
+                        continue
+                if tq > max_tot:
+                    max_tot = tq
+
+                cq = 0
+                for c in qty_line_cols:
+                    try:
+                        v = r.get(c)
+                        if v not in (None, "", " "):
+                            cq = int(float(v))
+                            break
+                    except Exception:
+                        continue
+                cp = 0.0
+                for c in px_cols:
+                    try:
+                        v = r.get(c)
+                        if v not in (None, "", " "):
+                            cp = float(v)
+                            break
+                    except Exception:
+                        continue
+                if cq > 0 and cp > 0:
+                    sum_q += cq
+                    w_px += cq * cp
+
+            exec_qty = max_tot if max_tot > 0 else sum_q
+            if sum_q > 0:
+                exec_px = w_px / sum_q
+        except Exception:
+            exec_qty = 0
+            exec_px = 0.0
+        return {
+            "ok": True,
+            "found": True,
+            "rows": int(len(df1.index)),
+            "columns": list(df1.columns),
+            "exec_qty": int(exec_qty or 0),
+            "exec_px": float(exec_px or 0.0),
+        }
     except Exception as e:
         return {"ok": False, "found": False, "reason": str(e)}
 
@@ -1482,8 +1580,16 @@ def safe_execute_order(
                         risk_mgr.clear_pending_order(stock_code, side="buy")
                     except Exception:
                         pass
-                    risk_mgr.update_position(stock_code, price, quantity, "buy")
-                    logging.info(f"[매수 체결] {stock_code}: {price:,.0f}원, {quantity}주, 금액: {price*quantity:,.0f}원")
+                    exec_price = float(chk_filled.get("exec_px") or 0.0) if isinstance(chk_filled, dict) else 0.0
+                    exec_qty = int(chk_filled.get("exec_qty") or 0) if isinstance(chk_filled, dict) else 0
+                    if exec_price <= 0:
+                        exec_price = float(price)
+                    if exec_qty <= 0:
+                        exec_qty = int(quantity)
+                    risk_mgr.update_position(stock_code, exec_price, exec_qty, "buy")
+                    details["executed_price"] = exec_price
+                    details["executed_quantity"] = exec_qty
+                    logging.info(f"[매수 체결] {stock_code}: {exec_price:,.0f}원, {exec_qty}주, 금액: {exec_price*exec_qty:,.0f}원")
                     details["ok"] = True
                     details["status"] = "filled"
                     if return_details:
@@ -1739,8 +1845,16 @@ def safe_execute_order(
                         risk_mgr.clear_pending_order(stock_code, side="sell")
                     except Exception:
                         pass
-                    pnl = risk_mgr.update_position(stock_code, price, quantity, "sell")
-                    logging.info(f"[매도 체결] {stock_code}: {price:,.0f}원, {quantity}주, 손익: {pnl:+,.0f}원")
+                    exec_price = float(chk_filled.get("exec_px") or 0.0) if isinstance(chk_filled, dict) else 0.0
+                    exec_qty = int(chk_filled.get("exec_qty") or 0) if isinstance(chk_filled, dict) else 0
+                    if exec_price <= 0:
+                        exec_price = float(price)
+                    if exec_qty <= 0:
+                        exec_qty = int(quantity)
+                    pnl = risk_mgr.update_position(stock_code, exec_price, exec_qty, "sell")
+                    details["executed_price"] = exec_price
+                    details["executed_quantity"] = exec_qty
+                    logging.info(f"[매도 체결] {stock_code}: {exec_price:,.0f}원, {exec_qty}주, 손익: {pnl:+,.0f}원")
                     details["ok"] = True
                     details["pnl"] = pnl
                     details["status"] = "filled"

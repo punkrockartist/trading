@@ -265,7 +265,37 @@ class TradingState:
             else:
                 trade_info["stock_name"] = ""
         trade_info["timestamp"] = datetime.now().isoformat()
-        self.trade_history.append(trade_info)
+        # pending 주문이 이후 체결확인으로 들어오면 같은 주문 레코드를 갱신(append 중복 방지)
+        did_upsert = False
+        try:
+            incoming_status = str(trade_info.get("order_status") or "").strip().lower()
+            incoming_code = str(trade_info.get("stock_code") or "").strip().zfill(6)
+            incoming_side = str(trade_info.get("order_type") or "").strip().lower()
+            incoming_odno = str(trade_info.get("odno") or "").strip()
+            if incoming_status == "filled":
+                for i in range(len(self.trade_history) - 1, -1, -1):
+                    prev = self.trade_history[i] or {}
+                    prev_status = str(prev.get("order_status") or "").strip().lower()
+                    if prev_status != "accepted_pending":
+                        continue
+                    prev_code = str(prev.get("stock_code") or "").strip().zfill(6)
+                    prev_side = str(prev.get("order_type") or "").strip().lower()
+                    if prev_code != incoming_code or prev_side != incoming_side:
+                        continue
+                    prev_odno = str(prev.get("odno") or "").strip()
+                    if incoming_odno and prev_odno and incoming_odno != prev_odno:
+                        continue
+                    merged = dict(prev)
+                    merged.update(trade_info)
+                    merged["accepted_timestamp"] = prev.get("timestamp")
+                    merged["timestamp"] = trade_info["timestamp"]
+                    self.trade_history[i] = merged
+                    did_upsert = True
+                    break
+        except Exception:
+            did_upsert = False
+        if not did_upsert:
+            self.trade_history.append(trade_info)
         if len(self.trade_history) > 100:
             self.trade_history = self.trade_history[-100:]
         # DynamoDB quant_trading_user_hist 저장 (일자별 10일 보관, TTL)
@@ -395,6 +425,12 @@ class RiskConfig(BaseModel):
     atr_ratio_max_pct: float = 0.0  # 0=미적용. ATR/현재가*100 > 이 값이면 스킵 (예: 2.5)
     sap_deviation_filter_enabled: bool = False  # 세션 평균가(SAP) 대비 이탈률 상한
     sap_deviation_max_pct: float = 3.0  # |현재가-SAP|/SAP*100 > 이 값이면 스킵 (과열/과매도 구간)
+    # 횡보 구간 본전/소폭익절 청산(진입 후 일정 시간 경과 + 박스권 + 진입가 위)
+    sideways_be_exit_enabled: bool = False
+    sideways_be_hold_seconds: int = 180
+    sideways_be_buffer_ratio: float = 0.0005
+    sideways_be_range_lookback_ticks: int = 24
+    sideways_be_max_range_ratio: float = 0.0012
 
 class StockSelectionConfig(BaseModel):
     min_price_change_ratio: float
