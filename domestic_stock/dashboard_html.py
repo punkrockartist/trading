@@ -940,6 +940,16 @@ def get_dashboard_html(username: str) -> str:
                     <p style="color: var(--muted); text-align: center; padding: 20px;">집계 중...</p>
                 </div>
             </div>
+            <div class="card">
+                <div class="card-header-row">
+                    <h2>AI Shadow (읽기 전용)</h2>
+                    <button class="btn btn-inline" onclick="loadAiShadow()">새로고침</button>
+                </div>
+                <div class="hint">주문/청산 로직에는 개입하지 않고 보조 점수·경고·추천만 표시합니다.</div>
+                <div id="ai_shadow_panel" style="margin-top:10px; color:var(--text); font-size:13px; line-height:1.55;">
+                    <p style="color: var(--muted); text-align: center; padding: 20px;">집계 중...</p>
+                </div>
+            </div>
         </div>
 
         <!-- 포지션 탭 -->
@@ -4331,6 +4341,124 @@ API: POST /api/config/risk|strategy|stock-selection|operational
             `;
         }}
 
+        function _esc(v) {{
+            return String(v == null ? '' : v)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }}
+
+        const aiShadowTrend = {{
+            execution: [],
+            lossGuard: [],
+        }};
+
+        function _pushAiTrend(key, score) {{
+            const v = Number(score);
+            if (!Number.isFinite(v)) return;
+            const now = Date.now();
+            const arr = aiShadowTrend[key] || [];
+            arr.push({{ t: now, v }});
+            const cutoff = now - (10 * 60 * 1000);
+            while (arr.length && arr[0].t < cutoff) arr.shift();
+            if (arr.length > 240) arr.splice(0, arr.length - 240);
+            aiShadowTrend[key] = arr;
+        }}
+
+        function _renderSparkline(arr, color) {{
+            if (!Array.isArray(arr) || arr.length < 2) {{
+                return '<div style="color:var(--muted); font-size:12px;">데이터 수집 중...</div>';
+            }}
+            const w = 220, h = 42, pad = 4;
+            const vals = arr.map(x => Number(x.v)).filter(Number.isFinite);
+            if (vals.length < 2) return '<div style="color:var(--muted); font-size:12px;">데이터 수집 중...</div>';
+            const minV = Math.min(...vals);
+            const maxV = Math.max(...vals);
+            const span = Math.max(1, maxV - minV);
+            const points = vals.map((v, i) => {{
+                const x = pad + (i * (w - pad * 2)) / Math.max(1, vals.length - 1);
+                const y = h - pad - ((v - minV) / span) * (h - pad * 2);
+                return `${{x.toFixed(1)}},${{y.toFixed(1)}}`;
+            }}).join(' ');
+            const y30 = h - pad - ((30 - minV) / span) * (h - pad * 2);
+            const y60 = h - pad - ((60 - minV) / span) * (h - pad * 2);
+            const line30 = Number.isFinite(y30) && y30 >= 0 && y30 <= h;
+            const line60 = Number.isFinite(y60) && y60 >= 0 && y60 <= h;
+            return `
+                <svg width="${{w}}" height="${{h}}" viewBox="0 0 ${{w}} ${{h}}" style="display:block; margin-top:4px;">
+                    ${{line30 ? `<line x1="${{pad}}" y1="${{y30.toFixed(1)}}" x2="${{w - pad}}" y2="${{y30.toFixed(1)}}" stroke="var(--border)" stroke-width="1" stroke-dasharray="3 2" />` : ''}}
+                    ${{line60 ? `<line x1="${{pad}}" y1="${{y60.toFixed(1)}}" x2="${{w - pad}}" y2="${{y60.toFixed(1)}}" stroke="var(--danger)" stroke-width="1" stroke-dasharray="3 2" opacity="0.6" />` : ''}}
+                    <polyline fill="none" stroke="${{color}}" stroke-width="2" points="${{points}}" />
+                </svg>
+                <div style="display:flex; gap:10px; font-size:11px; color:var(--muted); margin-top:2px;">
+                    <span>기준선 30(주의)</span><span>60(위험)</span>
+                </div>
+            `;
+        }}
+
+        function renderAiShadow(data) {{
+            const el = document.getElementById('ai_shadow_panel');
+            if (!el) return;
+            if (!data || data.enabled === false) {{
+                el.innerHTML = '<p style="color: var(--muted); text-align:center; padding:20px;">사용 안 함</p>';
+                return;
+            }}
+            const ex = data.execution || {{}};
+            const lg = data.loss_guard || {{}};
+            const at = data.auto_tuning || {{}};
+            _pushAiTrend('execution', ex.score);
+            _pushAiTrend('lossGuard', lg.score);
+            const recs = Array.isArray(at.recommendations) ? at.recommendations : [];
+            const recHtml = recs.length
+                ? recs.slice(0, 3).map(r => (
+                    `<div style="display:flex; justify-content:space-between; gap:10px;">
+                        <span>${{_esc(r.key)}}: ${{_esc(r.current)}} → <strong>${{_esc(r.suggested)}}</strong></span>
+                        <span style="color:var(--muted);">${{_esc(r.why || '')}}</span>
+                    </div>`
+                )).join('')
+                : '<div style="color:var(--muted);">추천 없음</div>';
+            const exReasons = Array.isArray(ex.reasons) && ex.reasons.length ? ex.reasons.join(', ') : '-';
+            const lgReasons = Array.isArray(lg.reasons) && lg.reasons.length ? lg.reasons.join(', ') : '-';
+            el.innerHTML = `
+                <div style="display:grid; grid-template-columns:1fr; gap:12px;">
+                    <div style="padding:10px; border:1px solid var(--border); border-radius:var(--radius); background:var(--surface-2);">
+                        <div style="color:var(--muted); font-size:12px; margin-bottom:6px;">Execution Shadow</div>
+                        <div>risk=<strong>${{_esc(ex.level || '-')}}</strong>, score=<strong>${{_esc(ex.score ?? '-')}}</strong></div>
+                        <div>spread=${{((Number(ex.spread_ratio||0))*100).toFixed(3)}}%, range=${{((Number(ex.recent_range_ratio||0))*100).toFixed(3)}}%</div>
+                        <div style="color:var(--muted);">reasons: ${{_esc(exReasons)}}</div>
+                        ${{_renderSparkline(aiShadowTrend.execution, 'var(--primary)')}}
+                    </div>
+                    <div style="padding:10px; border:1px solid var(--border); border-radius:var(--radius); background:var(--surface-2);">
+                        <div style="color:var(--muted); font-size:12px; margin-bottom:6px;">Loss Guard Shadow</div>
+                        <div>level=<strong>${{_esc(lg.level || '-')}}</strong>, score=<strong>${{_esc(lg.score ?? '-')}}</strong></div>
+                        <div style="color:var(--muted);">reasons: ${{_esc(lgReasons)}}</div>
+                        ${{_renderSparkline(aiShadowTrend.lossGuard, 'var(--warning)')}}
+                    </div>
+                    <div style="padding:10px; border:1px solid var(--border); border-radius:var(--radius); background:var(--surface-2);">
+                        <div style="color:var(--muted); font-size:12px; margin-bottom:6px;">Auto Tuning (추천 전용)</div>
+                        <div style="margin-bottom:6px;">${{_esc(at.summary || '추천 데이터 부족')}}</div>
+                        ${{recHtml}}
+                    </div>
+                </div>
+            `;
+        }}
+
+        async function loadAiShadow() {{
+            try {{
+                const response = await fetch('/api/ai/shadow?t=' + Date.now(), withAuth({{}}));
+                if (!response.ok) {{
+                    renderAiShadow(null);
+                    return;
+                }}
+                const data = await response.json();
+                renderAiShadow(data);
+            }} catch (error) {{
+                renderAiShadow(null);
+            }}
+        }}
+
         function updateSettingsSummaries() {{
             try {{
                 const risk = document.getElementById('risk_summary');
@@ -4574,15 +4702,23 @@ API: POST /api/config/risk|strategy|stock-selection|operational
             const infoList = window.__selected_stock_info || [];
             const codeToName = {{}};
             infoList.forEach(function(item) {{ const c = (item.code || '').toString().trim(); if (c) codeToName[c] = (item.name || '').toString().trim(); }});
-            let html = '<table><thead><tr><th>종목</th><th>수량</th><th>매수가</th><th>매수금액</th><th>현재가</th><th>평가금액</th><th>손익</th><th>동작</th></tr></thead><tbody>';
+            let html = '<table><thead><tr><th>종목</th><th>구분</th><th>수량</th><th>매수가</th><th>매수금액</th><th>현재가</th><th>평가금액</th><th>손익</th><th>동작</th></tr></thead><tbody>';
             for (const [code, pos] of Object.entries(positions)) {{
                 const name = (pos.stock_name || pos.name || codeToName[code] || '').toString().trim();
                 const stockLabel = (name && name.length) ? (code + ' ' + name) : code;
                 const buyAmt = (pos.buy_price || 0) * (pos.quantity || 0);
                 const evalAmt = (pos.current_price || 0) * (pos.quantity || 0);
                 const pnl = evalAmt - buyAmt;
+                const manualOnly = !!pos.manual_only;
+                const origin = (pos.position_origin || '').toString().trim();
+                const tag = manualOnly
+                    ? '<span title="자동 리스크/전략 매도 비활성. 포지션 탭에서 수동 청산만 가능" style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;border:1px solid #7a5f22;color:#ffe1a3;background:#30240f;">기존보유(수동청산)</span>'
+                    : ((origin === 'balance_sync')
+                        ? '<span title="잔고 동기화 포지션" style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;border:1px solid #2e4a6f;color:#9ec9ff;background:#0f2239;">잔고동기화</span>'
+                        : '<span title="엔진 포지션" style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;border:1px solid #2f5f3a;color:#bde8c4;background:#13291a;">일반</span>');
                 html += `<tr>
                     <td>${{stockLabel}}</td>
+                    <td>${{tag}}</td>
                     <td>${{pos.quantity}}주</td>
                     <td>${{formatNumber(pos.buy_price)}}원</td>
                     <td>${{formatNumber(Math.round(buyAmt))}}원</td>
@@ -5068,12 +5204,15 @@ API: POST /api/config/risk|strategy|stock-selection|operational
                 const response = await fetch('/api/system/status?t=' + Date.now(), withAuth({{}}));
                 if (!response.ok) {{
                     renderBuySkipStats(null);
+                    renderAiShadow(null);
                     return;
                 }}
                 const data = await response.json();
                 updateStatus(data);
+                await loadAiShadow();
             }} catch (error) {{
                 renderBuySkipStats(null);
+                renderAiShadow(null);
                 addLog('새로고침 오류: ' + (error && error.message ? error.message : error), 'error');
             }}
         }}

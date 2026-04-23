@@ -7,6 +7,7 @@ API 엔드포인트 모듈 (모바일 대시보드용)
 from fastapi import Depends, HTTPException, WebSocket, WebSocketDisconnect, Query, Body
 from fastapi.responses import JSONResponse
 from typing import Dict, List, Optional, Any
+from collections import deque
 from datetime import datetime, time as dtime, timedelta, timezone
 import logging
 import asyncio
@@ -42,6 +43,8 @@ from audit_log import audit_log, audit_get
 from notifier import send_alert
 from system_log import system_log_append
 from user_settings_store import round_floats_for_json_storage
+from ai_shadow import execution_shadow_score, loss_guard_shadow, auto_tuning_recommendation
+from order_event_log import enqueue_order_event
 
 try:
     # OpenAI Python SDK (v1.x). AI 리포트 생성을 위해 사용. 환경에 설치·키 설정이 안 되어 있으면 graceful fallback.
@@ -109,6 +112,152 @@ def _append_sell_trigger_to_order_log(msg: str, signal: str, sell_trigger_code: 
     tc = (sell_trigger_code or "").strip() or SELL_TRIG_UNKNOWN
     r = (reason or "").strip()
     return f"{msg} | 매도트리거={tc} | 매도사유={r}"
+
+
+def _shadow_recent_range_ratio(stock_code: str, current_price: float, lookback: int = 20) -> float:
+    """최근 틱 범위를 비율로 계산(없으면 0)."""
+    try:
+        if current_price <= 0 or not getattr(state, "strategy", None):
+            return 0.0
+        prices = (state.strategy.price_history.get(str(stock_code).strip().zfill(6)) or [])[-max(5, int(lookback or 20)) :]
+        if not prices:
+            return 0.0
+        hi = max(float(p) for p in prices)
+        lo = min(float(p) for p in prices)
+        if hi <= 0 or lo <= 0:
+            return 0.0
+        return max(0.0, float((hi - lo) / float(current_price)))
+    except Exception:
+        return 0.0
+
+
+# 체결 틱 링버퍼: 종목당 고정 maxlen (메모리 상한)
+EXEC_TICK_RING_MAXLEN = 256
+
+
+def krx_session_bucket_kst(now_dt: Optional[datetime] = None) -> str:
+    """KST 기준 거친 장중 구간(피처·로그용, 법적 장구분과 다를 수 있음)."""
+    tz = timezone(timedelta(hours=9))
+    if now_dt is None:
+        n = datetime.now(tz)
+    elif now_dt.tzinfo is None:
+        n = now_dt.replace(tzinfo=tz)
+    else:
+        n = now_dt.astimezone(tz)
+    t = n.time()
+    if t < dtime(9, 0):
+        return "pre_market"
+    if t < dtime(9, 5):
+        return "open_block"
+    if t < dtime(12, 0):
+        return "morning_regular"
+    if t < dtime(13, 0):
+        return "mid_day"
+    if t < dtime(15, 20):
+        return "afternoon_regular"
+    if t < dtime(15, 30):
+        return "close_block"
+    return "after_hours_or_halt"
+
+
+def _exec_tick_ring_append(stock_code: str, price: float, vol: float) -> None:
+    code = str(stock_code or "").strip().zfill(6)
+    if not code or float(price or 0.0) <= 0:
+        return
+    ring = getattr(state, "_exec_tick_ring", None)
+    if ring is None:
+        return
+    dq = ring.get(code)
+    if dq is None:
+        dq = deque(maxlen=EXEC_TICK_RING_MAXLEN)
+        ring[code] = dq
+    dq.append((time.time(), float(price), float(max(0.0, vol))))
+
+
+def _exec_tick_summary_window(code: str, window_sec: float = 60.0) -> Dict[str, Any]:
+    """링버퍼에서 최근 window_sec 초 요약(체결 WS 기반 vol은 종목·구간에 따라 0일 수 있음)."""
+    code = str(code or "").strip().zfill(6)
+    ring = getattr(state, "_exec_tick_ring", None) or {}
+    dq = ring.get(code)
+    if not dq:
+        return {"n": 0, "vol_sum": 0.0, "px_range_ratio": 0.0, "last_px": 0.0}
+    now = time.time()
+    win = float(max(5.0, min(120.0, window_sec)))
+    t0 = now - win
+    prices: List[float] = []
+    vol_sum = 0.0
+    for ts, px, vv in dq:
+        if ts < t0:
+            continue
+        prices.append(float(px))
+        vol_sum += float(vv)
+    if not prices:
+        return {"n": 0, "vol_sum": 0.0, "px_range_ratio": 0.0, "last_px": 0.0}
+    last_px = float(prices[-1])
+    hi, lo = max(prices), min(prices)
+    rr = (hi - lo) / last_px if last_px > 0 else 0.0
+    return {"n": len(prices), "vol_sum": float(vol_sum), "px_range_ratio": float(rr), "last_px": last_px}
+
+
+def _enqueue_order_attempt_context(stock_code: Any, signal: Any, price: Any, result: bool, details: Any) -> None:
+    """주문 시도 1건을 JSONL 큐에 적재(라벨·사후 분석용, 핫패스 부하 최소)."""
+    try:
+        code_o = str(stock_code or "").strip().zfill(6)
+        qd = (getattr(state, "latest_quotes", {}) or {}).get(code_o) or {}
+        px_u = float(price or 0.0)
+        ask_u = float(qd.get("ask") or 0.0)
+        bid_u = float(qd.get("bid") or 0.0)
+        sp: Optional[float] = None
+        if px_u > 0 and ask_u > 0 and bid_u > 0:
+            sp = float((ask_u - bid_u) / px_u)
+        d = details if isinstance(details, dict) else {}
+        odno = str(d.get("odno") or "").strip()
+        if not odno:
+            resp = d.get("order_response") or {}
+            fld = resp.get("fields") or {}
+            summ = resp.get("summary") or {}
+            odno = str(fld.get("ODNO") or fld.get("odno") or summ.get("odno") or "").strip()
+        enqueue_order_event({
+            "event": "order_attempt",
+            "ts_kst": datetime.now(timezone(timedelta(hours=9))).isoformat(),
+            "session": krx_session_bucket_kst(),
+            "stock_code": code_o,
+            "signal": str(signal or "").lower(),
+            "signal_price": px_u,
+            "success": bool(result),
+            "filled": bool(d.get("filled", False)),
+            "odno": odno,
+            "reason": str(d.get("reason") or "").strip(),
+            "spread_ratio": sp,
+            "ask_rsqn1": float(qd.get("ask_rsqn1") or 0),
+            "bid_rsqn1": float(qd.get("bid_rsqn1") or 0),
+            "depth5_ask_vol": float(qd.get("depth5_ask_vol") or 0),
+            "depth5_bid_vol": float(qd.get("depth5_bid_vol") or 0),
+            "depth5_imbalance": float(qd.get("depth5_imbalance") or 0),
+            "tick_summary_60s": _exec_tick_summary_window(code_o, 60.0),
+        })
+    except Exception:
+        pass
+
+
+def _collect_recent_sell_pnls(limit: int = 8) -> List[float]:
+    vals: List[float] = []
+    try:
+        hist = getattr(state, "trade_history", []) or []
+        for t in reversed(hist):
+            if str(t.get("order_type") or "").lower() != "sell":
+                continue
+            if t.get("pnl") is None:
+                continue
+            try:
+                vals.append(float(t.get("pnl")))
+            except Exception:
+                continue
+            if len(vals) >= max(1, int(limit or 8)):
+                break
+    except Exception:
+        pass
+    return vals
 
 
 pending_signals_lock = threading.Lock()
@@ -1837,6 +1986,48 @@ def _to_float(v, default: float = 0.0) -> float:
         return default
 
 
+def _parse_hoga_row_depth5(row: Any) -> Dict[str, Any]:
+    """실시간 호가 행에서 1~5단 가격·잔량 추출(없는 단은 0)."""
+    askp: List[float] = []
+    bidp: List[float] = []
+    ask_rsqn: List[float] = []
+    bid_rsqn: List[float] = []
+    for i in range(1, 6):
+        uk = f"ASKP{i}"
+        vk = f"BIDP{i}"
+        ark = f"ASKP_RSQN{i}"
+        brk = f"BIDP_RSQN{i}"
+        av = row.get(uk)
+        if av is None:
+            av = row.get(uk.lower()) if hasattr(row, "get") else None
+        bv = row.get(vk)
+        if bv is None:
+            bv = row.get(vk.lower()) if hasattr(row, "get") else None
+        arv = row.get(ark)
+        if arv is None:
+            arv = row.get(ark.lower()) if hasattr(row, "get") else None
+        brv = row.get(brk)
+        if brv is None:
+            brv = row.get(brk.lower()) if hasattr(row, "get") else None
+        askp.append(max(0.0, _to_float(av, 0.0)))
+        bidp.append(max(0.0, _to_float(bv, 0.0)))
+        ask_rsqn.append(max(0.0, _to_float(arv, 0.0)))
+        bid_rsqn.append(max(0.0, _to_float(brv, 0.0)))
+    sa = float(sum(ask_rsqn))
+    sb = float(sum(bid_rsqn))
+    den = sa + sb
+    imb = float((sb - sa) / den) if den > 0 else 0.0
+    return {
+        "askp5": askp,
+        "bidp5": bidp,
+        "ask_rsqn5": ask_rsqn,
+        "bid_rsqn5": bid_rsqn,
+        "depth5_ask_vol": sa,
+        "depth5_bid_vol": sb,
+        "depth5_imbalance": imb,
+    }
+
+
 def _pick_first(row: dict, keys: list):
     for k in keys:
         if k in row and row.get(k) not in (None, "", " "):
@@ -2245,6 +2436,8 @@ async def _pending_order_reconciler_loop():
     last_balance_check_ts = time.time()
     last_rebalance_ts = 0.0
     last_recommend_ts = 0.0
+    last_ai_loss_guard_ts = 0.0
+    last_ai_tuning_ts = 0.0
     last_advance_ratio_log_ts = 0.0
     last_low_selected_reselect_ts = float(getattr(state, "_last_low_selected_reselect_ts", 0.0) or 0.0)
     BALANCE_CHECK_INTERVAL_SEC = 60.0
@@ -2398,6 +2591,68 @@ async def _pending_order_reconciler_loop():
                             await state.broadcast({"type": "log", "level": r.get("level", "info"), "message": f"[성과 추천] {r.get('message', '')}"})
                 except Exception as e:
                     logger.warning(f"성과 추천 오류(무시): {e}")
+
+            # [AI Shadow] Loss Guard: 기존 리스크 제어는 그대로 두고 경고만 출력
+            if (now_ts - last_ai_loss_guard_ts) >= 30.0:
+                last_ai_loss_guard_ts = now_ts
+                try:
+                    rm = getattr(state, "risk_manager", None)
+                    daily_pnl = float(getattr(rm, "daily_pnl", 0.0) or 0.0) if rm else 0.0
+                    daily_loss_limit = float(getattr(rm, "daily_loss_limit", 0.0) or 0.0) if rm else 0.0
+                    c_losses = int(getattr(state, "consecutive_losses", 0) or 0)
+                    lg = loss_guard_shadow(
+                        daily_pnl=daily_pnl,
+                        daily_loss_limit=daily_loss_limit,
+                        consecutive_losses=c_losses,
+                        recent_sell_pnls=_collect_recent_sell_pnls(8),
+                    )
+                    state._ai_shadow_last_loss_guard = {
+                        "timestamp": datetime.now().isoformat(),
+                        "daily_pnl": daily_pnl,
+                        **lg,
+                    }
+                    if lg.get("level") in ("warning", "critical"):
+                        await state.broadcast({
+                            "type": "log",
+                            "level": "warning" if lg.get("level") == "warning" else "error",
+                            "message": (
+                                f"[AI-SHADOW][LOSS_GUARD] level={lg.get('level')} score={lg.get('score')} "
+                                f"daily_pnl={daily_pnl:,.0f} reasons={','.join(lg.get('reasons') or []) or '-'} "
+                                f"(alert-only)"
+                            ),
+                        })
+                except Exception as e:
+                    logger.warning("AI shadow loss guard 오류(무시): %s", e)
+
+            # [AI Shadow] Auto Tuning: 자동적용 없이 다음날 추천값만 상태/로그에 저장
+            if (now_ts - last_ai_tuning_ts) >= 300.0:
+                last_ai_tuning_ts = now_ts
+                try:
+                    rm = getattr(state, "risk_manager", None)
+                    current_risk = _build_risk_config_dict_from_rm() if rm else {}
+                    current_strategy = dict(getattr(state, "_strategy_config_snapshot", None) or {})
+                    rec = auto_tuning_recommendation(
+                        trades=list(getattr(state, "trade_history", []) or []),
+                        current_risk=current_risk,
+                        current_strategy=current_strategy,
+                    )
+                    state._ai_shadow_recommendation = {
+                        "timestamp": datetime.now().isoformat(),
+                        **rec,
+                    }
+                    if rec.get("available") and rec.get("recommendations"):
+                        top = rec.get("recommendations")[0]
+                        await state.broadcast({
+                            "type": "log",
+                            "level": "info",
+                            "message": (
+                                f"[AI-SHADOW][AUTO_TUNING] {rec.get('summary')} | "
+                                f"top: {top.get('key')} {top.get('current')} -> {top.get('suggested')} "
+                                f"({top.get('why')}) (recommend-only)"
+                            ),
+                        })
+                except Exception as e:
+                    logger.warning("AI shadow auto tuning 오류(무시): %s", e)
 
             # 상승 종목 비율 필터 켜져 있을 때 5분마다 비율·설정 하한을 시스템 로그(대시보드+파일)에 기록
             if bool(getattr(state, "advance_ratio_filter_enabled", False)) and (now_ts - last_advance_ratio_log_ts) >= ADVANCE_RATIO_LOG_INTERVAL_SEC:
@@ -3889,12 +4144,26 @@ def _sync_positions_from_balance_sync() -> int:
             except Exception:
                 cur_price = float(buy_price or 0)
             stock_name = (rdict.get("PRDT_NAME") or rdict.get("prdt_name") or "").strip()
+            prev = existing.get(code) if isinstance(existing, dict) else None
+            prev_origin = ""
+            prev_manual_only = False
+            if isinstance(prev, dict):
+                prev_origin = str(prev.get("position_origin") or "").strip()
+                prev_manual_only = bool(prev.get("manual_only", False))
+
+            # 잔고 동기화로 새로 유입된 종목은 "기존보유(수동청산 전용)"으로 표기/동작.
+            # 기존 엔진 포지션에 대해서는 이전 표식을 유지한다.
+            origin = prev_origin or ("balance_sync" if code not in existing else "engine")
+            manual_only = prev_manual_only if code in existing else True
+
             new_positions[code] = {
                 "buy_price": buy_price,
                 "quantity": qty,
                 "current_price": cur_price,
                 "buy_time": existing[code].get("buy_time") if code in existing else datetime.now(),
                 "partial_taken": existing[code].get("partial_taken", False) if code in existing else False,
+                "position_origin": origin,
+                "manual_only": manual_only,
             }
             if stock_name:
                 new_positions[code]["stock_name"] = stock_name
@@ -4092,7 +4361,9 @@ def _build_positions_message():
             "quantity": pos["quantity"],
             "buy_price": pos["buy_price"],
             "current_price": pos.get("current_price", pos["buy_price"]),
-            "buy_time": pos["buy_time"].isoformat() if isinstance(pos.get("buy_time"), datetime) else str(pos.get("buy_time", ""))
+            "buy_time": pos["buy_time"].isoformat() if isinstance(pos.get("buy_time"), datetime) else str(pos.get("buy_time", "")),
+            "position_origin": str(pos.get("position_origin") or ""),
+            "manual_only": bool(pos.get("manual_only", False)),
         }
         name = code_to_name.get(code) or (pos.get("stock_name") or pos.get("name") or "")
         if name:
@@ -4142,10 +4413,78 @@ def _handle_signal(
                         elapsed = (datetime.now() - buy_time).total_seconds()
                         if elapsed < min_hold:
                             return
+    # 매도 주문가능수량 초과(APBK0400 등) 직후 짧은 쿨다운: 동일 종목 재시도 폭주 방지
+    if signal == "sell":
+        try:
+            code_cd = str(stock_code or "").strip().zfill(6)
+            cd_map = getattr(state, "_sell_reject_cooldown_until", None) or {}
+            if not isinstance(cd_map, dict):
+                cd_map = {}
+            until_ts = float(cd_map.get(code_cd, 0.0) or 0.0)
+            if until_ts > time.time():
+                return
+        except Exception:
+            pass
 
     _stc_kw = None
     if str(signal).lower() == "sell":
         _stc_kw = (sell_trigger_code or "").strip() or None
+    # [AI Shadow] Execution 보조 점수: 주문결정에는 개입하지 않고 로그/상태만 생성
+    try:
+        code = str(stock_code or "").strip().zfill(6)
+        q = (getattr(state, "latest_quotes", {}) or {}).get(code) or {}
+        ask = float(q.get("ask") or 0.0)
+        bid = float(q.get("bid") or 0.0)
+        max_spread = float(getattr(state, "max_spread_ratio", 0.0) or 0.0)
+        rr = _shadow_recent_range_ratio(code, float(price or 0.0), 20)
+        tick_s = _exec_tick_summary_window(code, 60.0)
+        sess = krx_session_bucket_kst()
+        d5a = float(q.get("depth5_ask_vol") or 0.0)
+        d5b = float(q.get("depth5_bid_vol") or 0.0)
+        sh = execution_shadow_score(
+            stock_code=code,
+            side=str(signal).lower(),
+            price=float(price or 0.0),
+            ask=ask,
+            bid=bid,
+            max_spread_ratio=max_spread,
+            recent_range_ratio=rr,
+            momentum_ratio=None,
+            slope_ratio=None,
+            depth5_ask_vol_sum=d5a,
+            depth5_bid_vol_sum=d5b,
+        )
+        state._ai_shadow_last_execution = {
+            "timestamp": datetime.now().isoformat(),
+            "session": sess,
+            "tick_summary_60s": tick_s,
+            "quote_depth": {
+                "ask_rsqn1": float(q.get("ask_rsqn1") or 0),
+                "bid_rsqn1": float(q.get("bid_rsqn1") or 0),
+                "total_ask_rsqn": float(q.get("total_ask_rsqn") or 0),
+                "total_bid_rsqn": float(q.get("total_bid_rsqn") or 0),
+                "depth5_ask_vol": d5a,
+                "depth5_bid_vol": d5b,
+                "depth5_imbalance": float(q.get("depth5_imbalance") or 0.0),
+                "ask_rsqn5": list(q.get("ask_rsqn5") or []),
+                "bid_rsqn5": list(q.get("bid_rsqn5") or []),
+            },
+            **sh,
+        }
+        _run_async_broadcast({
+            "type": "log",
+            "level": "info" if sh.get("level") != "high" else "warning",
+            "message": (
+                f"[AI-SHADOW][EXEC] {code} {str(signal).upper()} "
+                f"risk={sh.get('level')} score={int(sh.get('score') or 0)} "
+                f"spread={float(sh.get('spread_ratio') or 0.0)*100:.3f}% "
+                f"range={float(sh.get('recent_range_ratio') or 0.0)*100:.3f}% "
+                f"reasons={','.join(sh.get('reasons') or []) or '-'} "
+                f"(shadow-only)"
+            ),
+        })
+    except Exception:
+        pass
     result, details = safe_execute_order(
         signal=signal,
         stock_code=stock_code,
@@ -4159,9 +4498,11 @@ def _handle_signal(
         selected_stocks_count=len(getattr(state, "selected_stocks", None) or []),
         sell_trigger_code=_stc_kw,
     )
+    _enqueue_order_attempt_context(stock_code, signal, price, result, details)
     if not result:
         reason = details.get("reason") or ""
         rej_msg = (details.get("rejection_message") or "").strip()
+        rej_key = str(details.get("rejection_reason") or "").strip().lower()
         # 반복 로그 억제: 일일 거래 횟수 초과, 모의투자 잔고내역 없음 등은 5분에 한 번만
         skip_log = False
         if reason == "일일 거래 횟수 초과":
@@ -4196,6 +4537,33 @@ def _handle_signal(
                 setattr(state, pending_key, time.time())
                 _run_async_broadcast({"type": "log", "message": f"중복 주문 무시(이미 접수됨) | {(details.get('signal') or '').upper()} {stock_code}", "level": "info"})
                 skip_log = True
+        # 실계좌/모의 공통: 주문가능수량 초과(예: APBK0400) 시 짧은 쿨다운 + 잔고동기화 시도
+        elif signal == "sell" and (
+            rej_key == "balance"
+            or "주문 가능한 수량을 초과" in rej_msg
+            or "주문가능 수량을 초과" in rej_msg
+            or "주문 가능 수량" in rej_msg
+        ):
+            try:
+                code_cd = str(stock_code or "").strip().zfill(6)
+                cd_map = getattr(state, "_sell_reject_cooldown_until", None) or {}
+                if not isinstance(cd_map, dict):
+                    cd_map = {}
+                cool_s = max(15, min(180, int(getattr(state, "sell_qty_reject_cooldown_sec", 60) or 60)))
+                cd_map[code_cd] = time.time() + cool_s
+                state._sell_reject_cooldown_until = cd_map
+                _run_async_broadcast({
+                    "type": "log",
+                    "level": "warning",
+                    "message": f"매도 재시도 일시중지({cool_s}s) | {code_cd} | 사유=주문가능수량 초과",
+                })
+            except Exception:
+                pass
+            try:
+                _sync_positions_from_balance_sync()
+                _run_async_broadcast({"type": "position", "data": _build_positions_message()})
+            except Exception:
+                pass
         if not skip_log:
             _raw = _format_order_log(details)
             _msg = _append_sell_trigger_to_order_log(_raw, signal, sell_trigger_code, reason)
@@ -4536,7 +4904,7 @@ def _start_trading_engine_thread():
                             except Exception as ex:
                                 logger.debug("H0STMKO0 VI 처리 실패: %s", ex)
                             return
-                        # 호가 TR: 스프레드 계산용 캐시 갱신
+                        # 호가 TR: 스프레드 + 1~5호가 가격·잔량 + 총잔량(가능 시) 캐시 갱신
                         if tr_id in ["H0STASP0", "H0NXASP0", "H0UNASP0"] and not result.empty:
                             try:
                                 for _, row in result.iterrows():
@@ -4544,11 +4912,34 @@ def _start_trading_engine_thread():
                                     ask = _to_float(row.get("ASKP1", 0))
                                     bid = _to_float(row.get("BIDP1", 0))
                                     if code and ask > 0 and bid > 0:
-                                        state.latest_quotes[code] = {
+                                        d5 = _parse_hoga_row_depth5(row)
+                                        ar1 = float(d5["ask_rsqn5"][0]) if d5.get("ask_rsqn5") else 0.0
+                                        br1 = float(d5["bid_rsqn5"][0]) if d5.get("bid_rsqn5") else 0.0
+                                        ta = _to_float(row.get("TOTAL_ASKP_RSQN", row.get("total_askp_rsqn", 0)), 0)
+                                        tb = _to_float(row.get("TOTAL_BIDP_RSQN", row.get("total_bidp_rsqn", 0)), 0)
+                                        ent: Dict[str, Any] = {
                                             "ask": float(ask),
                                             "bid": float(bid),
                                             "at": datetime.now().isoformat(),
+                                            "ask_rsqn1": float(ar1),
+                                            "bid_rsqn1": float(br1),
+                                            "total_ask_rsqn": float(ta),
+                                            "total_bid_rsqn": float(tb),
+                                            "depth5_ask_vol": float(d5.get("depth5_ask_vol") or 0.0),
+                                            "depth5_bid_vol": float(d5.get("depth5_bid_vol") or 0.0),
+                                            "depth5_imbalance": float(d5.get("depth5_imbalance") or 0.0),
+                                            "askp5": list(d5.get("askp5") or []),
+                                            "bidp5": list(d5.get("bidp5") or []),
+                                            "ask_rsqn5": list(d5.get("ask_rsqn5") or []),
+                                            "bid_rsqn5": list(d5.get("bid_rsqn5") or []),
                                         }
+                                        hc = row.get("HOUR_CLS_CODE", row.get("hour_cls_code"))
+                                        if hc is not None and str(hc).strip():
+                                            ent["hour_cls_code"] = str(hc).strip()
+                                        bh = row.get("BSOP_HOUR", row.get("bsop_hour"))
+                                        if bh is not None and str(bh).strip():
+                                            ent["bsop_hour"] = str(bh).strip()
+                                        state.latest_quotes[code] = ent
                             except Exception:
                                 pass
                             return
@@ -4815,8 +5206,8 @@ def _start_trading_engine_thread():
                                     pass
 
                                 # 틱 거래량/거래대금 이력(진입 하한·급증 조건용): 매 틱 누적
+                                vol_tick = None
                                 try:
-                                    vol_tick = None
                                     if row.get("CNTG_VOL") is not None:
                                         vol_tick = float(row.get("CNTG_VOL") or 0.0)
                                     elif row.get("ACML_VOL") is not None:
@@ -4843,6 +5234,14 @@ def _start_trading_engine_thread():
                                             if len(tvh) > 120:
                                                 tvh = tvh[-120:]
                                             state._tv_tick_hist[stock_code] = tvh
+                                except Exception:
+                                    pass
+                                try:
+                                    _exec_tick_ring_append(
+                                        stock_code,
+                                        float(current_price),
+                                        float(vol_tick) if vol_tick is not None else 0.0,
+                                    )
                                 except Exception:
                                     pass
 
@@ -4890,6 +5289,23 @@ def _start_trading_engine_thread():
                                     state._minute_bars[stock_code] = bars
                                 except Exception:
                                     pass
+
+                                pos_now = None
+                                try:
+                                    pos_now = (state.risk_manager.positions or {}).get(stock_code)
+                                except Exception:
+                                    pos_now = None
+                                manual_only_pos = bool((pos_now or {}).get("manual_only", False))
+
+                                # 잔고 동기화로 유입된 기존보유(manual_only)는 자동 리스크/전략 매도를 수행하지 않는다.
+                                # 해당 포지션은 포지션 탭 수동 청산 버튼으로만 청산 가능.
+                                if manual_only_pos:
+                                    _throttled_info_log(
+                                        f"manual_only_hold:{stock_code}",
+                                        f"AUTO SELL 스킵 | {stock_code} | 기존보유(manual_only) 포지션은 수동 청산만 허용",
+                                        ttl_sec=30,
+                                    )
+                                    continue
 
                                 exit_sig = None
                                 try:
@@ -4944,6 +5360,14 @@ def _start_trading_engine_thread():
                                             if mr_buy_candidate and not ma_buy_candidate
                                             else "이동평균 크로스 조건 충족"
                                         )
+                                        # 통과 시점 진단용(사후 재현): 실제 모멘텀/기울기 수치와 임계값을 함께 기록
+                                        buy_diag = {
+                                            "slope_ratio": None,
+                                            "slope_thr": None,
+                                            "mom_ratio": None,
+                                            "mom_thr": None,
+                                            "mom_n": None,
+                                        }
                                         _throttled_info_log(
                                             f"entry_cand:{stock_code}:{buy_signal_reason}",
                                             (
@@ -5174,6 +5598,8 @@ def _start_trading_engine_thread():
                                                     thr = float(min_slope)
                                                     if mult and mult > 0 and vol_ratio > 0:
                                                         thr = max(thr, float(mult) * float(vol_ratio))
+                                                    buy_diag["slope_ratio"] = float(slope_ratio)
+                                                    buy_diag["slope_thr"] = float(thr)
                                                     if slope_ratio < thr:
                                                         _record_buy_skip(stock_code, "slope")
                                                         _throttled_skip_log(
@@ -5188,12 +5614,15 @@ def _start_trading_engine_thread():
                                         try:
                                             mom_n = int(_eff_int("momentum_lookback_ticks", 0) or 0)
                                             mom_r = float(_eff_float("min_momentum_ratio", 0.0) or 0.0)
+                                            buy_diag["mom_thr"] = float(mom_r) if mom_r > 0 else None
+                                            buy_diag["mom_n"] = int(mom_n) if mom_n > 0 else None
                                             if mom_n > 0 and mom_r > 0:
                                                 prices = (state.strategy.price_history.get(stock_code) or [])
                                                 if len(prices) > mom_n:
                                                     prev_px = float(prices[-mom_n - 1])
                                                     if prev_px > 0:
                                                         mr = (float(current_price) - prev_px) / prev_px
+                                                        buy_diag["mom_ratio"] = float(mr)
                                                         if mr < mom_r:
                                                             _record_buy_skip(stock_code, "momentum")
                                                             _throttled_skip_log(
@@ -5534,11 +5963,29 @@ def _start_trading_engine_thread():
                                         signal_type = None
                                     if signal_type:
                                         if signal_type == "buy":
+                                            _slope_r = buy_diag.get("slope_ratio")
+                                            _slope_t = buy_diag.get("slope_thr")
+                                            _mom_r = buy_diag.get("mom_ratio")
+                                            _mom_t = buy_diag.get("mom_thr")
+                                            _mom_n = buy_diag.get("mom_n")
+                                            slope_txt = (
+                                                f"{float(_slope_r)*100:.3f}%/{float(_slope_t)*100:.3f}%"
+                                                if _slope_r is not None and _slope_t is not None
+                                                else "n/a"
+                                            )
+                                            mom_txt = (
+                                                f"{float(_mom_r)*100:.3f}%/{float(_mom_t)*100:.3f}%"
+                                                if _mom_r is not None and _mom_t is not None
+                                                else "n/a"
+                                            )
+                                            mom_n_txt = str(int(_mom_n)) if _mom_n is not None else "-"
                                             _throttled_info_log(
                                                 f"buy_attempt:{stock_code}",
                                                 (
                                                     f"BUY 주문 시도 | {stock_code} | reason={buy_signal_reason} "
-                                                    f"| px={float(current_price):.0f}"
+                                                    f"| px={float(current_price):.0f} "
+                                                    f"| slope(pass={slope_txt}) "
+                                                    f"| momentum(pass={mom_txt},N={mom_n_txt})"
                                                 ),
                                                 ttl_sec=15,
                                             )
@@ -5690,7 +6137,9 @@ async def send_status_update():
                 "quantity": pos["quantity"],
                 "buy_price": pos["buy_price"],
                 "current_price": pos.get("current_price", pos["buy_price"]),
-                "buy_time": pos["buy_time"].isoformat() if isinstance(pos["buy_time"], datetime) else str(pos["buy_time"])
+                "buy_time": pos["buy_time"].isoformat() if isinstance(pos["buy_time"], datetime) else str(pos["buy_time"]),
+                "position_origin": str(pos.get("position_origin") or ""),
+                "manual_only": bool(pos.get("manual_only", False)),
             }
         
         await state.broadcast({
@@ -6831,7 +7280,9 @@ async def get_positions(current_user: str = Depends(get_current_user)):
             "stock_code": code,
             "quantity": pos["quantity"],
             "buy_price": pos["buy_price"],
-            "buy_time": pos["buy_time"].isoformat() if isinstance(pos["buy_time"], datetime) else str(pos["buy_time"])
+            "buy_time": pos["buy_time"].isoformat() if isinstance(pos["buy_time"], datetime) else str(pos["buy_time"]),
+            "position_origin": str(pos.get("position_origin") or ""),
+            "manual_only": bool(pos.get("manual_only", False)),
         })
     
     return JSONResponse(positions)
@@ -7953,6 +8404,7 @@ async def approve_signal(signal_id: str, current_user: str = Depends(get_current
         selected_stocks_count=len(getattr(state, "selected_stocks", None) or []),
         sell_trigger_code=_ap_stc,
     )
+    _enqueue_order_attempt_context(signal_data.get("stock_code"), signal_data.get("signal"), signal_data.get("price"), result, details)
     filled = bool(details.get("filled", False))
     _raw_ap = _format_order_log(details)
     _ap_reason = str(signal_data.get("reason") or "")
@@ -8851,6 +9303,7 @@ async def execute_manual_order(order: ManualOrder, current_user: str = Depends(g
             selected_stocks_count=len(getattr(state, "selected_stocks", None) or []),
             sell_trigger_code=_mo_stc,
         )
+        _enqueue_order_attempt_context(order.stock_code, order.order_type, order.price or 0, result, details)
         filled = bool(details.get("filled", False))
         _raw_mo = _format_order_log(details)
         _mo_msg = _append_sell_trigger_to_order_log(
@@ -8941,6 +9394,18 @@ async def execute_manual_order(order: ManualOrder, current_user: str = Depends(g
     except Exception as e:
         logger.error(f"수동 주문 오류: {e}")
         return JSONResponse({"success": False, "message": str(e)})
+
+
+@app.get("/api/ai/shadow")
+async def get_ai_shadow_snapshot(current_user: str = Depends(get_current_user)):
+    """AI shadow 보조지표 조회(읽기 전용)."""
+    _ = current_user
+    return JSONResponse({
+        "enabled": True,
+        "execution": getattr(state, "_ai_shadow_last_execution", None) or {},
+        "loss_guard": getattr(state, "_ai_shadow_last_loss_guard", None) or {},
+        "auto_tuning": getattr(state, "_ai_shadow_recommendation", None) or {},
+    })
 
 # ============================================================================
 # 시스템 초기화

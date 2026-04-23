@@ -14,6 +14,7 @@ from starlette.requests import Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Any, Dict, List, Optional
+from collections import deque
 import json
 import logging
 from datetime import datetime
@@ -221,8 +222,10 @@ class TradingState:
         # 신규 매수 허용 시간(한국시간, HH:MM). 매도/청산은 항상 허용.
         self.buy_window_start_hhmm: str = "09:05"
         self.buy_window_end_hhmm: str = "11:30"
-        # 실시간 호가(스프레드) 캐시: {code: {"ask": float, "bid": float, "at": iso}}
+        # 실시간 호가 캐시: 1~5호가 가격·잔량, 총잔량, depth5 요약(WS)
         self.latest_quotes: Dict[str, Dict] = {}
+        # 체결 틱 링버퍼(종목별 고정 maxlen): (time.time(), price, cntg_vol)
+        self._exec_tick_ring: Dict[str, deque] = {}
         # 장운영 WS(H0STMKO0) VI 적용 여부: 종목코드 -> (active: bool, time.time() 수신시각)
         self._vi_ws_active: Dict[str, tuple] = {}
         # 통합 시장 레짐: 저장 베이스(오버레이 없음) + 현재 라벨
