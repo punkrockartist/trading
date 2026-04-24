@@ -43,7 +43,14 @@ from audit_log import audit_log, audit_get
 from notifier import send_alert
 from system_log import system_log_append
 from user_settings_store import round_floats_for_json_storage
-from ai_shadow import execution_shadow_score, loss_guard_shadow, auto_tuning_recommendation
+from ai_shadow import (
+    execution_shadow_score,
+    loss_guard_shadow,
+    auto_tuning_recommendation,
+    persist_execution_shadow_aggregate,
+    persist_loss_guard_aggregate,
+    persist_auto_tuning_aggregate,
+)
 from order_event_log import enqueue_order_event
 
 try:
@@ -2611,6 +2618,19 @@ async def _pending_order_reconciler_loop():
                         "daily_pnl": daily_pnl,
                         **lg,
                     }
+                    try:
+                        rid = str(getattr(state, "_ai_shadow_run_id", "") or "").strip()
+                        if not rid:
+                            rid = datetime.now(timezone(timedelta(hours=9))).strftime("%Y%m%d#%H%M%S") + "#" + uuid.uuid4().hex[:8]
+                            state._ai_shadow_run_id = rid
+                        persist_loss_guard_aggregate(
+                            username=str(getattr(state, "trading_username", None) or "admin"),
+                            run_id=rid,
+                            loss_guard=lg,
+                            daily_pnl=daily_pnl,
+                        )
+                    except Exception:
+                        pass
                     if lg.get("level") in ("warning", "critical"):
                         await state.broadcast({
                             "type": "log",
@@ -2640,6 +2660,18 @@ async def _pending_order_reconciler_loop():
                         "timestamp": datetime.now().isoformat(),
                         **rec,
                     }
+                    try:
+                        rid = str(getattr(state, "_ai_shadow_run_id", "") or "").strip()
+                        if not rid:
+                            rid = datetime.now(timezone(timedelta(hours=9))).strftime("%Y%m%d#%H%M%S") + "#" + uuid.uuid4().hex[:8]
+                            state._ai_shadow_run_id = rid
+                        persist_auto_tuning_aggregate(
+                            username=str(getattr(state, "trading_username", None) or "admin"),
+                            run_id=rid,
+                            rec=rec,
+                        )
+                    except Exception:
+                        pass
                     if rec.get("available") and rec.get("recommendations"):
                         top = rec.get("recommendations")[0]
                         await state.broadcast({
@@ -4471,6 +4503,19 @@ def _handle_signal(
             },
             **sh,
         }
+        try:
+            run_id = str(getattr(state, "_ai_shadow_run_id", "") or "").strip()
+            if not run_id:
+                run_id = f"{datetime.now(timezone(timedelta(hours=9))).strftime('%Y%m%d#%H%M%S')}#{uuid.uuid4().hex[:8]}"
+                state._ai_shadow_run_id = run_id
+            persist_execution_shadow_aggregate(
+                username=str(getattr(state, "trading_username", None) or "admin"),
+                run_id=run_id,
+                exec_shadow=state._ai_shadow_last_execution,
+                session=sess,
+            )
+        except Exception:
+            pass
         _run_async_broadcast({
             "type": "log",
             "level": "info" if sh.get("level") != "high" else "warning",
@@ -6927,6 +6972,11 @@ async def _do_start_system(username: str) -> tuple:
 
         state.is_running = True
         state.trading_username = username
+        try:
+            tz9 = timezone(timedelta(hours=9))
+            state._ai_shadow_run_id = f"{datetime.now(tz9).strftime('%Y%m%d#%H%M%S')}#{uuid.uuid4().hex[:8]}"
+        except Exception:
+            pass
         logger.info("시스템 시작: trading_username=%s (quant_trading_user_hist 저장 대상)", username)
         try:
             if getattr(state, "session_start_balance", None) is None:
