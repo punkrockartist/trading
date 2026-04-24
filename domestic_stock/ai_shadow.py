@@ -160,7 +160,7 @@ def persist_loss_guard_aggregate(
     loss_guard: Dict[str, Any],
     daily_pnl: float,
 ) -> Tuple[bool, str]:
-    """Loss Guard Shadow »ùÇÃÀ» ÀÏÀÚ¡¤½ÇÇà(run)º°·Î ´©Àû ÀúÀå."""
+    """Loss Guard Shadow ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½Ú¡ï¿½ï¿½ï¿½ï¿½ï¿½(run)ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½."""
     table = _resolve_ai_table()
     if table is None:
         return False, "dynamodb table unavailable"
@@ -241,7 +241,7 @@ def persist_auto_tuning_aggregate(
     run_id: str,
     rec: Dict[str, Any],
 ) -> Tuple[bool, str]:
-    """Auto Tuning Æò°¡(¾à 5ºÐ ÁÖ±â)¸¦ ÀÏÀÚ¡¤½ÇÇà(run)º°·Î ´©Àû ÀúÀå."""
+    """Auto Tuning ï¿½ï¿½(ï¿½ï¿½ 5ï¿½ï¿½ ï¿½Ö±ï¿½)ï¿½ï¿½ ï¿½ï¿½ï¿½Ú¡ï¿½ï¿½ï¿½ï¿½ï¿½(run)ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½."""
     table = _resolve_ai_table()
     if table is None:
         return False, "dynamodb table unavailable"
