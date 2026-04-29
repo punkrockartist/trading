@@ -327,6 +327,10 @@ class RiskManager:
             self._prune_pending_orders()
             if self.has_pending_order(stock_code=stock_code, side="buy"):
                 return False, "체결 대기 중인 매수 주문이 있습니다"
+            # 미체결 매도 주문이 남아 있으면 같은 종목 재진입을 차단한다.
+            # (매도 대기 수량이 주문가능수량을 잠가 APBK0400을 유발하는 상황 방지)
+            if self.has_pending_order(stock_code=stock_code, side="sell"):
+                return False, "체결 대기 중인 매도 주문이 있어 재진입을 차단합니다"
         except Exception:
             pass
 
@@ -1722,6 +1726,19 @@ def safe_execute_order(
         # 주문 실행 (시장가/최우선 지정가 + 재시도)
         try:
             style = str(getattr(risk_mgr, "sell_order_style", "market") or "market").strip().lower()
+            trigger_code = str(details.get("sell_trigger_code") or "").strip().lower()
+            # Risk/exit-critical triggers should prioritize fill certainty.
+            force_market_triggers = (
+                "risk_",
+                "strategy_ma_dead_cross",
+                "time_liquidation",
+                "daily_",
+                "exchange_",
+                "emergency_",
+                "manual_liquidation",
+            )
+            if any(trigger_code.startswith(x) for x in force_market_triggers):
+                style = "market"
             retries = int(getattr(risk_mgr, "order_retry_count", 0) or 0)
             delay_ms = int(getattr(risk_mgr, "order_retry_delay_ms", 300) or 300)
             fallback_to_mkt = bool(getattr(risk_mgr, "order_fallback_to_market", True))

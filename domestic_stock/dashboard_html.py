@@ -4204,11 +4204,12 @@ API: POST /api/config/risk|strategy|stock-selection|operational
             if (posTrades) {{ posTrades.textContent = data.daily_trades + '회'; }}
             // 설정 입력 중에는 서버 폴링 값으로 덮어쓰지 않음(저장 전 '되돌아감' 방지)
             const activeId = (document.activeElement && document.activeElement.id) ? document.activeElement.id : '';
-            if (data.short_ma_period != null) {{
+            const strategyDirty = !!window.__strategyConfigDirty;
+            if (!strategyDirty && data.short_ma_period != null) {{
                 const el = document.getElementById('short_ma_period');
                 if (el && activeId !== 'short_ma_period') el.value = data.short_ma_period;
             }}
-            if (data.long_ma_period != null) {{
+            if (!strategyDirty && data.long_ma_period != null) {{
                 const el = document.getElementById('long_ma_period');
                 if (el && activeId !== 'long_ma_period') el.value = data.long_ma_period;
             }}
@@ -4220,11 +4221,11 @@ API: POST /api/config/risk|strategy|stock-selection|operational
                 const uon = document.getElementById('unified_regime_live_on');
                 if (uon) uon.textContent = data.unified_regime_enabled ? '켜짐' : '꺼짐';
             }}
-            if (data.buy_window_start_hhmm) {{
+            if (!strategyDirty && data.buy_window_start_hhmm) {{
                 const el = document.getElementById('buy_window_start_hhmm');
                 if (el) el.value = data.buy_window_start_hhmm;
             }}
-            if (data.buy_window_end_hhmm) {{
+            if (!strategyDirty && data.buy_window_end_hhmm) {{
                 const el = document.getElementById('buy_window_end_hhmm');
                 if (el) el.value = data.buy_window_end_hhmm;
             }}
@@ -5219,7 +5220,7 @@ API: POST /api/config/risk|strategy|stock-selection|operational
 
         async function loadUserSettings() {{
             try {{
-                const response = await fetch('/api/config/user-settings', {{ credentials: 'include' }});
+                const response = await fetch('/api/config/user-settings', withAuth({{ credentials: 'include' }}));
                 const data = await response.json();
                 if (!data.success) {{
                     if (response.status === 401) addLog('설정 로드: 로그인이 필요합니다.', 'warning');
@@ -5308,6 +5309,9 @@ API: POST /api/config/risk|strategy|stock-selection|operational
                     ensureMacroDateDefault();
                 }}
                 if (strat) {{
+                    window.__strategyConfigDirty = false;
+                    const sp = document.getElementById('strategy_preset_select');
+                    if (sp) sp.value = '';
                     var shortMa = strat.short_ma_period;
                     var longMa = strat.long_ma_period;
                     if (shortMa !== undefined && shortMa !== null) document.getElementById('short_ma_period').value = String(Number(shortMa));
@@ -5743,6 +5747,7 @@ API: POST /api/config/risk|strategy|stock-selection|operational
                 }});
                 const data = await response.json();
                 if (data.success) {{
+                    window.__strategyConfigDirty = false;
                     if (data.persisted === false) {{
                         addLog(`전략 설정 반영됨(런타임, short=${{config.short_ma_period}}, long=${{config.long_ma_period}}). DB 저장은 실패/비활성 상태입니다.`, 'warning');
                     }} else {{
@@ -5774,8 +5779,8 @@ API: POST /api/config/risk|strategy|stock-selection|operational
                         document.getElementById('short_ma_period').value = 8;
                         document.getElementById('long_ma_period').value = 21;
                     }}
-                    addLog('MA 프리셋 적용: ' + n, 'info');
-                    await updateStrategyConfig();
+                    window.__strategyConfigDirty = true;
+                    addLog('MA 프리셋 적용(화면만 변경): ' + n + ' — 저장 버튼을 눌러 반영하세요.', 'info');
                     updateSettingsSummaries();
                     return;
                 }}
@@ -5812,8 +5817,8 @@ API: POST /api/config/risk|strategy|stock-selection|operational
                     document.getElementById('early_min_short_ma_slope_pct').value = 0.015;
                     document.getElementById('early_momentum_lookback_ticks').value = 8;
                     document.getElementById('early_min_momentum_pct').value = 0.22;
-                    addLog('전략 프리셋 trend_relaxed: slope 0.015%/틱, 모멘텀 0.15%, 보강 1/1, 분봉추세 완화(2봉·1충족·higher_close), 거래대금급증 2.5배', 'info');
-                    await updateStrategyConfig();
+                    window.__strategyConfigDirty = true;
+                    addLog('전략 프리셋 trend_relaxed 적용(화면만 변경): 저장 버튼을 눌러 반영하세요.', 'info');
                     updateSettingsSummaries();
                     return;
                 }}
@@ -5936,8 +5941,8 @@ API: POST /api/config/risk|strategy|stock-selection|operational
                     document.getElementById('early_min_range_pct').value = 0.30;
                 }}
 
-                addLog('전략 프리셋 적용: ' + n, 'info');
-                await updateStrategyConfig();
+                window.__strategyConfigDirty = true;
+                addLog('전략 프리셋 적용(화면만 변경): ' + n + ' — 저장 버튼을 눌러 반영하세요.', 'info');
                 updateSettingsSummaries();
             }} catch (e) {{
                 addLog('전략 프리셋 적용 오류: ' + e, 'error');
@@ -5951,8 +5956,6 @@ API: POST /api/config/risk|strategy|stock-selection|operational
                 const v = (sel.value || '').toString();
                 if (!v) return;
                 await applyStrategyPreset(v);
-                // 적용 후에는 "직접 설정"으로 되돌려 혼선 방지
-                sel.value = '';
             }} catch (e) {{
                 addLog('전략 프리셋 변경 오류: ' + e, 'error');
             }}
