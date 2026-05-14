@@ -5187,22 +5187,96 @@ API: POST /api/config/risk|strategy|stock-selection|operational
 
         async function stopSystem(liquidate = false) {{
             if (guardGuestReadonly('시스템 중지')) return;
-            try {{
-                const response = await fetch(`/api/system/stop?liquidate=${{liquidate ? 'true' : 'false'}}`, withAuth({{ method: 'POST' }}));
-                const data = await response.json();
-                if (data.success) {{
-                    addLog('시스템 중지됨', 'info');
-                }} else {{
-                    addLog('시스템 중지 실패: ' + (data.message || '알 수 없는 오류'), 'error');
+            const url = `/api/system/stop?liquidate=${{liquidate ? 'true' : 'false'}}`;
+            const timeoutMs = liquidate ? 120000 : 45000;
+            let lastErr = null;
+            for (let attempt = 0; attempt < 3; attempt++) {{
+                const ac = new AbortController();
+                const to = setTimeout(function () {{ ac.abort(); }}, timeoutMs);
+                try {{
+                    const response = await fetch(url, withAuth({{ method: 'POST', signal: ac.signal }}));
+                    clearTimeout(to);
+                    const data = await response.json();
+                    if (data.success) {{
+                        addLog('시스템 중지됨', 'info');
+                    }} else {{
+                        addLog('시스템 중지 실패: ' + (data.message || '알 수 없는 오류'), 'error');
+                    }}
+                    return;
+                }} catch (error) {{
+                    clearTimeout(to);
+                    lastErr = error;
+                    const isAbort = error && (error.name === 'AbortError');
+                    const msg = (error && error.message) ? error.message : String(error || '');
+                    if (attempt < 2 && (isAbort || msg.indexOf('Failed to fetch') >= 0)) {{
+                        await new Promise(function (r) {{ setTimeout(r, 500 + attempt * 400); }});
+                        continue;
+                    }}
+                    break;
                 }}
-            }} catch (error) {{
-                addLog('오류: ' + (error && error.message ? error.message : error), 'error');
             }}
+            const raw = lastErr && lastErr.message ? lastErr.message : String(lastErr || '');
+            let detail = raw;
+            if (lastErr && lastErr.name === 'AbortError') {{
+                detail = '요청 시간 초과(' + (timeoutMs / 1000) + '초) — 청산·KIS 지연 또는 서버 부하. 터미널에서 프로세스 중지를 확인하세요.';
+            }} else if (raw.indexOf('Failed to fetch') >= 0) {{
+                detail = 'API 연결 실패 — 백엔드 응답 없음·재시도 3회 실패. Uvicorn·포트·네트워크 확인';
+            }}
+            addLog('오류: ' + detail, 'error');
         }}
 
+        let __refreshDataErrLogAt = 0;
+        window.__clientDiagQueue = window.__clientDiagQueue || [];
+        function __enqueueClientDiag(payload) {{
+            try {{
+                const row = Object.assign({{ at_ms: Date.now() }}, payload || {{}});
+                window.__clientDiagQueue.push(row);
+                if (window.__clientDiagQueue.length > 60) {{
+                    window.__clientDiagQueue.splice(0, window.__clientDiagQueue.length - 60);
+                }}
+            }} catch (_e) {{}}
+        }}
+        async function flushClientDiagQueue() {{
+            const q = window.__clientDiagQueue;
+            if (!q || !q.length) return;
+            const batch = q.slice(0, 40);
+            try {{
+                const r = await fetch('/api/system/client-diag', withAuth({{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ events: batch }})
+                }}));
+                if (r && r.ok) {{
+                    window.__clientDiagQueue = q.slice(batch.length);
+                }}
+            }} catch (_e) {{}}
+        }}
+        async function __fetchSystemStatusOnce() {{
+            const ac = new AbortController();
+            const to = setTimeout(function () {{ ac.abort(); }}, 25000);
+            try {{
+                return await fetch('/api/system/status?t=' + Date.now(), withAuth({{ signal: ac.signal }}));
+            }} finally {{
+                clearTimeout(to);
+            }}
+        }}
+        function __isFailedToFetch(err) {{
+            const raw = (err && err.message) ? err.message : String(err || '');
+            return raw === 'Failed to fetch' || (typeof raw === 'string' && raw.indexOf('Failed to fetch') >= 0);
+        }}
         async function refreshData() {{
             try {{
-                const response = await fetch('/api/system/status?t=' + Date.now(), withAuth({{}}));
+                let response;
+                try {{
+                    response = await __fetchSystemStatusOnce();
+                }} catch (e1) {{
+                    if (__isFailedToFetch(e1)) {{
+                        await new Promise(function (r) {{ setTimeout(r, 400); }});
+                        response = await __fetchSystemStatusOnce();
+                    }} else {{
+                        throw e1;
+                    }}
+                }}
                 if (!response.ok) {{
                     renderBuySkipStats(null);
                     renderAiShadow(null);
@@ -5211,10 +5285,31 @@ API: POST /api/config/risk|strategy|stock-selection|operational
                 const data = await response.json();
                 updateStatus(data);
                 await loadAiShadow();
+                void flushClientDiagQueue();
             }} catch (error) {{
                 renderBuySkipStats(null);
                 renderAiShadow(null);
-                addLog('새로고침 오류: ' + (error && error.message ? error.message : error), 'error');
+                const now = Date.now();
+                const raw = (error && error.message) ? error.message : String(error);
+                let detail = raw;
+                if (error && error.name === 'AbortError') {{
+                    detail = '요청 시간 초과(25초) — 서버 부하·재시작·네트워크 지연';
+                }} else if (raw === 'Failed to fetch' || (typeof raw === 'string' && raw.indexOf('Failed to fetch') >= 0)) {{
+                    detail = 'API 연결 실패 — 대시보드 백엔드(Uvicorn) 미실행·재시작 중·포트 불일치·방화벽/VPN·접속 URL(호스트·포트·http/https) 확인';
+                }}
+                if (now - __refreshDataErrLogAt > 12000) {{
+                    addLog('새로고침 오류: ' + detail, 'error');
+                    __refreshDataErrLogAt = now;
+                }}
+                __enqueueClientDiag({{
+                    kind: 'refresh_status',
+                    detail: detail,
+                    raw: raw,
+                    href: (typeof location !== 'undefined' ? String(location.href || '') : ''),
+                    online: (typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean' ? navigator.onLine : null),
+                    error_name: (error && error.name) ? String(error.name) : ''
+                }});
+                void flushClientDiagQueue();
             }}
         }}
 
@@ -6587,6 +6682,7 @@ API: POST /api/config/risk|strategy|stock-selection|operational
         }})();
 
         // 초기화
+        window.addEventListener('online', function () {{ void flushClientDiagQueue(); }});
         connectWebSocket();
         applyGuestReadonlyMode();
         const _sub = document.getElementById('settingsSubbar');

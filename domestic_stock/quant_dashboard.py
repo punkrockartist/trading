@@ -1188,6 +1188,7 @@ if __name__ == "__main__":
     print("퀀트 매매 시스템 대시보드 (모바일 최적화) 시작")
     print("=" * 80)
     print("웹 브라우저에서 http://localhost:8000 접속")
+    print("  ※ 터미널에 \"[HTTP] Uvicorn 리슨 완료\" 가 보인 뒤 접속하세요. 그 전에는 /api/health 가 연결되지 않을 수 있습니다.")
     print("기본 계정: admin / admin123")
     print("종료하려면 Ctrl+C를 누르세요 (한 번에 안 꺼지면 잠시 대기 후 다시 Ctrl+C 또는 프로세스 종료)")
     print("=" * 80)

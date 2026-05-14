@@ -1817,28 +1817,48 @@ def _apply_unified_regime_merged_overlay() -> bool:
     return True
 
 
-def _sync_unified_regime_label_from_market_and_apply() -> None:
-    """저장/로드 직후: 시장 기준 라벨 산출 후 오버레이 적용."""
+def _unified_regime_sync_prepare() -> Optional[UnifiedRegimeSwitchConfig]:
+    """통합 레짐 동기화 전제 확인 후 검증된 설정 반환. 불가 시 None."""
     snap = getattr(state, "_strategy_config_snapshot", None) or {}
     ur_raw = snap.get("unified_regime") or {}
     if not ur_raw.get("enabled"):
-        return
+        return None
     if not getattr(state, "_unified_regime_base_strategy", None):
-        return
+        return None
     if not getattr(state, "_unified_regime_base_risk", None):
         state._unified_regime_base_risk = _build_risk_config_dict_from_rm()
     if not state._unified_regime_base_risk:
-        return
+        return None
     try:
-        ur = UnifiedRegimeSwitchConfig.model_validate(ur_raw)
+        return UnifiedRegimeSwitchConfig.model_validate(ur_raw)
     except Exception as e:
         logger.warning("unified_regime sync validate: %s", e)
-        return
-    raw = _compute_unified_regime_label(ur)
+        return None
+
+
+def _apply_unified_regime_computed_label(raw: str) -> None:
     state.unified_regime_active_label = str(raw)
     state._unified_regime_pending_label = None
     state._unified_regime_pending_streak = 0
     _apply_unified_regime_merged_overlay()
+
+
+def _sync_unified_regime_label_from_market_and_apply() -> None:
+    """저장/로드 직후: 시장 기준 라벨 산출 후 오버레이 적용(동기·HTTP 블로킹 가능)."""
+    ur = _unified_regime_sync_prepare()
+    if ur is None:
+        return
+    raw = _compute_unified_regime_label(ur)
+    _apply_unified_regime_computed_label(raw)
+
+
+async def _sync_unified_regime_label_from_market_and_apply_async() -> None:
+    """시스템 시작 등: KIS 다건 호출을 스레드로 넘겨 Uvicorn 이벤트 루프 블로킹 완화."""
+    ur = _unified_regime_sync_prepare()
+    if ur is None:
+        return
+    raw = await asyncio.to_thread(_compute_unified_regime_label, ur)
+    _apply_unified_regime_computed_label(raw)
 
 
 async def _sync_unified_regime_periodic() -> None:
@@ -3887,16 +3907,46 @@ def _ensure_initialized() -> bool:
     return bool(initialize_trading_system(account_balance=account_balance, is_paper_trading=is_paper))
 
 
-def _run_async_broadcast(message: dict):
-    """스레드 컨텍스트에서 안전하게 브로드캐스트."""
+def _broadcast_future_done(fut: Any) -> None:
+    """run_coroutine_threadsafe(broadcast) 완료 후 예만 로깅."""
     try:
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(state.broadcast(message))
-        except RuntimeError:
-            asyncio.run(state.broadcast(message))
+        exc = fut.exception()
+        if exc is not None:
+            logger.error("브로드캐스트(threadsafe) 실패: %s: %s", type(exc).__name__, exc)
+    except asyncio.CancelledError:
+        pass
     except Exception as e:
-        logger.error(f"브로드캐스트 오류: {e}")
+        logger.error("브로드캐스트 future 처리 오류: %s", e)
+
+
+def _run_async_broadcast(message: dict):
+    """
+    엔진·KIS WS 스레드 등 비(대시보드)루프에서 state.broadcast 를 Uvicorn 메인 루프로만 스케줄한다.
+    (기존: KIS asyncio.run 루프에 create_task → Starlette WebSocket 과 이벤트 루프 불일치)
+    """
+    try:
+        main_loop = getattr(state, "_dashboard_asyncio_loop", None)
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+
+        if main_loop is not None and running is main_loop:
+            main_loop.create_task(state.broadcast(message))
+            return
+
+        if main_loop is not None and getattr(main_loop, "is_running", lambda: False)():
+            fut = asyncio.run_coroutine_threadsafe(state.broadcast(message), main_loop)
+            try:
+                fut.add_done_callback(_broadcast_future_done)
+            except Exception:
+                pass
+            return
+
+        # HTTP 기동 전·테스트 등: 메인 루프 없음 — 잘못된 asyncio.run 경로는 쓰지 않음
+        logger.warning("브로드캐스트 생략: 대시보드 이벤트 루프 미등록(_dashboard_asyncio_loop)")
+    except Exception as e:
+        logger.error("브로드캐스트 오류: %s", e)
 
 
 def _to_float(value, default: float = 0.0) -> float:
@@ -3996,8 +4046,19 @@ def _refresh_kis_account_balance_sync() -> int:
         state.kis_account_balance_ok = True
         state.kis_account_balance = int(bal or 0)
         state.kis_account_balance_at = time.time()
+        try:
+            state._kis_balance_cache_for_paper = bool(getattr(state, "is_paper_trading", True))
+        except Exception:
+            pass
         if getattr(state, "risk_manager", None):
             state.risk_manager.account_balance = float(state.kis_account_balance)
+        # 모의: 표시(start+일손익)가 KIS와 어긋나지 않도록 세션 시작잔고 동기화
+        if getattr(state, "is_paper_trading", True) and getattr(state, "risk_manager", None):
+            try:
+                pnl = float(getattr(state.risk_manager, "daily_pnl", 0) or 0)
+                state.session_start_balance = float(state.kis_account_balance) - pnl
+            except Exception:
+                pass
         return bal
     except Exception as e:
         logger.warning(f"KIS 잔고 조회 실패(무시): {e}")
@@ -4219,19 +4280,37 @@ def _sync_positions_from_balance_sync() -> int:
         return 0
 
 
+# KIS 잔고 to_thread가 스레드 풀·API 지연으로 길어지면 /api/system/status·stop 이 함께 대기 → 브라우저 Failed to fetch
+_KIS_BALANCE_TO_THREAD_TIMEOUT_SEC = 6.0
+
+
 async def _refresh_kis_account_balance(force: bool = False, ttl_sec: int = 60) -> int:
     """비동기 컨텍스트에서 TTL 기반으로 KIS 잔고를 갱신."""
     try:
         now = time.time()
         last_at = float(getattr(state, "kis_account_balance_at", 0) or 0)
-        if not force and last_at and (now - last_at) < ttl_sec:
+        paper_now = bool(getattr(state, "is_paper_trading", True))
+        cache_paper = getattr(state, "_kis_balance_cache_for_paper", None)
+        # 모의↔실전 전환 직후에도 TTL이 모의 잔고를 그대로 쓰는 문제 방지
+        env_match = cache_paper is None or bool(cache_paper) == paper_now
+        if not force and last_at and (now - last_at) < ttl_sec and env_match:
             return int(getattr(state, "kis_account_balance", 0) or 0)
 
         if not getattr(state, "trenv", None):
             return 0
 
-        bal = await asyncio.to_thread(_refresh_kis_account_balance_sync)
-        return int(bal or 0)
+        try:
+            bal = await asyncio.wait_for(
+                asyncio.to_thread(_refresh_kis_account_balance_sync),
+                timeout=_KIS_BALANCE_TO_THREAD_TIMEOUT_SEC,
+            )
+            return int(bal or 0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "KIS 잔고 갱신 to_thread 시간 초과(%ss) — 캐시 유지(status/stop 응답 지연 방지)",
+                _KIS_BALANCE_TO_THREAD_TIMEOUT_SEC,
+            )
+            return int(getattr(state, "kis_account_balance", 0) or 0)
     except Exception as e:
         logger.warning(f"KIS 잔고 갱신 실패(무시): {e}")
         return int(getattr(state, "kis_account_balance", 0) or 0)
@@ -6140,10 +6219,11 @@ async def websocket_endpoint(websocket: WebSocket):
         if websocket in state.websocket_clients:
             state.websocket_clients.remove(websocket)
 
-async def send_status_update():
-    """상태 업데이트 전송"""
+async def send_status_update(refresh_balance: bool = True):
+    """상태 업데이트 전송. refresh_balance=False면 KIS 잔고 호출 생략(시스템 중지 직후 즉시 반영 등)."""
     if state.risk_manager:
-        await _refresh_kis_account_balance(force=False, ttl_sec=60)
+        if refresh_balance:
+            await _refresh_kis_account_balance(force=False, ttl_sec=60)
         _crit_user = getattr(state, "trading_username", None) or "admin"
         _criteria = _get_stock_selection_criteria(_crit_user)
         await state.broadcast({
@@ -6546,6 +6626,12 @@ def _load_today_daily_stats(current_user: str, env_dv: Optional[str] = None) -> 
     return (None, None)
 
 
+@app.get("/api/health")
+async def dashboard_health():
+    """인증 없이 동작 확인용(Uvicorn 리슨·방화벽·프록시 진단, Docker HEALTHCHECK)."""
+    return JSONResponse({"ok": True, "service": "quant_dashboard"})
+
+
 @app.get("/api/system/status")
 async def get_system_status(current_user: str = Depends(get_current_user)):
     """시스템 상태 조회"""
@@ -6847,7 +6933,7 @@ async def _do_start_system(username: str) -> tuple:
                 try:
                     s0 = saved.get("strategy_config")
                     if isinstance(s0, dict) and (s0.get("unified_regime") or {}).get("enabled"):
-                        _sync_unified_regime_label_from_market_and_apply()
+                        await _sync_unified_regime_label_from_market_and_apply_async()
                 except Exception:
                     pass
                 _apply_stock_selection_config_dict_to_state(saved.get("stock_selection_config"))
@@ -6867,7 +6953,8 @@ async def _do_start_system(username: str) -> tuple:
         # 시작 시 자동 재선정이 이를 덮어쓰지 않도록 selected가 비어있을 때만 수행합니다.
         if getattr(state, "stock_selector", None) and not getattr(state, "selected_stocks", None):
             try:
-                selected = state.stock_selector.select_stocks_by_fluctuation()
+                # 장 시작 직후 자동 시작 시 동기 KIS 호출이 이벤트 루프를 막으면 대시보드 폴링이 Failed to fetch 됨
+                selected = await asyncio.to_thread(state.stock_selector.select_stocks_by_fluctuation)
                 if selected:
                     state.selected_stocks = selected
                     state.selected_stock_info = getattr(
@@ -6958,6 +7045,12 @@ async def _do_start_system(username: str) -> tuple:
             pass
         _restore_daily_buy_notional_from_hist(username)
 
+        # DB 복원 후 일손익이 반영된 상태로 KIS 잔고·모의 session_start 동기화 (순서 중요)
+        try:
+            await _refresh_kis_account_balance(force=True, ttl_sec=0)
+        except Exception:
+            pass
+
         # 선택적 런타임 차단만 적용: POST /api/system/allow-real-auto-trading {"mode":"block"} 시 시작 불가
         if not _effective_allow_real_auto_trading():
             msg = (
@@ -6980,7 +7073,7 @@ async def _do_start_system(username: str) -> tuple:
         logger.info("시스템 시작: trading_username=%s (quant_trading_user_hist 저장 대상)", username)
         try:
             if getattr(state, "session_start_balance", None) is None:
-                state.session_start_balance = float(_get_display_account_balance() or getattr(state.risk_manager, "account_balance", 0) or 0)
+                state.session_start_balance = float(_get_display_account_balance())
         except Exception:
             if getattr(state, "session_start_balance", None) is None:
                 state.session_start_balance = float(getattr(state.risk_manager, "account_balance", 0) or 0)
@@ -7044,14 +7137,16 @@ async def set_trading_env(
                 "success": False,
                 "message": "시스템을 중지한 후 투자 환경을 변경할 수 있습니다."
             })
-        balance = float(getattr(state.risk_manager, "account_balance", 100000) if state.risk_manager else 100000)
-        ok = initialize_trading_system(account_balance=balance, is_paper_trading=is_paper_trading)
+        # 이전 risk_manager 잔고(모의 동기값 등)를 넘기면 실전 RiskManager 시드가 오염됨 → 환경변수 기본 시드 후 KIS로 덮음
+        seed_balance = _env_float("ACCOUNT_BALANCE", 100000.0)
+        ok = initialize_trading_system(account_balance=seed_balance, is_paper_trading=is_paper_trading)
         if not ok:
             detail = getattr(state, "last_init_error", None)
             msg = "환경 전환 실패: KIS 설정·네트워크·계정을 확인하세요."
             if detail:
                 msg = f"{msg} ({detail})"
             return JSONResponse({"success": False, "message": msg})
+        await _refresh_kis_account_balance(force=True, ttl_sec=0)
         await send_status_update()
         env_label = "모의투자" if is_paper_trading else "실전투자"
         return JSONResponse({"success": True, "message": f"환경이 {env_label}(으)로 변경되었습니다.", "is_paper_trading": is_paper_trading})
@@ -7139,6 +7234,12 @@ async def _do_stop_system(username: str, liquidate: bool) -> tuple:
         try:
             if getattr(state, "risk_manager", None) and hasattr(state.risk_manager, "_pending_orders"):
                 state.risk_manager._pending_orders = {}
+        except Exception:
+            pass
+
+        # 잔고 KIS 대기 전에 실행 중지를 WS·다음 status 폴링에 즉시 반영 (청산·저장은 이후 단계)
+        try:
+            await send_status_update(refresh_balance=False)
         except Exception:
             pass
 
@@ -7238,6 +7339,46 @@ async def stop_system(
     return JSONResponse({"success": success, "message": message})
 
 
+@app.post("/api/system/client-diag")
+async def post_client_diagnostic_events(
+    current_user: str = Depends(get_current_user),
+    body: Optional[Dict[str, Any]] = Body(None),
+):
+    """
+    브라우저가 `/api/system/status` 등 실패 후, 연결이 복구되면 전송하는 진단 이벤트 → system_YYYYMMDD.log.
+    (실패 순간에는 요청 자체가 불가하므로 큐→재전송 패턴)
+    """
+    if not isinstance(body, dict):
+        body = {}
+    events = body.get("events")
+    if not isinstance(events, list) or not events:
+        return JSONResponse({"success": True, "received": 0})
+    events = events[:40]
+    received = 0
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        kind = str(ev.get("kind") or "unknown")[:64]
+        at_ms = ev.get("at_ms")
+        detail = str(ev.get("detail") or "")[:900]
+        raw = str(ev.get("raw") or "")[:400]
+        href = str(ev.get("href") or "")[:320]
+        online = ev.get("online")
+        err_name = str(ev.get("error_name") or "")[:80]
+        line = (
+            f"[client-diag] user={current_user} kind={kind} at_ms={at_ms} "
+            f"name={err_name} online={online} href={href} | detail={detail} | raw={raw}"
+        )
+        if len(line) > 3500:
+            line = line[:3490] + "…(trunc)"
+        try:
+            system_log_append("warning", line)
+            received += 1
+        except Exception:
+            pass
+    return JSONResponse({"success": True, "received": received})
+
+
 async def _auto_schedule_loop():
     """매일 지정 시각(KST)에 자동 시작/종료. 60초마다 확인."""
     kst = timezone(timedelta(hours=9))
@@ -7275,6 +7416,10 @@ async def _auto_schedule_loop():
 @app.on_event("startup")
 async def _start_auto_schedule():
     """앱 기동 시 자동 스케줄 루프 시작."""
+    try:
+        state._dashboard_asyncio_loop = asyncio.get_running_loop()
+    except Exception:
+        pass
     t = asyncio.create_task(_auto_schedule_loop())
     try:
         state._auto_schedule_task = t
@@ -7286,11 +7431,32 @@ async def _start_auto_schedule():
 @app.on_event("startup")
 async def _dashboard_lifecycle_startup_log():
     """어떤 방식으로 Uvicorn을 띄우든 system_*.log에 기동 흔적."""
+    try:
+        state._dashboard_asyncio_loop = asyncio.get_running_loop()
+    except Exception:
+        pass
     ensure_dashboard_atexit_registered()
     try:
         system_log_append("info", "대시보드 HTTP 서비스 시작 (FastAPI startup / Uvicorn)")
     except Exception:
         pass
+    try:
+        await _startup_deferred_kis_balance_refresh()
+    except Exception as e:
+        logger.warning("startup 잔고 갱신 실패(무시): %s", e)
+    try:
+        print("[HTTP] Uvicorn 리슨 완료 — 브라우저·GET /api/health 접속 가능 (초기 KIS 잔고 동기화 시도 완료)")
+    except Exception:
+        pass
+
+
+async def _startup_deferred_kis_balance_refresh():
+    """HTTP 리슨 이후 1회: 계좌 잔고 동기화(initialize에서 제거 — 리슨 전 장시간 블로킹 방지)."""
+    try:
+        if getattr(state, "trenv", None):
+            await _refresh_kis_account_balance(force=True, ttl_sec=0)
+    except Exception as e:
+        logger.warning("startup 지연 잔고 갱신 실패(무시): %s", e)
 
 
 @app.on_event("shutdown")
@@ -7307,6 +7473,10 @@ async def _dashboard_http_shutdown_event():
     try:
         state.engine_running = False
         _request_active_kis_ws_close()
+    except Exception:
+        pass
+    try:
+        state._dashboard_asyncio_loop = None
     except Exception:
         pass
     try:
@@ -9508,6 +9678,16 @@ def initialize_trading_system(
         except Exception:
             pass
         state.is_paper_trading = is_paper_trading
+        # 모의/실전 전환·재초기화 시 이전 KIS 잔고 캐시·세션 시작잔고가 남으면 표시/동기화가 섞임
+        try:
+            state.kis_account_balance = 0
+            state.kis_account_balance_ok = False
+            state.kis_account_balance_at = 0.0
+            state.session_start_balance = None
+            if hasattr(state, "_kis_balance_cache_for_paper"):
+                delattr(state, "_kis_balance_cache_for_paper")
+        except Exception:
+            pass
         if not getattr(state, "buy_window_start_hhmm", None):
             state.buy_window_start_hhmm = "09:05"
         if not getattr(state, "buy_window_end_hhmm", None):
@@ -9524,8 +9704,9 @@ def initialize_trading_system(
         state.engine_thread = None
         state.engine_running = False
 
-        # 초기화 직후 1회 실제 계좌 잔고를 조회해 반영 (가능하면)
-        _refresh_kis_account_balance_sync()
+        # 초기 잔고는 여기서 동기 호출하지 않음: KIS 첫 응답이 길면 uvicorn.run 이전에 메인 스레드가
+        # 블로킹되어 8000 리슨 전에 브라우저가 "연결할 수 없음"으로 실패할 수 있음.
+        # 실제 반영은 startup 훅에서 비동기로 1회 갱신(아래 _startup_deferred_kis_balance_refresh).
         
         logger.info("거래 시스템 초기화 완료")
         return True

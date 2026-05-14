@@ -31,7 +31,7 @@ EXPOSE 8000
 
 # 헬스체크 (선택)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:8000/api/system/status', timeout=5)" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).read()" || exit 1
 
 # 애플리케이션 실행
 # 방법 1: uvicorn 모듈로 실행
